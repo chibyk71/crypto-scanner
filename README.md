@@ -35,7 +35,7 @@ This project is ideal for traders and developers looking to automate market moni
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/your-username/crypto-trading-scanner.git
+   git clone https://github.com/chibyk71/crypto-scanner.git
    cd crypto-trading-scanner
    ```
 
