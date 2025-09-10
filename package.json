@@ -42,7 +42,8 @@
         "db:push": "drizzle-kit push",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",
-        "db:studio": "drizzle-kit studio"
+        "db:studio": "drizzle-kit studio",
+        "start:github": "node -r dotenv dist/index-github.js"
     },
     "engines": {
         "node": ">=10"
@@ -60,6 +61,7 @@
         "effect": "^3.17.9",
         "node-cron": "^4.2.1",
         "node-telegram-bot-api": "^0.66.0",
+        "pm2": "^6.0.10",
         "technicalindicators": "^3.1.0",
         "winston": "^3.17.0"
     },
