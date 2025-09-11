@@ -1,0 +1,33 @@
+services:
+  - type: worker
+    name: crypto-bot-worker
+    env: node
+    region: oregon
+    buildCommand: npm install
+    startCommand: npx ts-node src/lib/worker.ts
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        value: file:/render/data/alerts.db
+      - key: PUBLIC_SYMBOLS
+        value: BTC/USDT,ETH/USDT
+      - key: PUBLIC_TIMEFRAME
+        value: 1h
+      - key: PUBLIC_LEVERAGE
+        value: 10
+      - key: PUBLIC_POLL_INTERVAL
+        value: 300000
+    disk:
+      name: data
+      mountPath: /render/data
+      sizeGB: 1
+    autoDeploy: true
