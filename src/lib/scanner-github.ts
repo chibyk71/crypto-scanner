@@ -80,7 +80,7 @@ export class MarketScanner {
             await this.processTradeSignal(symbol, signal, currentPrice);
         }
 
-        await this.processDatabaseAlerts(symbol, signal, currentPrice, highs, lows, closes, volumes);
+        await this.processDatabaseAlerts(symbol, signal, currentPrice);
     }
 
     private async processTradeSignal(symbol: string, signal: TradeSignal, currentPrice: number): Promise<void> {
@@ -121,11 +121,7 @@ export class MarketScanner {
     private async processDatabaseAlerts(
         symbol: string,
         signal: TradeSignal,
-        currentPrice: number,
-        highs: number[],
-        lows: number[],
-        closes: number[],
-        volumes: number[]
+        currentPrice: number
     ): Promise<void> {
         const alerts = await dbService.getAlertsBySymbol(symbol);
         const now = Date.now();
