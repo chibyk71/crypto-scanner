@@ -95,16 +95,7 @@ export async function startWorker(): Promise<void> {
         exchange,
         strategy,
         config.symbols,
-        telegram,
-        {
-            intervalMs: 15000, // Scan every 15 seconds
-            concurrency: 3, // Process 3 symbols concurrently
-            cooldownMs: 5 * 60_000, // 5-minute cooldown per symbol
-            jitterMs: 250, // 250ms jitter for API calls
-            retries: 1, // 1 retry on transient errors
-            heartbeatEvery: 20, // Heartbeat every 20 scans
-            requireAtrFeasibility: true // Require ATR-based volatility check
-        }
+        telegram
     );
 
     // Set up cleanup for graceful shutdown
