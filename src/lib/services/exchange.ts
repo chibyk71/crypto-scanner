@@ -13,10 +13,19 @@ export class ExchangeService {
      * config, and rate limiting is enabled.
      */
     constructor() {
-        this.exchange = new ccxt.gate({
-            enableRateLimit: true,
-            timeout: 30000,
-        });
+        this.exchange = this.createExchange(config.exchange.name);
+    }
+
+    /**
+     * Creates a CCXT exchange instance based on the given id.
+     * @param id the id of the exchange to create
+     * @returns a CCXT exchange instance
+     * @throws if the exchange is not supported
+     */
+    private createExchange(id: string): Exchange {
+        const exchangeClass = (ccxt as any)[id];
+        if (!exchangeClass) throw new Error(`Exchange ${id} is not supported`);
+        return new exchangeClass({ enableRateLimit: true, timeout: 30000 }) as Exchange;
     }
 
     /**
