@@ -10,6 +10,7 @@ import { ExchangeService } from './services/exchange';
 import { TelegramService } from './services/telegram';
 import { dbService } from './db';
 import { Strategy, type TradeSignal } from './strategy';
+import { config } from './config/settings';
 
 // Configuration options for the scanner, allowing customization of its behavior.
 type ScannerOptions = {
@@ -54,12 +55,12 @@ export class MarketScanner {
         private readonly symbols: string[],
         private readonly telegram: TelegramService,
         private readonly opts: ScannerOptions = {
-            intervalMs: 60000, // Scan every 60 seconds.
+            intervalMs: config.pollingInterval, // Scan every 60 seconds.
             concurrency: 3, // Process up to 3 symbols concurrently.
             cooldownMs: 5 * 60_000, // 5-minute cooldown per symbol.
             jitterMs: 250, // 250ms jitter to avoid rate limits.
             retries: 1, // Retry once on transient errors.
-            heartbeatEvery: 20, // Heartbeat every 20 scans.
+            heartbeatEvery: config.heartBeatInterval, // Heartbeat every X scans.
             requireAtrFeasibility: true // Require ATR-based volatility check.
         }
     ) { }
@@ -155,7 +156,7 @@ export class MarketScanner {
         // Fetch OHLCV data (Open, High, Low, Close, Volume) for the symbol.
         const ohlcv = this.exchange.getOHLCV(symbol);
         // Skip if no data or insufficient data (less than 200 candles for robust analysis).
-        if (!ohlcv || ohlcv.length < 200) return;
+        if (!ohlcv || ohlcv.length < config.historyLength) return;
 
         // Extract OHLCV components into arrays and filter out invalid (NaN) values.
         const highs = ohlcv.map(c => Number(c[2])).filter(v => !isNaN(v)); // High prices.
@@ -163,7 +164,7 @@ export class MarketScanner {
         const closes = ohlcv.map(c => Number(c[4])).filter(v => !isNaN(v)); // Close prices.
         const volumes = ohlcv.map(c => Number(c[5])).filter(v => !isNaN(v)); // Volume data.
         // Skip if there are fewer than 200 valid close prices after filtering.
-        if (closes.length < 200) return;
+        if (closes.length < config.historyLength) return;
 
         const currentPrice = closes.at(-1)!; // Get the latest closing price.
 
@@ -182,7 +183,7 @@ export class MarketScanner {
         }
 
         // Process database-driven alerts for additional conditions.
-        await this.processDatabaseAlerts(symbol, signal, currentPrice, highs, lows, closes, volumes);
+        await this.processDatabaseAlerts(symbol, signal, currentPrice);
     }
 
     /**
@@ -237,19 +238,11 @@ export class MarketScanner {
      * @param symbol - The trading symbol.
      * @param signal - The generated trade signal.
      * @param currentPrice - The current price.
-     * @param highs - Array of high prices.
-     * @param lows - Array of low prices.
-     * @param closes - Array of close prices.
-     * @param volumes - Array of volume data.
      */
     private async processDatabaseAlerts(
         symbol: string,
         signal: TradeSignal,
         currentPrice: number,
-        highs: number[],
-        lows: number[],
-        closes: number[],
-        volumes: number[]
     ): Promise<void> {
         // Fetch all active alerts for this symbol from the database.
         const alerts = await dbService.getAlertsBySymbol(symbol);
