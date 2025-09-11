@@ -5,6 +5,7 @@ dotenvConfig();
 
 export const config = {
     exchange: {
+        name: process.env.EXCHANGE ?? 'bybit',
         apiKey: process.env.EXCHANGE_API_KEY ?? '',
         apiSecret: process.env.EXCHANGE_API_SECRET ?? '',
     },
@@ -14,8 +15,11 @@ export const config = {
     },
     database_url: process.env.DATABASE_URL ?? './alerts.db',
     symbols: process.env.SYMBOLS ? process.env.SYMBOLS.split(',') : ['BTC/USDT', 'ETH/USDT'],
-    timeframe: process.env.PUBLIC_TIMEFRAME ?? '1m',
-    leverage: Number(process.env.PUBLIC_LEVERAGE) || 1,
-    historyLength: 100, // Number of historical candles to fetch
-    pollingInterval: Number(process.env.PUBLIC_POLL_INTERVAL) || 300000, // Default to 5 minutes
+    timeframe: process.env.TIMEFRAME ?? '1h',
+    leverage: Number(process.env.LEVERAGE) || 1,
+    historyLength: Number(process.env.HISTORY_LENGTH) || 200, // Number of historical candles to fetch
+    pollingInterval: Number(process.env.POLL_INTERVAL) || 60000, // Default to 1 minutes
+    heartBeatInterval: Number(process.env.HEARTBEAT_INTERVAL) || 20,
 };
+
+export type Config = typeof config;
