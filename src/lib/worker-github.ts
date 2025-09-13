@@ -15,14 +15,9 @@ import { MarketScanner } from './scanner-github';
 // Handles sending Telegram messages (e.g., notifications about trades, errors, status)
 import { TelegramService } from './services/telegram';
 
-// Winston is a logging library for Node.js
-// - `createLogger`: creates a logger instance
-// - `format`: defines log formatting (e.g., JSON, timestamp)
-// - `transports`: specifies where logs are sent (console, file, etc.)
-import { createLogger, format, transports } from 'winston';
-
 // Provides access to database functions (alerts, locks, etc.)
 import { dbService } from './db';
+import { createLogger } from './logger';
 
 
 // -------------------- LOGGER CONFIGURATION --------------------
@@ -33,17 +28,7 @@ import { dbService } from './db';
 // - `transports`: determines where logs are written
 //    1. File transport: writes logs to `logs/worker.log` (persistent storage)
 //    2. Console transport: outputs logs in real time to the terminal
-export const logger = createLogger({
-    level: 'info',
-    format: format.combine(
-        format.timestamp(),  // Attach timestamp to every log
-        format.json()        // Convert log messages into JSON structure
-    ),
-    transports: [
-        new transports.File({ filename: 'logs/worker.log' }), // Persistent log file
-        new transports.Console() // Console output for live monitoring
-    ]
-});
+export const logger = createLogger('cron-worker');
 
 
 // -------------------- WORKER ENTRY POINT --------------------
