@@ -49,11 +49,10 @@
         "node": ">=10"
     },
     "dependencies": {
-        "@libsql/client": "^0.14.0",
         "ccxt": "^4.5.1",
         "dotenv": "^17.2.1",
-        "drizzle-orm": "^0.40.0",
-        "drizzle-kit": "^0.31.4",
+        "drizzle-orm": "^0.40.1",
+        "mysql2": "^3.14.5",
         "node-telegram-bot-api": "^0.66.0",
         "pm2": "^6.0.10",
         "technicalindicators": "^3.1.0",
@@ -69,6 +68,7 @@
         "codecov": "^3.5.0",
         "cspell": "^4.1.0",
         "cz-conventional-changelog": "^3.3.0",
+        "drizzle-kit": "^0.31.4",
         "eslint": "^9.35.0",
         "eslint-config-prettier": "^6.11.0",
         "eslint-plugin-eslint-comments": "^3.2.0",
