@@ -4,6 +4,8 @@ import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 export const config = {
+    env: process.env.ENV || 'dev',
+    log_level: process.env.LOG_LEVEL || 'info',
     exchange: {
         name: process.env.EXCHANGE ?? 'bybit',
         apiKey: process.env.EXCHANGE_API_KEY ?? '',
@@ -13,7 +15,7 @@ export const config = {
         token: process.env.TELEGRAM_BOT_TOKEN ?? '',
         chatId: process.env.TELEGRAM_CHAT_ID ?? '',
     },
-    database_url: process.env.DATABASE_URL ?? './alerts.db',
+    database_url: process.env.DATABASE_URL ?? 'file:./alerts.db',
     symbols: process.env.SYMBOLS ? process.env.SYMBOLS.split(',') : ['BTC/USDT', 'ETH/USDT'],
     timeframe: process.env.TIMEFRAME ?? '1h',
     leverage: Number(process.env.LEVERAGE) || 1,
