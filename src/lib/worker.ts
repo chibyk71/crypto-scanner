@@ -15,22 +15,10 @@ import { config } from './config/settings';
 
 // Import file system for lock file management
 import * as fs from 'fs/promises';
-
-// Import Winston for structured logging
-import { createLogger, format, transports } from 'winston';
+import { createLogger } from './logger';
 
 // Initialize logger for structured logging to file and console
-export const logger = createLogger({
-    level: 'info', // Log info level and above
-    format: format.combine(
-        format.timestamp(), // Add timestamps for tracking
-        format.json() // JSON format for structured logs
-    ),
-    transports: [
-        new transports.File({ filename: 'logs/worker.log' }), // Log to file
-        new transports.Console() // Log to console for real-time monitoring
-    ]
-});
+export const logger = createLogger('worker'); // 'worker' label for structured logging()
 
 const LOCK_FILE = './worker.lock'; // Path to lock file to prevent concurrent runs
 
