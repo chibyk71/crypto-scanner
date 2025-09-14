@@ -15,7 +15,7 @@ export const config = {
         token: process.env.TELEGRAM_BOT_TOKEN ?? '',
         chatId: process.env.TELEGRAM_CHAT_ID ?? '',
     },
-    database_url: process.env.DATABASE_URL ?? 'file:./alerts.db',
+    database_url: process.env.DATABASE_URL ?? 'mysql://root:@localhost:3306/crypto_scanner',
     symbols: process.env.SYMBOLS ? process.env.SYMBOLS.split(',') : ['BTC/USDT', 'ETH/USDT'],
     timeframe: process.env.TIMEFRAME ?? '1h',
     leverage: Number(process.env.LEVERAGE) || 1,
