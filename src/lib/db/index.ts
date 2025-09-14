@@ -1,6 +1,6 @@
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { alert, heartbeat, locks, type Alert, type NewAlert } from './schema';
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
@@ -211,7 +211,7 @@ export const dbService = {
         if (!drizzleDb) throw new Error('Database not initialized');
         await drizzleDb
             .update(heartbeat)
-            .set({ cycleCount: drizzleDb.raw('cycleCount + 1'), lastHeartbeatAt: Date.now() })
+            .set({ cycleCount: sql`cycleCount + 1`, lastHeartbeatAt: Date.now() })
             .where(eq(heartbeat.id, 1))
             .execute();
         const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
