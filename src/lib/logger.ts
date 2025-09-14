@@ -20,6 +20,7 @@ export function createLogger(label: string) {
             format.printf(({ level, message, label, timestamp }) => {
                 return `${timestamp} [${label}] ${level.toUpperCase()}: ${message}`;
             }),
+            format.errors({ stack: true }),
         ),
         transports: [
             new transports.Console(), // Logs to console (visible in cPanel Setup Node.js App logs).
