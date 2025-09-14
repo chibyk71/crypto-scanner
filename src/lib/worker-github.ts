@@ -28,7 +28,7 @@ import { createLogger } from './logger';
 // - `transports`: determines where logs are written
 //    1. File transport: writes logs to `logs/worker.log` (persistent storage)
 //    2. Console transport: outputs logs in real time to the terminal
-export const logger = createLogger('cron-worker');
+const logger = createLogger('cron-worker');
 
 
 // -------------------- WORKER ENTRY POINT --------------------
@@ -79,11 +79,15 @@ export async function startWorker(): Promise<void> {
         // Log successful exchange initialization
         logger.info('Exchange initialized', { symbols: config.symbols });
 
+        // Retrieve supported symbols from ExchangeService as a Set and convert to an array
+        // MarketScanner expects an array of strings, so we use Array.from to convert the Set
+        const supportedSymbols = Array.from(exchange.getSupportedSymbols());
+
         // Create the MarketScanner:
         // - Coordinates the strategy and exchange
         // - Runs scans over the given symbols
         // - Can notify via Telegram
-        const scanner = new MarketScanner(exchange, strategy, config.symbols, telegram);
+        const scanner = new MarketScanner(exchange, strategy, supportedSymbols, telegram);
 
         // Execute a single scan cycle:
         // - Fetch data
