@@ -20,7 +20,7 @@ export class ExchangeService {
     // Track polling intervals for each symbol to manage real-time updates
     private pollingIntervals: { [symbol: string]: NodeJS.Timeout } = {};
     // Store supported symbols as a Set for efficient lookup and iteration
-    private supportedSymbols: Set<string> = new Set();
+    private supportedSymbols: Array<string> = [];
 
     /**
      * Constructor for ExchangeService. Initializes the CCXT exchange instance
@@ -57,8 +57,10 @@ export class ExchangeService {
             logger.info('Loading all markets from the exchange...');
             const markets = await this.exchange.loadMarkets();
             // Extract symbol names from market data and store in Set
-            this.supportedSymbols = new Set(Object.keys(markets));
-            logger.info(`Successfully loaded ${this.supportedSymbols.size} markets`);
+            this.supportedSymbols = Array.from(Object.keys(markets)).filter((symbol) => {
+                return config.symbols.includes(symbol);
+            });
+            logger.info(`Successfully loaded ${this.supportedSymbols.length} markets`);
         } catch (error) {
             // Log critical error if market loading fails, but don't throw to allow partial operation
             logger.error('Failed to load markets from the exchange', { error });
@@ -69,9 +71,9 @@ export class ExchangeService {
      * Returns the Set of supported symbols. Ensures symbols are loaded if not already.
      * @returns {Set<string>} A Set of supported symbol strings
      */
-    public getSupportedSymbols(): Set<string> {
+    public getSupportedSymbols(): Array<string> {
         // Load symbols if the Set is empty (lazy initialization)
-        if (this.supportedSymbols.size === 0) {
+        if (this.supportedSymbols.length === 0) {
             logger.info('Supported symbols not loaded yet, loading now...');
             this.loadSupportedSymbols();
         }
@@ -84,18 +86,12 @@ export class ExchangeService {
      * @param symbols - Array of symbols to initialize (e.g., ['BTC/USDT', 'ETH/USDT'])
      * @returns {Promise<void>} Resolves when initialization is complete, or skips unsupported symbols
      */
-    async initialize(symbols: string[]): Promise<void> {
+    async initialize(): Promise<void> {
         // Load supported symbols first to validate input symbols
         await this.loadSupportedSymbols();
 
         // Process each symbol in the provided list
-        for (const symbol of symbols) {
-            // Check if the symbol is supported by the exchange
-            if (!this.supportedSymbols.has(symbol)) {
-                logger.error(`Symbol ${symbol} is not supported by the exchange. Skipping`);
-                continue;
-            }
-
+        for (const symbol of this.supportedSymbols) {
             try {
                 // Fetch initial historical OHLCV data for the symbol
                 this.ohlcvData[symbol] = await this.exchange.fetchOHLCV(
