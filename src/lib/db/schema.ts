@@ -1,4 +1,4 @@
-import { mysqlTable, int, varchar, double, timestamp, boolean } from 'drizzle-orm/mysql-core';
+import { mysqlTable, int, varchar, double, timestamp, boolean, bigint } from 'drizzle-orm/mysql-core';
 
 /**
  * User table for storing user authentication data.
@@ -50,6 +50,12 @@ export const alert = mysqlTable('alert', {
 export const locks = mysqlTable('locks', {
     id: int('id').primaryKey(), // INT for unique lock ID (typically 1).
     isLocked: boolean('is_locked').default(false), // BOOLEAN for lock status, defaults to false.
+});
+
+export const heartbeat = mysqlTable('heartbeat', {
+    id: int('id').primaryKey(),
+    cycleCount: int('cycleCount').notNull().default(0),
+    lastHeartbeatAt: bigint('lastHeartbeatAt', { mode: 'number' })
 });
 
 /**

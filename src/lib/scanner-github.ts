@@ -2,6 +2,9 @@ import { ExchangeService } from './services/exchange';
 import { TelegramService } from './services/telegram';
 import { dbService } from './db';
 import { Strategy, type TradeSignal } from './strategy';
+import { createLogger } from './logger';
+
+const logger = createLogger('MarketScanner');
 
 type ScannerOptions = {
     concurrency: number;
@@ -9,6 +12,7 @@ type ScannerOptions = {
     jitterMs?: number;
     retries?: number;
     requireAtrFeasibility?: boolean;
+    heartbeatCycles?: number; // Number of cycles between heartbeat messages
 };
 
 export class MarketScanner {
@@ -22,19 +26,42 @@ export class MarketScanner {
             cooldownMs: 5 * 60_000,
             jitterMs: 250,
             retries: 1,
-            requireAtrFeasibility: true
+            requireAtrFeasibility: true,
+            heartbeatCycles: 60 // Default to 60 cycles
         }
     ) {}
 
+    /**
+     * Runs a single scan cycle over all symbols, processing them concurrently.
+     * Sends a Telegram heartbeat message every heartbeatCycles (default 60) cycles,
+     * tracked via the database to persist across restarts.
+     */
     async runSingleScan(): Promise<void> {
-        const { concurrency, jitterMs = 0, retries = 1 } = this.opts;
+        const { concurrency, jitterMs = 0, retries = 1, heartbeatCycles = 60 } = this.opts;
+
+        // Increment the heartbeat cycle count
+        const cycleCount = await dbService.incrementHeartbeatCount();
+        logger.info(`Scan cycle ${cycleCount} started`, { symbols: this.symbols });
+
+        // Process symbols concurrently
         const queue = [...this.symbols];
         const workers = Array.from(
             { length: Math.min(concurrency, queue.length) },
             () => this.processWorker(queue, jitterMs, retries)
         );
         await Promise.all(workers);
-        await this.telegram.sendMessage(`Scan completed over ${this.symbols.length} symbols`).catch(() => {});
+
+        // Send heartbeat message if cycle count is a multiple of heartbeatCycles
+        if (cycleCount % heartbeatCycles === 0) {
+            await this.telegram.sendMessage(`Heartbeat: Scan completed over ${this.symbols.length} symbols`)
+                .catch(err => {
+                    logger.error('Failed to send Telegram heartbeat message', { error: err });
+                });
+            await dbService.resetHeartbeatCount();
+            logger.info(`Heartbeat sent and cycle count reset at cycle ${cycleCount}`);
+        }
+
+        logger.info(`Scan cycle ${cycleCount} completed`);
     }
 
     private async processWorker(queue: string[], jitterMs: number, retries: number): Promise<void> {
@@ -50,21 +77,30 @@ export class MarketScanner {
                 await this.withRetries(() => this.processSymbol(symbol), retries);
             } catch (err) {
                 const msg = (err as Error)?.message ?? String(err);
-                console.error(`Error processing ${symbol}: ${msg}`);
-                await this.telegram.sendMessage(`Error processing ${symbol}: ${msg}`).catch(() => {});
+                logger.error(`Error processing ${symbol}`, { error: msg });
+                await this.telegram.sendMessage(`Error processing ${symbol}: ${msg}`)
+                    .catch(err => {
+                        logger.error('Failed to send Telegram error message', { error: err });
+                    });
             }
         }
     }
 
     private async processSymbol(symbol: string): Promise<void> {
         const ohlcv = this.exchange.getOHLCV(symbol);
-        if (!ohlcv || ohlcv.length < 200) return;
+        if (!ohlcv || ohlcv.length < 200) {
+            logger.warn(`Insufficient OHLCV data for ${symbol}`, { candles: ohlcv?.length || 0 });
+            return;
+        }
 
         const highs = ohlcv.map(c => Number(c[2])).filter(v => !isNaN(v));
         const lows = ohlcv.map(c => Number(c[3])).filter(v => !isNaN(v));
         const closes = ohlcv.map(c => Number(c[4])).filter(v => !isNaN(v));
         const volumes = ohlcv.map(c => Number(c[5])).filter(v => !isNaN(v));
-        if (closes.length < 200) return;
+        if (closes.length < 200) {
+            logger.warn(`Insufficient valid OHLCV data for ${symbol}`, { closesLength: closes.length });
+            return;
+        }
 
         const currentPrice = closes.at(-1)!;
 
@@ -97,7 +133,6 @@ export class MarketScanner {
         const cooldownMs = this.opts.cooldownMs ?? 5 * 60_000;
         if (alerts.some(a => a.lastAlertAt && now - a.lastAlertAt < cooldownMs)) return;
 
-        // Update lastAlertAt for all alerts of this symbol
         for (const alert of alerts) {
             await dbService.setLastAlertTime(alert.id, now);
         }
@@ -115,7 +150,10 @@ export class MarketScanner {
             for (const r of signal.reason.slice(0, 6)) lines.push(`   - ${r}`);
         }
 
-        await this.telegram.sendMessage(lines.join('\n')).catch(() => {});
+        await this.telegram.sendMessage(lines.join('\n'))
+            .catch(err => {
+                logger.error('Failed to send Telegram trade signal', { error: err });
+            });
     }
 
     private async processDatabaseAlerts(
@@ -157,7 +195,10 @@ export class MarketScanner {
                     alert.note ? `• Note: ${alert.note}` : ''
                 ].filter(Boolean).join('\n');
 
-                await this.telegram.sendMessage(msg).catch(() => {});
+                await this.telegram.sendMessage(msg)
+                    .catch(err => {
+                        logger.error('Failed to send Telegram alert', { error: err });
+                    });
             }
         }
     }

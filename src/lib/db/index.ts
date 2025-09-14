@@ -1,7 +1,7 @@
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
 import { and, eq } from 'drizzle-orm';
-import { alert, locks, type Alert, type NewAlert } from './schema';
+import { alert, heartbeat, locks, type Alert, type NewAlert } from './schema';
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
 
@@ -18,7 +18,7 @@ if (!config.database_url) throw new Error('DATABASE_URL is not set in .env');
 
 let pool: mysql.Pool | null = null;
 // Drizzle instance typed with schema
-let drizzleDb: MySql2Database<{ alert: typeof alert; locks: typeof locks }> | null = null;
+let drizzleDb: MySql2Database<{ alert: typeof alert; locks: typeof locks, heartbeat: typeof heartbeat }> | null = null;
 
 export async function initializeClient() {
     const maxRetries = 3;
@@ -39,7 +39,7 @@ export async function initializeClient() {
 
             // Initialize Drizzle ORM with the pool and schema (alert and locks tables).
             drizzleDb = drizzle(pool, {
-                schema: { alert, locks },
+                schema: { alert, locks, heartbeat },
                 mode: 'default', // Standard MySQL mode (use 'planetscale' if using PlanetScale).
                 logger: config.env === 'dev' ? true : false, // Enable query logging in dev mode for debugging.
             });
@@ -190,6 +190,44 @@ export const dbService = {
             .insert(locks)
             .values({ id: 1, isLocked })
             .onDuplicateKeyUpdate({ set: { isLocked } })
+            .execute();
+    },
+
+    /**
+     * Gets the current heartbeat cycle count from the database.
+     * @returns {Promise<number>} The current cycle count
+     */
+    async getHeartbeatCount(): Promise<number> {
+        if (!drizzleDb) throw new Error('Database not initialized');
+        const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
+        return result.length > 0 ? result[0].cycleCount : 0;
+    },
+
+    /**
+     * Increments the heartbeat cycle count in the database.
+     * @returns {Promise<number>} The new cycle count
+     */
+    async incrementHeartbeatCount(): Promise<number> {
+        if (!drizzleDb) throw new Error('Database not initialized');
+        await drizzleDb
+            .update(heartbeat)
+            .set({ cycleCount: drizzleDb.raw('cycleCount + 1'), lastHeartbeatAt: Date.now() })
+            .where(eq(heartbeat.id, 1))
+            .execute();
+        const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
+        return result[0].cycleCount;
+    },
+
+    /**
+     * Resets the heartbeat cycle count to 0.
+     * @returns {Promise<void>}
+     */
+    async resetHeartbeatCount(): Promise<void> {
+        if (!drizzleDb) throw new Error('Database not initialized');
+        await drizzleDb
+            .update(heartbeat)
+            .set({ cycleCount: 0, lastHeartbeatAt: 0 })
+            .where(eq(heartbeat.id, 1))
             .execute();
     }
 };
