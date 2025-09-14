@@ -20,7 +20,7 @@ let pool: mysql.Pool | null = null;
 // Drizzle instance typed with schema
 let drizzleDb: MySql2Database<{ alert: typeof alert; locks: typeof locks }> | null = null;
 
-async function initializeClient() {
+export async function initializeClient() {
     const maxRetries = 3;
     for (let i = 0; i < maxRetries; i++) {
         try {
@@ -67,12 +67,6 @@ export async function closeDb() {
         logger.info('MySQL database connection pool closed');
     }
 }
-
-// Initialize the database connection on module load (runs at startup).
-initializeClient().catch(err => {
-    logger.error('Failed to initialize MySQL database:', err);
-    process.exit(1);
-});
 
 /**
  * Database service with methods for alerts and locks.
@@ -199,3 +193,9 @@ export const dbService = {
             .execute();
     }
 };
+
+// Initialize the database connection on module load (runs at startup).
+initializeClient().catch(err => {
+    logger.error('Failed to initialize MySQL database:', err);
+    process.exit(1);
+});

@@ -1,118 +1,103 @@
-// Importing dependencies and modules required for the worker logic
+// src/lib/worker-github.ts
+// This file is the main entry point for the trading application's worker process.
+// It initializes services (ExchangeService, Strategy, TelegramService, dbService)
+// and runs a single scan cycle using MarketScanner. It uses a MySQL database lock
+// to prevent concurrent runs and ensures graceful shutdown by releasing the lock
+// and closing the database connection.
 
-// Handles interaction with cryptocurrency exchanges using CCXT
+// Import required services and utilities for the trading application
 import { ExchangeService } from './services/exchange';
-
-// Implements the trading strategy logic (e.g., risk-reward, indicators, feasibility)
 import { Strategy } from './strategy';
-
-// Loads runtime configuration (symbols, exchange settings, timeframe, etc.)
 import { config } from './config/settings';
-
-// The scanner that coordinates exchange data, strategy decisions, and alerting
 import { MarketScanner } from './scanner-github';
-
-// Handles sending Telegram messages (e.g., notifications about trades, errors, status)
 import { TelegramService } from './services/telegram';
-
-// Provides access to database functions (alerts, locks, etc.)
-import { dbService } from './db';
+import { dbService, initializeClient, closeDb } from './db';
 import { createLogger } from './logger';
 
-
-// -------------------- LOGGER CONFIGURATION --------------------
-
-// Create a logger instance for this worker.
-// - `level: 'info'` means logs at "info" and higher (warn, error) will be recorded
-// - `format`: logs will include timestamps and be in JSON format for structure
-// - `transports`: determines where logs are written
-//    1. File transport: writes logs to `logs/worker.log` (persistent storage)
-//    2. Console transport: outputs logs in real time to the terminal
+// Initialize a logger instance with the 'cron-worker' label for structured logging
+// Logs are written to both a file (logs/worker.log) and the console for real-time monitoring
 const logger = createLogger('cron-worker');
 
-
-// -------------------- WORKER ENTRY POINT --------------------
-
-// The main function that runs a worker process
-// This worker does one cycle of:
-//  1. Acquire lock (to prevent multiple workers overlapping)
-//  2. Initialize exchange, strategy, and Telegram service
-//  3. Run a single scan with MarketScanner
-//  4. Release lock (always, even on error)
+/**
+ * Main entry point for the trading application's worker process.
+ * Initializes the MySQL database, acquires a lock, sets up services, runs a single
+ * MarketScanner cycle, and releases the lock and database connection. Handles errors
+ * gracefully to ensure the lock is released and resources are freed.
+ * @returns {Promise<void>} Resolves when the worker completes or skips execution
+ * @throws {Error} If critical initialization fails (e.g., database or exchange)
+ */
 export async function startWorker(): Promise<void> {
-
-    // 1. Check the lock in the database
-    // The lock ensures that only one worker runs at a time.
-    // If lock is `true`, another worker is already running → skip execution
-    const lock = await dbService.getLock();
-    if (lock) {
-        logger.warn('Bot already running, skipping execution');
-        return;
+    // Explicitly initialize the MySQL database connection to ensure dbService is ready
+    // This calls initializeClient() in db/index.ts, which sets up the Drizzle ORM
+    // with the MySQL connection pool using config.database_url
+    try {
+        await initializeClient();
+        logger.info('MySQL database initialized successfully');
+    } catch (err: any) {
+        logger.error('Failed to initialize MySQL database', { error: err });
+        throw new Error(`Database initialization failed: ${err.message}`);
     }
 
-    // If no lock, set it to `true` → claim ownership of the worker run
-    await dbService.setLock(true);
+    // Check the database lock to prevent concurrent worker instances
+    // If lock is true, another worker is running, so skip execution
+    let lockAcquired = false;
+    try {
+        const lock = await dbService.getLock();
+        if (lock) {
+            logger.warn('Bot already running, skipping execution');
+            return;
+        }
 
-    // 2. Create service instances
+        // Acquire the lock by setting it to true in the locks table
+        await dbService.setLock(true);
+        lockAcquired = true;
+        logger.info('Lock acquired');
+    } catch (err: any) {
+        logger.error('Failed to acquire lock', { error: err });
+        throw new Error(`Lock acquisition failed: ${err.message}`);
+    }
 
-    // ExchangeService:
-    // - Handles fetching OHLCV data
-    // - Polls exchange for updates
-    // - Provides latest price & historical candles
+    // Initialize core services for trading
     const exchange = new ExchangeService();
-
-    // Strategy:
-    // - Implements the trading strategy logic
-    // - `new Strategy(3)` → possibly sets a risk/reward ratio or number of trades
-    const strategy = new Strategy(3);
-
-    // TelegramService:
-    // - Handles sending bot updates to a Telegram channel/chat
+    const strategy = new Strategy(3); // Configure strategy with 3% risk-reward target
     const telegram = new TelegramService();
 
     try {
-        // 3. Initialize exchange with configured trading symbols
-        //    - Downloads initial OHLCV data
-        //    - Starts polling prices
+        // Initialize the exchange with configured symbols (e.g., ['BTC/USDT', 'ETH/USDT'])
+        // This fetches initial OHLCV data and starts polling for updates
         await exchange.initialize(config.symbols);
-
-        // Log successful exchange initialization
         logger.info('Exchange initialized', { symbols: config.symbols });
 
-        // Retrieve supported symbols from ExchangeService as a Set and convert to an array
-        // MarketScanner expects an array of strings, so we use Array.from to convert the Set
+        // Convert supported symbols from Set to array for MarketScanner
+        // MarketScanner expects an array of strings, so we use Array.from
         const supportedSymbols = Array.from(exchange.getSupportedSymbols());
 
-        // Create the MarketScanner:
-        // - Coordinates the strategy and exchange
-        // - Runs scans over the given symbols
-        // - Can notify via Telegram
+        // Initialize MarketScanner with services and supported symbols
         const scanner = new MarketScanner(exchange, strategy, supportedSymbols, telegram);
 
-        // Execute a single scan cycle:
-        // - Fetch data
-        // - Run strategy on each symbol
-        // - Generate alerts or actions
+        // Run a single scan cycle to fetch data, apply strategy, and generate alerts
         await scanner.runSingleScan();
-
-        // Log successful completion
         logger.info('Worker completed', { symbols: config.symbols });
-
     } catch (err) {
-        // 4. Handle errors gracefully
-
-        // Log the failure with error details
-        // Winston will log an object like:
-        // { level: 'error', message: 'Worker failed', error: [Error object] }
+        // Log any errors during execution and rethrow to ensure caller is aware
         logger.error('Worker failed', { error: err });
-
-        // Re-throw the error so caller can see it too
         throw err;
-
     } finally {
-        // 5. Release the lock no matter what happens
-        // This ensures the system does not remain stuck
-        // (important if the worker crashes or throws errors)
-        await dbService.setLock(false);
+        // Always release the lock and close database connection, even if an error occurs
+        if (lockAcquired) {
+            try {
+                await dbService.setLock(false);
+                logger.info('Lock released');
+            } catch (err) {
+                logger.warn('Failed to release lock', { error: err });
+            }
+        }
+        // Close the MySQL connection pool to release resources
+        try {
+            await closeDb();
+            logger.info('Database connection closed');
+        } catch (err) {
+            logger.warn('Failed to close database connection', { error: err });
+        }
     }
 }
