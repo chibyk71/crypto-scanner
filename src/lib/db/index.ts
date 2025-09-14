@@ -1,4 +1,4 @@
-import { drizzle } from 'drizzle-orm/mysql2';
+import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
 import { and, eq } from 'drizzle-orm';
 import { alert, locks, type Alert, type NewAlert } from './schema';
@@ -17,7 +17,8 @@ const logger = createLogger('db');
 if (!config.database_url) throw new Error('DATABASE_URL is not set in .env');
 
 let pool: mysql.Pool | null = null;
-let drizzleDb: ReturnType<typeof drizzle> | null = null;
+// Drizzle instance typed with schema
+let drizzleDb: MySql2Database<{ alert: typeof alert; locks: typeof locks }> | null = null;
 
 async function initializeClient() {
     const maxRetries = 3;
