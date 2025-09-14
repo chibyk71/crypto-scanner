@@ -18,7 +18,7 @@ export class MarketScanner {
         private readonly symbols: string[],
         private readonly telegram: TelegramService,
         private readonly opts: ScannerOptions = {
-            concurrency: 1,
+            concurrency: 3,
             cooldownMs: 5 * 60_000,
             jitterMs: 250,
             retries: 1,
