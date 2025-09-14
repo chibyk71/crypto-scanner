@@ -1,30 +1,40 @@
 import { createLogger as winstonCreateLogger, format, transports } from 'winston';
 import { config } from './config/settings';
+import * as path from 'path';
+import * as fs from 'fs';
+
+// Ensure logs directory exists
+const logDir = path.resolve(process.cwd(), 'logs');
+if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+}
 
 /**
  * Creates a Winston logger instance with console and file transports.
- * - Supports configurable log levels (e.g., 'INFO', 'DEBUG') via LOG_LEVEL env.
- * - Logs to console (for cPanel Setup Node.js App logs) and file (logs/app.log).
- * - Used in db/index.ts, scanner-github.ts, and other modules for consistent logging.
- * @param label - The label for the logger (e.g., 'db', 'scanner').
- * @returns A Winston logger instance.
+ * - Configurable log level via LOG_LEVEL env (defaults to 'info').
+ * - Console logs show in cPanel logs, file logs go to logs/app.log.
+ * - Used across modules for consistent logging.
+ * @param label - Logger label (e.g., 'db', 'scanner').
  */
 export function createLogger(label: string) {
-    const logLevel = config.log_level || 'info'; // Default to 'info' if LOG_LEVEL is unset.
+    const logLevel = (config.log_level || 'info').toLowerCase();
 
     return winstonCreateLogger({
-        level: logLevel.toLowerCase(), // Normalize to lowercase for Winston.
+        level: logLevel,
         format: format.combine(
-            format.label({ label }), // Add module label (e.g., '[db]').
-            format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), // Add timestamp.
-            format.printf(({ level, message, label, timestamp }) => {
-                return `${timestamp} [${label}] ${level.toUpperCase()}: ${message}`;
-            }),
-            format.errors({ stack: true }),
+            format.label({ label }),
+            format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+            format.errors({ stack: true }), // Ensure stack traces are captured
+            format.splat(),                 // Allow printf-style %s replacements
+            format.printf(({ level, message, label, timestamp, stack }) => {
+                return stack
+                    ? `${timestamp} [${label}] ${level.toUpperCase()}: ${message}\n${stack}`
+                    : `${timestamp} [${label}] ${level.toUpperCase()}: ${message}`;
+            })
         ),
         transports: [
-            new transports.Console(), // Logs to console (visible in cPanel Setup Node.js App logs).
-            new transports.File({ filename: 'logs/app.log' }), // Logs to /home/username/crypto-scanner/logs/app.log.
+            new transports.Console(),
+            new transports.File({ filename: path.join(logDir, 'app.log') }),
         ],
     });
 }
