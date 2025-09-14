@@ -9,7 +9,6 @@ import { ExchangeService } from './services/exchange';
 import { TelegramService } from './services/telegram';
 import { Strategy } from './strategy';
 import { MarketScanner } from './scanner';
-import { config } from './config/settings';
 import * as fs from 'fs/promises';
 import { createLogger } from './logger';
 
@@ -73,21 +72,21 @@ export async function startWorker() {
     const exchange = new ExchangeService();
     const strategy = new Strategy(3); // Configure strategy with 3% risk-reward target
     const telegram = new TelegramService();
+    // Retrieve supported symbols from ExchangeService as a Set and convert to an array
+    // MarketScanner expects an array of strings, so we use Array.from to convert the Set
+    const supportedSymbols = exchange.getSupportedSymbols();
 
     // Initialize the exchange with configured symbols from settings
     try {
-        await exchange.initialize(config.symbols);
-        logger.info('Exchange initialized', { symbols: config.symbols });
+        await exchange.initialize();
+
+        logger.info('Exchange initialized', { symbols: supportedSymbols });
     } catch (err) {
         // Log initialization failure with detailed error information and release lock
         logger.error('Failed to initialize exchange', { error: err });
         await releaseLock();
         throw err; // Stop execution if exchange initialization fails
     }
-
-    // Retrieve supported symbols from ExchangeService as a Set and convert to an array
-    // MarketScanner expects an array of strings, so we use Array.from to convert the Set
-    const supportedSymbols = Array.from(exchange.getSupportedSymbols());
 
     // Initialize MarketScanner with services and the array of supported symbols
     const scanner = new MarketScanner(
@@ -113,7 +112,7 @@ export async function startWorker() {
     // Start the MarketScanner to begin monitoring markets
     try {
         scanner.start();
-        logger.info('MarketScanner started', { symbols: config.symbols });
+        logger.info('MarketScanner started', { symbols: supportedSymbols });
     } catch (err) {
         // Log failure to start scanner, perform cleanup, and rethrow the error
         logger.error('Failed to start MarketScanner', { error: err });

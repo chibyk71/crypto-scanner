@@ -8,7 +8,6 @@
 // Import required services and utilities for the trading application
 import { ExchangeService } from './services/exchange';
 import { Strategy } from './strategy';
-import { config } from './config/settings';
 import { MarketScanner } from './scanner-github';
 import { TelegramService } from './services/telegram';
 import { dbService, initializeClient, closeDb } from './db';
@@ -65,19 +64,20 @@ export async function startWorker(): Promise<void> {
     try {
         // Initialize the exchange with configured symbols (e.g., ['BTC/USDT', 'ETH/USDT'])
         // This fetches initial OHLCV data and starts polling for updates
-        await exchange.initialize(config.symbols);
-        logger.info('Exchange initialized', { symbols: config.symbols });
+        await exchange.initialize();
 
         // Convert supported symbols from Set to array for MarketScanner
         // MarketScanner expects an array of strings, so we use Array.from
-        const supportedSymbols = Array.from(exchange.getSupportedSymbols());
+        const supportedSymbols = exchange.getSupportedSymbols();
+
+        logger.info('Exchange initialized', { symbols: supportedSymbols });
 
         // Initialize MarketScanner with services and supported symbols
         const scanner = new MarketScanner(exchange, strategy, supportedSymbols, telegram);
 
         // Run a single scan cycle to fetch data, apply strategy, and generate alerts
         await scanner.runSingleScan();
-        logger.info('Worker completed', { symbols: config.symbols });
+        logger.info('Worker completed', { symbols: supportedSymbols });
     } catch (err) {
         // Log any errors during execution and rethrow to ensure caller is aware
         logger.error('Worker failed', { error: err });
