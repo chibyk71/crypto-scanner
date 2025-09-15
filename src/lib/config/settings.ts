@@ -5,6 +5,7 @@ dotenvConfig();
 
 export const config = {
     env: process.env.ENV || 'dev',
+    runtime_env: process.env.RUNTIME_ENV || 'cron',
     log_level: process.env.LOG_LEVEL || 'info',
     exchange: {
         name: process.env.EXCHANGE ?? 'bybit',
