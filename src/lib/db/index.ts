@@ -1,6 +1,6 @@
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { alert, locks, heartbeat, type Alert, type NewAlert } from './schema';
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
@@ -49,7 +49,7 @@ export async function initializeClient() {
             pool = mysql.createPool({
                 uri: config.database_url,
                 waitForConnections: true,
-                connectionLimit: 10,
+                connectionLimit: 3,
                 queueLimit: 0,
             });
 
@@ -63,16 +63,6 @@ export async function initializeClient() {
                 mode: 'default',
                 logger: config.env === 'dev' ? true : false,
             });
-
-            // Ensure the heartbeat table has a default row for cycle tracking
-            // - Inserts id: 1 with cycleCount: 0 if it doesn't exist
-            // - Uses ON DUPLICATE KEY UPDATE to avoid conflicts
-            await drizzleDb
-                .insert(heartbeat)
-                .values({ id: 1, cycleCount: 0, lastHeartbeatAt: 0 })
-                .onDuplicateKeyUpdate({ set: { cycleCount: 0, lastHeartbeatAt: 0 } })
-                .execute();
-            logger.info('Heartbeat table initialized with default row');
 
             // Log successful initialization
             logger.info('MySQL database initialized successfully');
@@ -97,10 +87,14 @@ export async function initializeClient() {
  */
 export async function closeDb() {
     if (pool) {
-        await pool.end();
-        pool = null;
-        drizzleDb = null;
-        logger.info('MySQL database connection pool closed');
+        try {
+            pool.end(); // Ensure all connections are closed
+            logger.info('MySQL database connection pool closed');
+        } catch (err) {
+            logger.error('Failed to close database pool', { error: err });
+        } finally {
+            pool = null; // Prevent reuse
+        }
     }
 }
 
@@ -272,11 +266,6 @@ export const dbService = {
      */
     async incrementHeartbeatCount(): Promise<number> {
         if (!drizzleDb) throw new Error('Database not initialized');
-        await drizzleDb
-            .update(heartbeat)
-            .set({ cycleCount: sql`cycleCount + 1`, lastHeartbeatAt: Date.now() })
-            .where(eq(heartbeat.id, 1))
-            .execute();
         const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
         if (result.length === 0) {
             logger.warn('No heartbeat row found after update, initializing default row');
@@ -287,7 +276,14 @@ export const dbService = {
                 .execute();
             return 1;
         }
-        return result[0].cycleCount;
+        let cycleCount = result[0].cycleCount + 1;
+        await drizzleDb
+            .update(heartbeat)
+            .set({ cycleCount: cycleCount, lastHeartbeatAt: Date.now() })
+            .where(eq(heartbeat.id, 1))
+            .execute();
+
+        return cycleCount;
     },
 
     /**
