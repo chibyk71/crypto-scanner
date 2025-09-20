@@ -1,3 +1,4 @@
+// src/lib/logger.js
 import { createLogger as winstonCreateLogger, format, transports } from 'winston';
 import { config } from './config/settings';
 import * as path from 'path';
@@ -16,22 +17,31 @@ if (!fs.existsSync(logDir)) {
  * - Used across modules for consistent logging.
  * @param label - Logger label (e.g., 'db', 'scanner').
  */
-export function createLogger(label: string) {
+export function createLogger(label:string) {
     const logLevel = (config.log_level || 'info').toLowerCase();
+
+    const logFormat = format.combine(
+        format.label({ label }),
+        format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        format.errors({ stack: true }), // Ensure stack traces are captured
+        format.splat(), // Allow printf-style %s replacements
+        format.printf(({ level, message, label, timestamp, stack, ...meta }) => {
+            let logMessage = `${timestamp} [${label}] ${level.toUpperCase()}: ${message}`;
+
+            if (Object.keys(meta).length > 0) {
+                logMessage += ` ${JSON.stringify(meta)}`;
+            }
+            if (stack) {
+                logMessage += `\n${stack}`;
+            }
+
+            return logMessage;
+        })
+    );
 
     return winstonCreateLogger({
         level: logLevel,
-        format: format.combine(
-            format.label({ label }),
-            format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-            format.errors({ stack: true }), // Ensure stack traces are captured
-            format.splat(),                 // Allow printf-style %s replacements
-            format.printf(({ level, message, label, timestamp, stack }) => {
-                return stack
-                    ? `${timestamp} [${label}] ${level.toUpperCase()}: ${message}\n${stack}`
-                    : `${timestamp} [${label}] ${level.toUpperCase()}: ${message}`;
-            })
-        ),
+        format: logFormat,
         transports: [
             new transports.Console(),
             new transports.File({ filename: path.join(logDir, 'app.log') }),
