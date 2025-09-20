@@ -1,33 +1,156 @@
+// src/lib/scanner.ts
+
+/**
+ * Provides functionality for interacting with a cryptocurrency exchange, such as fetching market data or executing trades.
+ */
 import { ExchangeService } from './services/exchange';
+
+/**
+ * Provides functionality for sending messages, photos, and documents to a Telegram chat.
+ */
 import { TelegramService } from './services/telegram';
+
+/**
+ * Provides database operations for managing alerts, locks, and heartbeats.
+ */
 import { dbService } from './db';
+
+/**
+ * Imports the trading strategy logic and the `TradeSignal` type for generating and interpreting trade signals.
+ */
 import { Strategy, type TradeSignal } from './strategy';
+
+/**
+ * Imports a logger utility to log scanner-related events and errors.
+ * The logger is configured with a context of 'MarketScanner' for categorized logging.
+ */
 import { createLogger } from './logger';
+
+/**
+ * Imports the application configuration, including polling intervals, heartbeat settings, and symbols.
+ */
 import { config } from './config/settings';
 
+/**
+ * Initializes a logger instance for scanner-related logging.
+ * Logs are tagged with the 'MarketScanner' context for easy filtering and debugging.
+ */
 const logger = createLogger('MarketScanner');
 
+/**
+ * Defines the possible modes for the market scanner.
+ * - 'single': Performs a one-time scan of the market.
+ * - 'periodic': Runs scans on a scheduled interval.
+ */
 type ScannerMode = 'single' | 'periodic';
+
+/**
+ * Defines the possible backends for managing cooldown periods between alerts.
+ * - 'database': Uses the database to track cooldowns.
+ * - 'memory': Uses in-memory storage for cooldown tracking.
+ */
 type CooldownBackend = 'database' | 'memory';
 
+/**
+ * Configuration options for the market scanner.
+ * Allows customization of scanning behavior, concurrency, and alert settings.
+ */
 type ScannerOptions = {
-    mode?: ScannerMode; // 'single' for one-off scans, 'periodic' for scheduled scans
-    intervalMs?: number; // Scan interval for periodic mode (ms)
-    concurrency: number; // Max number of symbols processed concurrently
-    cooldownMs?: number; // Cooldown period between alerts (ms)
-    jitterMs?: number; // Random delay to avoid rate limits (ms)
-    retries?: number; // Number of retries for transient errors
-    heartbeatCycles?: number; // Send heartbeat every N cycles
-    requireAtrFeasibility?: boolean; // Check ATR-based feasibility
-    cooldownBackend?: CooldownBackend; // 'database' or 'memory' for cooldown management
+    /**
+     * The scanning mode: 'single' for one-off scans or 'periodic' for scheduled scans.
+     * @default 'single'
+     */
+    mode?: ScannerMode;
+
+    /**
+     * The interval (in milliseconds) between scans in periodic mode.
+     * @default config.pollingInterval (typically 60,000 ms)
+     */
+    intervalMs?: number;
+
+    /**
+     * The maximum number of symbols to process concurrently.
+     * @default 3
+     */
+    concurrency: number;
+
+    /**
+     * The cooldown period (in milliseconds) between alerts for the same symbol.
+     * @default 300,000 (5 minutes)
+     */
+    cooldownMs?: number;
+
+    /**
+     * A random delay (in milliseconds) to avoid exchange rate limits.
+     * @default 250
+     */
+    jitterMs?: number;
+
+    /**
+     * The number of retries for transient errors during symbol processing.
+     * @default 1
+     */
+    retries?: number;
+
+    /**
+     * The number of scan cycles between heartbeat messages.
+     * @default config.heartBeatInterval (typically 60)
+     */
+    heartbeatCycles?: number;
+
+    /**
+     * Whether to check ATR-based feasibility before acting on trade signals.
+     * @default true
+     */
+    requireAtrFeasibility?: boolean;
+
+    /**
+     * The backend for managing cooldown periods: 'database' or 'memory'.
+     * @default 'database'
+     */
+    cooldownBackend?: CooldownBackend;
 };
 
+/**
+ * Manages market scanning for trading signals across multiple symbols.
+ * Integrates with an exchange service, trading strategy, database, and Telegram for notifications.
+ * Supports both single and periodic scanning modes with configurable options.
+ */
 export class MarketScanner {
+    /**
+     * Indicates whether the scanner is currently running.
+     * @private
+     */
     private running = false;
+
+    /**
+     * The timer for periodic scans, used in 'periodic' mode.
+     * @private
+     */
     private timer: NodeJS.Timeout | null = null;
+
+    /**
+     * The number of scan cycles completed (in-memory counter).
+     * Used when `cooldownBackend` is set to 'memory'.
+     * @private
+     */
     private scanCount = 0;
+
+    /**
+     * Tracks the timestamp of the last alert for each symbol (in-memory).
+     * Used when `cooldownBackend` is set to 'memory'.
+     * @private
+     */
     private lastAlertAt: Record<string, number> = {};
 
+    /**
+     * Initializes the market scanner with dependencies and configuration options.
+     * @param exchange - The exchange service for fetching market data.
+     * @param strategy - The trading strategy for generating trade signals.
+     * @param symbols - The list of trading symbols to scan (e.g., ['BTC/USDT', 'ETH/USDT']).
+     * @param telegram - The Telegram service for sending notifications.
+     * @param opts - Configuration options for the scanner.
+     */
     constructor(
         private readonly exchange: ExchangeService,
         private readonly strategy: Strategy,
@@ -46,6 +169,17 @@ export class MarketScanner {
         }
     ) {}
 
+    /**
+     * Starts the market scanner in either single or periodic mode.
+     * In periodic mode, schedules scans at the configured interval.
+     * Does nothing if the scanner is already running.
+     * @returns {Promise<void>} A promise that resolves when the scanner starts.
+     * @example
+     * typescript
+     * const scanner = new MarketScanner(exchange, strategy, ['BTC/USDT'], telegram);
+     * await scanner.start();
+     *
+     */
     async start(): Promise<void> {
         if (this.running) return;
         this.running = true;
@@ -61,6 +195,14 @@ export class MarketScanner {
         }
     }
 
+    /**
+     * Stops the market scanner and clears any scheduled scans.
+     * Safe to call even if the scanner is not running.
+     * @example
+     * typescript
+     * scanner.stop();
+     *
+     */
     stop(): void {
         this.running = false;
         if (this.timer) {
@@ -69,6 +211,12 @@ export class MarketScanner {
         }
     }
 
+    /**
+     * Executes a single scan cycle over all symbols.
+     * Processes symbols concurrently, sends heartbeat messages, and handles errors.
+     * Used for both single and periodic modes.
+     * @returns {Promise<void>} A promise that resolves when the scan cycle completes.
+     */
     async runSingleScan(): Promise<void> {
         const cycleCount = this.opts.cooldownBackend === 'database'
             ? await dbService.incrementHeartbeatCount()
@@ -98,6 +246,11 @@ export class MarketScanner {
         logger.info(`Scan cycle ${cycleCount} completed`);
     }
 
+    /**
+     * Executes a scan cycle for periodic mode.
+     * Identical to `runSingleScan` but separated for clarity and future extensibility.
+     * @returns {Promise<void>} A promise that resolves when the scan cycle completes.
+     */
     private async runScanCycle(): Promise<void> {
         const cycleCount = this.opts.cooldownBackend === 'database'
             ? await dbService.incrementHeartbeatCount()
@@ -125,6 +278,15 @@ export class MarketScanner {
         }
     }
 
+    /**
+     * Processes symbols from a queue concurrently with optional jitter and retries.
+     * Handles errors by logging and sending Telegram notifications.
+     * @param queue - The queue of symbols to process.
+     * @param jitterMs - Random delay to avoid rate limits.
+     * @param retries - Number of retries for transient errors.
+     * @returns {Promise<void>} A promise that resolves when all symbols in the worker's queue are processed.
+     * @private
+     */
     private async processWorker(queue: string[], jitterMs: number, retries: number): Promise<void> {
         while (queue.length) {
             const symbol = queue.shift();
@@ -147,6 +309,13 @@ export class MarketScanner {
         }
     }
 
+    /**
+     * Processes a single symbol by fetching OHLCV data and generating a trade signal.
+     * Validates data sufficiency and triggers trade or alert processing if applicable.
+     * @param symbol - The trading symbol to process (e.g., 'BTC/USDT').
+     * @returns {Promise<void>} A promise that resolves when the symbol is processed.
+     * @private
+     */
     private async processSymbol(symbol: string): Promise<void> {
         const ohlcv = this.exchange.getOHLCV(symbol);
         const minCandles = config.historyLength ?? 200;
@@ -181,6 +350,15 @@ export class MarketScanner {
         await this.processDatabaseAlerts(symbol, signal, currentPrice);
     }
 
+    /**
+     * Processes a trade signal for a symbol, applying ATR feasibility checks and cooldowns.
+     * Sends a Telegram notification with signal details if conditions are met.
+     * @param symbol - The trading symbol (e.g., 'BTC/USDT').
+     * @param signal - The trade signal generated by the strategy.
+     * @param currentPrice - The current price of the symbol.
+     * @returns {Promise<void>} A promise that resolves when the signal is processed.
+     * @private
+     */
     private async processTradeSignal(symbol: string, signal: TradeSignal, currentPrice: number): Promise<void> {
         if (this.opts.requireAtrFeasibility !== false) {
             const atr = this.strategy.lastAtr;
@@ -224,6 +402,15 @@ export class MarketScanner {
             });
     }
 
+    /**
+     * Processes database-stored alerts for a symbol, checking conditions and sending notifications.
+     * Applies cooldowns and updates alert statuses as needed.
+     * @param symbol - The trading symbol (e.g., 'BTC/USDT').
+     * @param signal - The trade signal generated by the strategy.
+     * @param currentPrice - The current price of the symbol.
+     * @returns {Promise<void>} A promise that resolves when all alerts are processed.
+     * @private
+     */
     private async processDatabaseAlerts(
         symbol: string,
         signal: TradeSignal,
@@ -279,6 +466,14 @@ export class MarketScanner {
         }
     }
 
+    /**
+     * Executes a function with retries for transient errors.
+     * @param fn - The function to execute.
+     * @param retries - The number of retries to attempt.
+     * @returns {Promise<T>} The result of the function.
+     * @throws The last error if all retries fail.
+     * @private
+     */
     private async withRetries<T>(fn: () => Promise<T>, retries: number): Promise<T> {
         let err: unknown;
         for (let i = 0; i <= retries; i++) {
@@ -292,3 +487,4 @@ export class MarketScanner {
         throw err;
     }
 }
+
