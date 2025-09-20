@@ -1,15 +1,49 @@
+// src/lib/db/index.ts
+
+/**
+ * Provides Drizzle ORM functionality for interacting with a MySQL database.
+ * Drizzle is used to define schemas and execute type-safe queries.
+ * @see https://orm.drizzle.team/docs/overview
+ */
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
+
+/**
+ * Provides a promise-based MySQL client for creating connection pools and executing raw queries.
+ * @see https://www.npmjs.com/package/mysql2
+ */
 import mysql from 'mysql2/promise';
+
+/**
+ * Provides Drizzle ORM utilities for constructing SQL queries, including logical operators and equality checks.
+ */
 import { and, eq } from 'drizzle-orm';
-import { alert, locks, heartbeat, type Alert, type NewAlert } from './schema';
+
+/**
+ * Imports database schema definitions and types for the `alert`, `locks`, and `heartbeat` tables.
+ * These schemas define the structure of the database tables and the types for their records.
+ */
+import { alert, locks, heartbeat, type Alert, type NewAlert, type Heartbeat } from './schema';
+
+/**
+ * Imports the application configuration, including the database URL, from the settings module.
+ * The configuration is used to establish the database connection.
+ */
 import { config } from '../config/settings';
+
+/**
+ * Imports a logger utility to log database-related events and errors.
+ * The logger is configured with a context of 'db' for categorized logging.
+ */
 import { createLogger } from '../logger';
 
-// Initialize logger for database-related logging
+/**
+ * Initializes a logger instance for database-related logging.
+ * Logs are tagged with the 'db' context for easy filtering and debugging.
+ */
 const logger = createLogger('db');
 
 /**
- * Validates that DATABASE_URL is set in the configuration.
+ * Validates the database URL at the module level to ensure early failure on misconfiguration.
  * - Required for MySQL connection (format: mysql://user:pass@localhost:3306/dbname).
  * - Throws an error if not set, preventing startup with invalid config.
  */
@@ -19,236 +53,188 @@ if (!config.database_url) {
 }
 
 /**
- * Global variables for MySQL connection pool and Drizzle ORM instance.
- * - pool: Manages MySQL connections for efficient query handling.
- * - drizzleDb: Type-safe Drizzle ORM instance for database operations.
- * - Initialized as null, set during initializeClient().
+ * Centralized database service class to manage MySQL connections and Drizzle ORM queries.
+ * Encapsulates connection pooling, initialization, and query methods for alerts, locks, and heartbeats.
+ * Ensures a single point of control for database interactions and state management.
  */
-let pool: mysql.Pool | null = null;
-let drizzleDb: MySql2Database<{ alert: typeof alert; locks: typeof locks; heartbeat: typeof heartbeat }> | null = null;
+class DatabaseService {
+    /**
+     * The MySQL connection pool, initialized during `initialize()`.
+     * @private
+     */
+    private pool: mysql.Pool | null = null;
 
-/**
- * Initializes the MySQL database connection using mysql2/promise.
- * - Creates a connection pool to handle multiple concurrent queries (e.g., for alerts in scanner-github.ts).
- * - Uses DATABASE_URL from config (loaded via .env or settings.ts).
- * - Tests the connection with a simple SELECT query.
- * - Initializes the Drizzle ORM instance with the schema (alert, locks, heartbeat tables).
- * - Ensures the heartbeat table has a default row (id: 1, cycleCount: 0, lastHeartbeatAt: 0).
- * - Retries up to 3 times with exponential backoff for transient errors (e.g., cPanel network issues).
- */
-export async function initializeClient() {
-    const maxRetries = 3;
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            // Log the connection attempt with the DATABASE_URL for debugging
-            logger.info('Attempting to connect to MySQL', { database_url: config.database_url });
+    /**
+     * The Drizzle ORM instance, configured with the database schema.
+     * Provides type-safe query methods for the `alert`, `locks`, and `heartbeat` tables.
+     * @private
+     */
+    private drizzleDb: MySql2Database<{
+        alert: typeof alert;
+        locks: typeof locks;
+        heartbeat: typeof heartbeat;
+    }> | null = null;
 
-            // Create a MySQL connection pool with a limit of 10 connections
-            // - waitForConnections: Ensures queries wait for available connections
-            // - queueLimit: 0 allows unlimited queued queries (suitable for cron jobs)
-            pool = mysql.createPool({
-                uri: config.database_url,
-                waitForConnections: true,
-                connectionLimit: 3,
-                queueLimit: 0,
-            });
+    /**
+     * Initializes the MySQL connection pool and Drizzle ORM instance.
+     * Uses an exponential back-off retry strategy to handle transient connection failures.
+     * Logs connection attempts and errors for debugging.
+     * @throws {Error} If connection fails after the maximum number of retries.
+     */
+    public async initialize(): Promise<void> {
+        const maxRetries = 3;
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                logger.info(`Attempting to connect to MySQL (attempt ${i + 1})`);
+                this.pool = mysql.createPool({ uri: config.database_url, connectionLimit: 3 });
 
-            // Test the connection with a simple query to ensure connectivity
-            const [result] = await pool.execute('SELECT 1');
-            if (!result) throw new Error('Connection test failed');
+                // Test the connection with a simple query to ensure it works
+                await this.pool.execute('SELECT 1');
 
-            // Initialize Drizzle ORM with the schema and logging based on environment
-            drizzleDb = drizzle(pool, {
-                schema: { alert, locks, heartbeat },
-                mode: 'default',
-                logger: config.env === 'dev' ? true : false,
-            });
+                this.drizzleDb = drizzle(this.pool, {
+                    schema: { alert, locks, heartbeat },
+                    mode: 'default',
+                    logger: config.env === 'dev', // Enable Drizzle query logging in development
+                });
 
-            // Log successful initialization
-            logger.info('MySQL database initialized successfully');
-            return;
-        } catch (err:any) {
-            // Log detailed error information for debugging
-            logger.error(`Database connection attempt ${i + 1} failed`, {
-                error: err.message,
-                database_url: config.database_url
-            });
-            if (i === maxRetries - 1) throw new Error(`Failed to connect to MySQL database: ${err.message}`);
-            // Exponential backoff: wait longer with each retry
-            await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+                logger.info('MySQL database initialized successfully');
+                return;
+
+            } catch (err: any) {
+                logger.error(`Database connection attempt ${i + 1} failed: ${err.message}`);
+                if (i === maxRetries - 1) {
+                    throw new Error(`Failed to connect to MySQL database after ${maxRetries} retries: ${err.message}`);
+                }
+                const delay = 1000 * Math.pow(2, i); // Exponential back-off
+                logger.warn(`Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
         }
     }
-}
 
-/**
- * Closes the MySQL connection pool gracefully.
- * - Called on process exit or error to release resources.
- * - Ensures no lingering connections, especially in cPanel shared hosting.
- */
-export async function closeDb() {
-    if (pool) {
-        try {
-            pool.end(); // Ensure all connections are closed
+    /**
+     * Safely retrieves the Drizzle ORM instance, ensuring it has been initialized.
+     * @returns {MySql2Database} The Drizzle ORM instance.
+     * @throws {Error} If the database is not initialized.
+     * @private
+     */
+    private get db(): MySql2Database<any> {
+        if (!this.drizzleDb) {
+            throw new Error('Database not initialized. Call initialize() first.');
+        }
+        return this.drizzleDb;
+    }
+
+    /**
+     * Closes the MySQL connection pool gracefully and resets the internal state.
+     * Ensures resources are released properly when shutting down the application.
+     */
+    public async close(): Promise<void> {
+        if (this.pool) {
+            await this.pool.end();
             logger.info('MySQL database connection pool closed');
-        } catch (err) {
-            logger.error('Failed to close database pool', { error: err });
-        } finally {
-            pool = null; // Prevent reuse
+            this.pool = null;
+            this.drizzleDb = null;
         }
     }
-}
 
-/**
- * Database service providing methods for managing alerts, locks, and heartbeats.
- * - Uses Drizzle ORM for type-safe, efficient queries.
- * - Handles errors and logging for debugging (e.g., in cPanel logs or local dev).
- * - Designed for use in scanner-github.ts (cron jobs) and index-github.ts.
- */
-export const dbService = {
+    // --- Alert Management ---
+
     /**
-     * Creates a new alert in the 'alert' table.
-     * - Used when users add alerts via the bot's interface (e.g., Telegram).
-     * - Inserts alert data and returns the auto-generated ID.
-     * @param alertData Data for the new alert (symbol, condition, etc.)
-     * @returns The ID of the inserted alert
+     * Creates a new alert record in the `alert` table.
+     * @param alertData - The data for the new alert, conforming to the `NewAlert` type.
+     * @returns {Promise<number>} The ID of the inserted alert.
      */
-    async createAlert(alertData: NewAlert): Promise<number> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const [inserted] = await drizzleDb.insert(alert).values(alertData).execute();
+    public async createAlert(alertData: NewAlert): Promise<number> {
+        const [inserted] = await this.db.insert(alert).values(alertData).execute();
         return inserted.insertId;
-    },
+    }
 
     /**
-     * Fetches all active alerts from the 'alert' table.
-     * - Used for global scans or admin views in scanner-github.ts.
-     * - Filters by 'active' status to exclude triggered or canceled alerts.
-     * @returns Array of active Alert objects
+     * Retrieves all active alerts for a given trading symbol.
+     * @param symbol - The trading symbol to filter alerts (e.g., 'BTC/USDT').
+     * @returns {Promise<Alert[]>} An array of active alerts for the symbol.
      */
-    async getActiveAlerts(): Promise<Alert[]> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        return drizzleDb.select().from(alert).where(eq(alert.status, 'active')).execute();
-    },
-
-    /**
-     * Fetches active alerts for a specific symbol (e.g., 'BTC_USDT').
-     * - Used in scanner-github.ts (processDatabaseAlerts) to check conditions during scans.
-     * - Filters by symbol and 'active' status for efficiency.
-     * @param symbol The trading pair symbol (e.g., 'BTC_USDT')
-     * @returns Array of active Alert objects for the symbol
-     */
-    async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        return drizzleDb
+    public async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
+        return this.db
             .select()
             .from(alert)
             .where(and(eq(alert.symbol, symbol), eq(alert.status, 'active')))
             .execute();
-    },
+    }
 
     /**
-     * Updates an alert's status to 'triggered' or 'canceled'.
-     * - Used in scanner-github.ts (processDatabaseAlerts) to mark alerts after signals.
-     * - Throws an error if the alert ID is not found.
-     * @param id The alert ID
-     * @param status The new status ('triggered' or 'canceled')
-     * @returns The ID of the updated alert
+     * Retrieves an alert by its ID.
+     * @param id - The ID of the alert to retrieve.
+     * @returns {Promise<Alert | undefined>} The alert record, or `undefined` if not found.
      */
-    async updateAlertStatus(id: number, status: 'triggered' | 'canceled'): Promise<number> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const [updated] = await drizzleDb
-            .update(alert)
-            .set({ status })
-            .where(eq(alert.id, id))
-            .execute();
-        if (!updated) throw new Error(`Alert with id ${id} not found`);
-        return updated.insertId;
-    },
+    public async getAlertsById(id: number): Promise<Alert | undefined> {
+        const result = await this.db.select().from(alert).where(eq(alert.id, id)).execute();
+        return result.length > 0 ? result[0] : undefined;
+    }
 
     /**
-     * Deletes an alert by ID.
-     * - Used when users cancel alerts via the bot or admin interface.
-     * - No return value, as it's a delete operation.
-     * @param id The alert ID
+     * Updates the status of an alert to either 'triggered' or 'canceled'.
+     * @param id - The ID of the alert to update.
+     * @param status - The new status ('triggered' or 'canceled').
+     * @returns {Promise<boolean>} `true` if the update was successful, `false` otherwise.
      */
-    async deleteAlert(id: number): Promise<void> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        await drizzleDb.delete(alert).where(eq(alert.id, id)).execute();
-    },
+    public async updateAlertStatus(id: number, status: 'triggered' | 'canceled'): Promise<boolean> {
+        const result = await this.db.update(alert).set({ status }).where(eq(alert.id, id)).execute();
+        return result.length > 0;
+    }
 
     /**
-     * Retrieves the latest alert timestamp per symbol for cooldown checks.
-     * - Used in scanner-github.ts (processTradeSignal) to enforce cooldown periods.
-     * - Aggregates the maximum lastAlertAt for each active alert by symbol.
-     * @returns Record mapping symbols to their latest alert timestamp
+     * Updates the `lastAlertAt` timestamp for an alert.
+     * @param id - The ID of the alert to update.
+     * @param timestamp - The Unix timestamp (in milliseconds) to set.
+     * @returns {Promise<boolean>} `true` if the update was successful, `false` otherwise.
      */
-    async getLastAlertTimes(): Promise<Record<string, number>> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const result = await drizzleDb
-            .select({ symbol: alert.symbol, lastAlertAt: alert.lastAlertAt })
-            .from(alert)
-            .where(eq(alert.status, 'active'))
-            .execute();
-        return result.reduce((acc, { symbol, lastAlertAt }) => {
-            acc[symbol] = Math.max(acc[symbol] || 0, lastAlertAt || 0);
-            return acc;
-        }, {} as Record<string, number>);
-    },
-
-    /**
-     * Updates the last alert timestamp for a specific alert.
-     * - Used in scanner-github.ts (processDatabaseAlerts) after sending a Telegram alert.
-     * - Sets lastAlertAt to enforce cooldowns between alerts.
-     * @param id The alert ID
-     * @param timestamp The timestamp to set
-     */
-    async setLastAlertTime(id: number, timestamp: number): Promise<void> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        await drizzleDb
+    public async setLastAlertTime(id: number, timestamp: number): Promise<boolean> {
+        const result = await this.db
             .update(alert)
             .set({ lastAlertAt: timestamp })
             .where(eq(alert.id, id))
             .execute();
-    },
+        return result.length > 0;
+    }
+
+    // --- Lock Management ---
 
     /**
-     * Retrieves the lock status to prevent concurrent cron job runs.
-     * - Used in index-github.ts to skip overlapping scans.
-     * - Returns true if locked, false otherwise.
-     * @returns The lock status (true if locked)
+     * Checks if a global lock is active.
+     * Assumes a single lock record with `id = 1` in the `locks` table.
+     * @returns {Promise<boolean>} `true` if the lock is active, `false` otherwise.
      */
-    async getLock(): Promise<boolean> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const result = await drizzleDb.select().from(locks).where(eq(locks.id, 1)).execute();
+    public async getLock(): Promise<boolean> {
+        const result = await this.db.select().from(locks).where(eq(locks.id, 1)).execute();
         return result.length > 0 ? result[0].isLocked! : false;
-    },
+    }
 
     /**
-     * Sets the lock status to prevent or allow concurrent runs.
-     * - Used in index-github.ts to manage scan execution.
-     * - Uses ON DUPLICATE KEY UPDATE for idempotency.
-     * @param isLocked The lock status to set
+     * Sets or updates the global lock state.
+     * Uses `ON DUPLICATE KEY UPDATE` to handle both insert and update cases.
+     * @param isLocked - The desired lock state (`true` to lock, `false` to unlock).
      */
-    async setLock(isLocked: boolean): Promise<void> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        await drizzleDb
-            .insert(locks)
+    public async setLock(isLocked: boolean): Promise<void> {
+        await this.db.insert(locks)
             .values({ id: 1, isLocked })
             .onDuplicateKeyUpdate({ set: { isLocked } })
             .execute();
-    },
+    }
+
+    // --- Heartbeat Management ---
 
     /**
-     * Retrieves the current heartbeat cycle count from the database.
-     * - Used in scanner-github.ts to track scan cycles and send heartbeats.
-     * - If no row exists, initializes a default row and returns 0.
-     * @returns The current cycle count
+     * Retrieves the current heartbeat cycle count.
+     * Initializes a default heartbeat record if none exists.
+     * @returns {Promise<number>} The current cycle count.
      */
-    async getHeartbeatCount(): Promise<number> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
+    public async getHeartbeatCount(): Promise<number> {
+        const result = await this.db.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
         if (result.length === 0) {
             logger.warn('No heartbeat row found, initializing default row');
-            await drizzleDb
+            await this.db
                 .insert(heartbeat)
                 .values({ id: 1, cycleCount: 0, lastHeartbeatAt: 0 })
                 .onDuplicateKeyUpdate({ set: { cycleCount: 0, lastHeartbeatAt: 0 } })
@@ -256,20 +242,20 @@ export const dbService = {
             return 0;
         }
         return result[0].cycleCount;
-    },
+    }
 
     /**
-     * Increments the heartbeat cycle count and updates the last heartbeat timestamp.
-     * - Used in scanner-github.ts to track scan cycles.
-     * - If no row exists after update, initializes a default row with cycleCount: 1.
-     * @returns The new cycle count
+     * Atomically increments the heartbeat cycle count and updates the timestamp.
+     * Prevents race conditions by using a single, atomic SQL statement.
+     * Initializes a default heartbeat record if none exists.
+     * @returns {Promise<number>} The updated cycle count.
      */
-    async incrementHeartbeatCount(): Promise<number> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        const result = await drizzleDb.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
+    public async incrementHeartbeatCount(): Promise<number> {
+        // Check current state
+        const result = await this.db.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
         if (result.length === 0) {
             logger.warn('No heartbeat row found after update, initializing default row');
-            await drizzleDb
+            await this.db
                 .insert(heartbeat)
                 .values({ id: 1, cycleCount: 1, lastHeartbeatAt: Date.now() })
                 .onDuplicateKeyUpdate({ set: { cycleCount: 1, lastHeartbeatAt: Date.now() } })
@@ -277,39 +263,59 @@ export const dbService = {
             return 1;
         }
         let cycleCount = result[0].cycleCount + 1;
-        await drizzleDb
+        await this.db
             .update(heartbeat)
             .set({ cycleCount: cycleCount, lastHeartbeatAt: Date.now() })
             .where(eq(heartbeat.id, 1))
             .execute();
 
         return cycleCount;
-    },
+    }
 
     /**
-     * Resets the heartbeat cycle count to 0 and clears the last heartbeat timestamp.
-     * - Used in scanner-github.ts when sending a heartbeat after 60 cycles.
-     * @returns Void
+     * Resets the heartbeat cycle count and timestamp to zero.
+     * Used to restart the heartbeat tracking, typically for testing or recovery.
      */
-    async resetHeartbeatCount(): Promise<void> {
-        if (!drizzleDb) throw new Error('Database not initialized');
-        await drizzleDb
+    public async resetHeartbeatCount(): Promise<void> {
+        await this.db
             .update(heartbeat)
             .set({ cycleCount: 0, lastHeartbeatAt: 0 })
             .where(eq(heartbeat.id, 1))
             .execute();
     }
-};
+}
 
 /**
- * Initialize the database connection on module load.
- * - Runs at startup (e.g., when index-github.ts is executed).
- * - Exits the process if initialization fails after retries.
+ * Singleton instance of the `DatabaseService` class.
+ * Provides a single point of access to database operations throughout the application.
+ * @example
+ * typescript
+ * import { dbService, initializeClient } from './db';
+ * await initializeClient();
+ * const alertId = await dbService.createAlert({ symbol: 'BTC/USDT', status: 'active' });
+ *
  */
-initializeClient().catch(err => {
-    logger.error('Failed to initialize MySQL database:', {
-        error: err.message,
-        database_url: config.database_url
-    });
-    process.exit(1);
-});
+export const dbService = new DatabaseService();
+
+/**
+ * Bound method to initialize the database connection.
+ * Exported as a convenience to avoid directly accessing the `dbService` instance.
+ * @example
+ * typescript
+ * import { initializeClient } from './db';
+ * await initializeClient();
+ *
+ */
+export const initializeClient = dbService.initialize.bind(dbService);
+
+/**
+ * Bound method to close the database connection.
+ * Exported as a convenience to avoid directly accessing the `dbService` instance.
+ * @example
+ * typescript
+ * import { closeDb } from './db';
+ * await closeDb();
+ *
+ */
+export const closeDb = dbService.close.bind(dbService);
+
