@@ -71,3 +71,4 @@ export type User = typeof user.$inferSelect;
 export type Alert = typeof alert.$inferSelect;
 export type NewAlert = typeof alert.$inferInsert;
 export type Lock = typeof locks.$inferSelect;
+export type Heartbeat = typeof heartbeat.$inferSelect;
