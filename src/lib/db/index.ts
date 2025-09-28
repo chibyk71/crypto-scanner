@@ -22,7 +22,7 @@ import { and, eq } from 'drizzle-orm';
  * Imports database schema definitions and types for the `alert`, `locks`, and `heartbeat` tables.
  * These schemas define the structure of the database tables and the types for their records.
  */
-import { alert, locks, heartbeat, type Alert, type NewAlert, type Heartbeat } from './schema';
+import { alert, locks, heartbeat, type Alert, type NewAlert } from './schema';
 
 /**
  * Imports the application configuration, including the database URL, from the settings module.
@@ -118,7 +118,7 @@ class DatabaseService {
      * @throws {Error} If the database is not initialized.
      * @private
      */
-    private get db(): MySql2Database<any> {
+    public get db(): MySql2Database<any> {
         if (!this.drizzleDb) {
             throw new Error('Database not initialized. Call initialize() first.');
         }
@@ -141,12 +141,26 @@ class DatabaseService {
     // --- Alert Management ---
 
     /**
+     * Retrieves all active alerts from the `alert` table.
+     * @returns {Promise<Alert[]>} An array of active alerts.
+     */
+    public async getActiveAlerts(): Promise<Alert[]> {
+        const alerts = await this.db.select().from(alert).where(eq(alert.status, 'active')).execute();
+        return alerts.map(a => ({
+            ...a,
+            conditions: typeof a.conditions === 'string' ? JSON.parse(a.conditions) : a.conditions,
+        }));
+    }
+    /**
      * Creates a new alert record in the `alert` table.
      * @param alertData - The data for the new alert, conforming to the `NewAlert` type.
      * @returns {Promise<number>} The ID of the inserted alert.
      */
     public async createAlert(alertData: NewAlert): Promise<number> {
-        const [inserted] = await this.db.insert(alert).values(alertData).execute();
+        const [inserted] = await this.db.insert(alert).values({
+            ...alertData,
+            conditions: alertData.conditions, // Serialize JSON
+        }).execute();
         return inserted.insertId;
     }
 
@@ -155,12 +169,16 @@ class DatabaseService {
      * @param symbol - The trading symbol to filter alerts (e.g., 'BTC/USDT').
      * @returns {Promise<Alert[]>} An array of active alerts for the symbol.
      */
-    public async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
-        return this.db
+     public async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
+        const alerts = await this.db
             .select()
             .from(alert)
             .where(and(eq(alert.symbol, symbol), eq(alert.status, 'active')))
             .execute();
+        return alerts.map(a => ({
+            ...a,
+            conditions: typeof a.conditions === 'string' ? JSON.parse(a.conditions) : a.conditions,
+        }));
     }
 
     /**
@@ -170,7 +188,12 @@ class DatabaseService {
      */
     public async getAlertsById(id: number): Promise<Alert | undefined> {
         const result = await this.db.select().from(alert).where(eq(alert.id, id)).execute();
-        return result.length > 0 ? result[0] : undefined;
+        if (result.length === 0) return undefined;
+        const alertData = result[0];
+        return {
+            ...alertData,
+            conditions: typeof alertData.conditions === 'string' ? JSON.parse(alertData.conditions) : alertData.conditions,
+        };
     }
 
     /**
@@ -196,6 +219,16 @@ class DatabaseService {
             .set({ lastAlertAt: timestamp })
             .where(eq(alert.id, id))
             .execute();
+        return result.length > 0;
+    }
+
+    /**
+     * Deletes an alert by its ID.
+     * @param id - The ID of the alert to delete.
+     * @returns {Promise<boolean>} `true` if the deletion was successful, `false` otherwise.
+     */
+    public async deleteAlert(id: number): Promise<boolean> {
+        const result = await this.db.delete(alert).where(eq(alert.id, id)).execute();
         return result.length > 0;
     }
 

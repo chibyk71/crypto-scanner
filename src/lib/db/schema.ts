@@ -1,4 +1,5 @@
-import { mysqlTable, int, varchar, double, timestamp, boolean, bigint } from 'drizzle-orm/mysql-core';
+import { mysqlTable, int, varchar, timestamp, boolean, bigint, json } from 'drizzle-orm/mysql-core';
+import { Condition } from '../../types';
 
 /**
  * User table for storing user authentication data.
@@ -26,20 +27,20 @@ export const session = mysqlTable('session', {
 });
 
 /**
- * Alert table for storing trading alerts.
- * - Stores trading pair (symbol), condition (e.g., price > target), and status.
- * - Used in scanner-github.ts for market scans and Telegram alerts.
- * - Supports cooldowns via lastAlertAt for cron-based runs (every 5 minutes).
+ * Alert table for storing user-defined alerts.
+ * - Supports complex conditions using JSON.
+ * - Tracks status, creation time, and last alert time.
+ * - Used for notifying users based on specific criteria (e.g., price movements).
  */
 export const alert = mysqlTable('alert', {
-    id: int('id').primaryKey(), // AUTO_INCREMENT INT for unique alert IDs.
-    symbol: varchar('symbol', { length: 50 }).notNull(), // VARCHAR(50) for trading pairs (e.g., 'BTC/USDT').
-    condition: varchar('condition', { length: 50 }).notNull(), // VARCHAR(50) for conditions (e.g., 'price >', 'crosses_above_ema200').
-    targetPrice: double('target_price').notNull(), // DOUBLE for precise price targets.
-    status: varchar('status', { length: 20 }).notNull().default('active'), // VARCHAR(20) for status ('active', 'triggered', 'canceled').
-    createdAt: timestamp('created_at').defaultNow(), // TIMESTAMP with default CURRENT_TIMESTAMP.
-    note: varchar('note', { length: 255 }), // VARCHAR(255) for optional user notes, nullable.
-    lastAlertAt: int('last_alert_at'), // INT for Unix timestamp of last alert (for cooldowns).
+    id: int('id').primaryKey().autoincrement(),
+    symbol: varchar('symbol', { length: 50 }).notNull(),
+    conditions: json('conditions').$type<Condition[]>().notNull(), // JSON for complex conditions (e.g., [{type: 'price', operator: '>', value: 3.54}, {type: 'volume', operator: '>', value: 1000000}])
+    timeframe: varchar('timeframe', { length: 10 }).notNull().default('1h'), // e.g., '15m', '1h'
+    status: varchar('status', { length: 20 }).notNull().default('active'),
+    createdAt: timestamp('created_at').defaultNow(),
+    note: varchar('note', { length: 255 }),
+    lastAlertAt: int('last_alert_at').default(0),
 });
 
 /**
