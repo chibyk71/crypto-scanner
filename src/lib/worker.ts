@@ -66,14 +66,12 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
     const { lockType = 'file', scannerMode = 'periodic' } = options;
 
     // Initialize database connection if using database lock
-    if (lockType === 'database') {
-        try {
-            await initializeClient();
-            logger.info('MySQL database initialized successfully');
-        } catch (err: any) {
-            logger.error('Failed to initialize MySQL database', { error: err });
-            throw new Error(`Database initialization failed: ${err.message}`);
-        }
+    try {
+        await initializeClient();
+        logger.info('MySQL database initialized successfully');
+    } catch (err: any) {
+        logger.error('Failed to initialize MySQL database', { error: err });
+        throw new Error(`Database initialization failed: ${err.message}`);
     }
 
     // Acquire lock based on lockType
