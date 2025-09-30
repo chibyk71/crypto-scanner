@@ -137,6 +137,14 @@ const ConfigSchema = z.object({
      * @example 'single', 'periodic'
      */
     SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
+
+    /**
+     * The port on which the API server listens.
+     * Coerced to a number from a string if necessary.
+     * @default 3000
+     * @example '8080', '5000'
+     */
+    API_PORT: z.coerce.number().default(3000),
 });
 
 /**
@@ -208,6 +216,9 @@ export const config = {
 
     /** The scanner mode for monitoring or trading (e.g., 'periodic'). */
     scannerMode: validatedConfig.SCANNER_MODE,
+
+    /** The port on which the API server listens. */
+    apiPort: validatedConfig.API_PORT,
 };
 
 /**
