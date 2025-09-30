@@ -4,8 +4,8 @@
 # Run from cron every X minutes to ensure bot is alive
 # ============================================================
 
-APP_DIR="/home/steezepo/cryptoscanner.steezepot.com.ng"
-NODE_ENV_DIR="/home/steezepo/nodevenv/cryptoscanner.steezepot.com.ng/20"
+APP_DIR="/home/steezepo/cryptoscanner"
+NODE_ENV_DIR="/home/steezepo/nodevenv/cryptoscanner/20"
 SCRIPT="$APP_DIR/build/main/index.js"
 LOG_DIR="$APP_DIR/logs"
 LOG_FILE="$LOG_DIR/cron.log"
