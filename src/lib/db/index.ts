@@ -197,6 +197,20 @@ class DatabaseService {
     }
 
     /**
+     * Updates an existing alert in the `alert` table.
+     * @param id - The ID of the alert to update.
+     * @param alertData - The updated data for the alert, conforming to the `Partial<NewAlert>` type.
+     * @returns {Promise<boolean>} `true` if the update was successful, `false` otherwise.
+     */
+    public async updateAlert(id: number, alertData: Partial<NewAlert>): Promise<boolean> {
+        const result = await this.db.update(alert).set({
+            ...alertData,
+            conditions: alertData.conditions ? alertData.conditions : undefined,
+        }).where(eq(alert.id, id)).execute();
+        return result.length > 0;
+    }
+
+    /**
      * Updates the status of an alert to either 'triggered' or 'canceled'.
      * @param id - The ID of the alert to update.
      * @param status - The new status ('triggered' or 'canceled').
