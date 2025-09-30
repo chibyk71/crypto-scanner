@@ -6,6 +6,7 @@ import { dbService, initializeClient, closeDb } from './db';
 import { createLogger } from './logger';
 import * as fs from 'fs/promises';
 import { config } from './config/settings';
+import { TelegramBotController } from './services/telegramBotController';
 
 const logger = createLogger('worker');
 
@@ -96,6 +97,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
     const strategy = new Strategy(3);
     const telegram = new TelegramService();
     let scanner: MarketScanner | null = null;
+    let botController: TelegramBotController | null = null;
 
     try {
         // Initialize exchange
@@ -116,10 +118,15 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             cooldownBackend: lockType === 'database' ? 'database' : 'memory',
         });
 
+        // Initialize TelegramBotController for user alerts
+        botController = new TelegramBotController(exchange);
+        logger.info('TelegramBotController initialized');
+
         // Define cleanup function for graceful shutdown
         const cleanup = async () => {
             logger.info('Shutting down worker');
             if (scanner) scanner.stop();
+            if (botController) botController.stop();
             exchange.stopAll();
             if (lockType === 'file') {
                 await releaseFileLock();
