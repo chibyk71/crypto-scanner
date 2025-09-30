@@ -193,10 +193,10 @@ export class Strategy {
          */
         const trend = ema50.at(-1)! > ema200.at(-1)! ? 'bullish' : 'bearish';
         if (trend === 'bullish') {
-            buyScore += 20;
+            buyScore += 25; // Changed from 20
             reasons.push('Long-term trend is bullish (EMA50 > EMA200)');
         } else {
-            sellScore += 20;
+            sellScore += 25; // Changed from 20
             reasons.push('Long-term trend is bearish (EMA50 < EMA200)');
         }
 
@@ -222,15 +222,11 @@ export class Strategy {
         if (rsiNow > 60) reasons.push('RSI trending up');
         if (rsiNow < 40) reasons.push('RSI trending down');
 
-        if (rsiNow < 60 && rsiNow > 40) {
-            buyScore += 10;
-            sellScore += 10;
-            reasons.push('RSI is in a healthy range');
-        } else if (rsiNow > 70) {
-            sellScore += 15;
+        if (rsiNow > 70) {
+            sellScore += 25; // Changed from 15
             reasons.push('RSI Overbought (potential reversal)');
         } else if (rsiNow < 30) {
-            buyScore += 15;
+            buyScore += 25; // Changed from 15
             reasons.push('RSI Oversold (potential bounce)');
         }
 
@@ -241,10 +237,10 @@ export class Strategy {
          */
         const macdNow = macd.at(-1)!;
         if (macdNow.histogram > 0) {
-            buyScore += 15;
+            buyScore += 20; // Changed from 15
             reasons.push('MACD histogram is positive (bullish momentum)');
         } else {
-            sellScore += 15;
+            sellScore += 20; // Changed from 15
             reasons.push('MACD histogram is negative (bearish momentum)');
         }
 
@@ -255,11 +251,11 @@ export class Strategy {
          */
         const stochNow = stoch.at(-1)!;
         if (stochNow.k < 20 && stochNow.k > stochNow.d) {
-            buyScore += 10;
+            buyScore += 5; // Changed from 10
             reasons.push('Stochastics turning up from oversold area');
         }
         if (stochNow.k > 80 && stochNow.k < stochNow.d) {
-            sellScore += 10;
+            sellScore += 5; // Changed from 10
             reasons.push('Stochastics turning down from overbought area');
         }
 
@@ -270,10 +266,10 @@ export class Strategy {
          */
         const bbNow = bb.at(-1)!;
         if (price <= bbNow.lower) {
-            buyScore += 10;
+            buyScore += 5; // Changed from 10
             reasons.push('Price near/below Bollinger Band lower (potential bounce)');
         } else if (price >= bbNow.upper) {
-            sellScore += 10;
+            sellScore += 5; // Changed from 10
             reasons.push('Price near/above Bollinger Band upper (potential reversal)');
         }
 
@@ -290,6 +286,8 @@ export class Strategy {
             reasons.push('OBV falling (volume supports bearish move)');
         }
 
+        console.log(`Strategy Scores for ${symbol} - Buy: ${buyScore}, Sell: ${sellScore}`);
+
         // --- Decision & Confidence ---
         /**
          * Determine the final signal and confidence based on the accumulated scores.
@@ -298,10 +296,10 @@ export class Strategy {
         let signal: 'buy' | 'sell' | 'hold' = 'hold';
         let confidence = 0;
 
-        if (buyScore > sellScore && buyScore >= 70) {
+        if (buyScore > sellScore && buyScore >= 65) {
             signal = 'buy';
             confidence = Math.min(100, buyScore);
-        } else if (sellScore > buyScore && sellScore >= 70) {
+        } else if (sellScore > buyScore && sellScore >= 65) {
             signal = 'sell';
             confidence = Math.min(100, sellScore);
         } else {
