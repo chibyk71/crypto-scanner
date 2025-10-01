@@ -30,7 +30,6 @@ import { createLogger } from './logger';
  * Imports the application configuration, including polling intervals, heartbeat settings, and symbols.
  */
 import { config } from './config/settings';
-import { calculateEMA, calculateRSI, checkMACrossover } from './indicators';
 import type { IndicatorValues } from '../types';
 
 /**
@@ -344,8 +343,6 @@ export class MarketScanner {
             closes,
             volumes,
         });
-
-        logger.info(`Signal for ${symbol}: ${signal.signal} (confidence: ${signal.confidence}%)`, { signal });
 
         if (signal.signal !== 'hold') {
             await this.processTradeSignal(symbol, signal, currentPrice);

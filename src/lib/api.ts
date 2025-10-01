@@ -7,8 +7,7 @@ import { createLogger } from './logger';
 import { createReadStream } from 'fs';
 import { join } from 'path';
 import { eq } from 'drizzle-orm';
-import type { Alert, NewAlert } from './db/schema';
-import { alert as alertTable } from './db/schema';
+import { alert as alertTable, type NewAlert } from './db/schema';
 
 /**
  * Logger instance for API operations, used to log requests, errors, and server events.

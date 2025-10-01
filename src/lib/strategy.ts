@@ -286,8 +286,6 @@ export class Strategy {
             reasons.push('OBV falling (volume supports bearish move)');
         }
 
-        console.log(`Strategy Scores for ${symbol} - Buy: ${buyScore}, Sell: ${sellScore}`);
-
         // --- Decision & Confidence ---
         /**
          * Determine the final signal and confidence based on the accumulated scores.
