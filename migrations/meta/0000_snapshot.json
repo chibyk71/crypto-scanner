@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "09c24a21-fc20-43c3-825c-a4520786cbc7",
+  "id": "f2168b08-8658-45ad-b414-c2dfb5fd15d9",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -12,7 +12,7 @@
           "type": "int",
           "primaryKey": false,
           "notNull": true,
-          "autoincrement": false
+          "autoincrement": true
         },
         "symbol": {
           "name": "symbol",
@@ -21,19 +21,20 @@
           "notNull": true,
           "autoincrement": false
         },
-        "condition": {
-          "name": "condition",
-          "type": "varchar(50)",
+        "conditions": {
+          "name": "conditions",
+          "type": "json",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
-        "target_price": {
-          "name": "target_price",
-          "type": "double",
+        "timeframe": {
+          "name": "timeframe",
+          "type": "varchar(10)",
           "primaryKey": false,
           "notNull": true,
-          "autoincrement": false
+          "autoincrement": false,
+          "default": "'1h'"
         },
         "status": {
           "name": "status",
@@ -63,7 +64,8 @@
           "type": "int",
           "primaryKey": false,
           "notNull": false,
-          "autoincrement": false
+          "autoincrement": false,
+          "default": 0
         }
       },
       "indexes": {},
@@ -71,6 +73,45 @@
       "compositePrimaryKeys": {
         "alert_id": {
           "name": "alert_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraint": {}
+    },
+    "heartbeat": {
+      "name": "heartbeat",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "cycleCount": {
+          "name": "cycleCount",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "lastHeartbeatAt": {
+          "name": "lastHeartbeatAt",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "heartbeat_id": {
+          "name": "heartbeat_id",
           "columns": [
             "id"
           ]

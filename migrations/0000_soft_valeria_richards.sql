@@ -1,13 +1,20 @@
 CREATE TABLE `alert` (
-	`id` int NOT NULL,
+	`id` int AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(50) NOT NULL,
-	`condition` varchar(50) NOT NULL,
-	`target_price` double NOT NULL,
+	`conditions` json NOT NULL,
+	`timeframe` varchar(10) NOT NULL DEFAULT '1h',
 	`status` varchar(20) NOT NULL DEFAULT 'active',
 	`created_at` timestamp DEFAULT (now()),
 	`note` varchar(255),
-	`last_alert_at` int,
+	`last_alert_at` int DEFAULT 0,
 	CONSTRAINT `alert_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `heartbeat` (
+	`id` int NOT NULL,
+	`cycleCount` int NOT NULL DEFAULT 0,
+	`lastHeartbeatAt` bigint,
+	CONSTRAINT `heartbeat_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
 CREATE TABLE `locks` (
