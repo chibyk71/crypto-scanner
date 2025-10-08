@@ -18,8 +18,13 @@ type WorkerOptions = {
 
 const LOCK_FILE = './worker.lock';
 
+// ----------------------------------------------------------------
+// Lock Management Helpers
+// ----------------------------------------------------------------
+
 async function acquireFileLock(): Promise<boolean> {
     try {
+        // 'wx' flag ensures the file is created ONLY if it doesn't already exist
         await fs.writeFile(LOCK_FILE, process.pid.toString(), { flag: 'wx' });
         logger.info('File lock acquired', { pid: process.pid });
         return true;
@@ -42,7 +47,7 @@ async function acquireDatabaseLock(): Promise<boolean> {
     try {
         const lock = await dbService.getLock();
         if (lock) {
-            logger.warn('Bot already running, skipping execution');
+            logger.warn('Database lock is active, skipping execution');
             return false;
         }
         await dbService.setLock(true);
@@ -63,11 +68,16 @@ async function releaseDatabaseLock(): Promise<void> {
     }
 }
 
+// ----------------------------------------------------------------
+// Main Worker Function
+// ----------------------------------------------------------------
+
 export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic' }): Promise<void> {
     const { lockType = 'file', scannerMode = 'periodic' } = options;
 
-    // Initialize database connection if using database lock
+    // 1. Initialize Database
     try {
+        // Must connect DB first, regardless of lockType, as other services might need it (e.g., Alert storage)
         await initializeClient();
         logger.info('MySQL database initialized successfully');
     } catch (err: any) {
@@ -75,7 +85,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         throw new Error(`Database initialization failed: ${err.message}`);
     }
 
-    // Acquire lock based on lockType
+    // 2. Acquire Lock
     let lockAcquired = false;
     if (lockType === 'file') {
         lockAcquired = await acquireFileLock();
@@ -85,6 +95,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
 
     if (!lockAcquired) {
         logger.error('Cannot start worker: another instance is running');
+        // If DB lock failed, the DB connection is still open and must be closed.
         if (lockType === 'database') {
             await closeDb();
             logger.info('Database connection closed');
@@ -92,7 +103,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         process.exit(1);
     }
 
-    // Initialize services
+    // 3. Initialize Services and Run
     const exchange = new ExchangeService();
     const strategy = new Strategy(3);
     const telegram = new TelegramService();
@@ -100,62 +111,75 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
     let botController: TelegramBotController | null = null;
 
     try {
-        // Initialize exchange
         await exchange.initialize();
         const supportedSymbols = Array.from(exchange.getSupportedSymbols());
-        logger.info('Exchange initialized', { symbols: supportedSymbols });
+        logger.info('Exchange initialized', { symbols: supportedSymbols.length });
 
-        // Initialize MarketScanner with unified options
-        scanner = new MarketScanner(exchange, strategy, supportedSymbols, telegram, {
+        // Initialize MarketScanner
+        scanner = new MarketScanner(exchange, telegram, strategy, supportedSymbols, {
             mode: scannerMode,
-            intervalMs: config.pollingInterval ?? 60_000,
+            intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,
             cooldownMs: 5 * 60_000,
             jitterMs: 250,
             retries: 1,
-            heartbeatCycles: config.heartBeatInterval ?? 60,
+            heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
             requireAtrFeasibility: true,
+            // Use database for cooldown storage if we are using the DB lock, else use memory
             cooldownBackend: lockType === 'database' ? 'database' : 'memory',
         });
 
-        // Initialize TelegramBotController for user alerts
+        // Initialize TelegramBotController for user interaction
         botController = new TelegramBotController(exchange);
         logger.info('TelegramBotController initialized');
 
-        // Define cleanup function for graceful shutdown
+        /**
+         * Graceful shutdown function, ensuring all resources are properly released.
+         * This logic is critical and correctly stops services, releases locks, and closes the DB.
+         */
         const cleanup = async () => {
             logger.info('Shutting down worker');
             if (scanner) scanner.stop();
             if (botController) botController.stop();
             exchange.stopAll();
+
             if (lockType === 'file') {
                 await releaseFileLock();
             } else {
                 await releaseDatabaseLock();
+                // Database is only closed here because we are sure to release the lock first.
                 await closeDb();
                 logger.info('Database connection closed');
             }
             process.exit(0);
         };
 
-        // Register signal handlers for server mode
+        // Register signal handlers for periodic server mode
         if (scannerMode === 'periodic') {
             process.on('SIGTERM', cleanup);
             process.on('SIGINT', cleanup);
+            logger.info('Registered SIGTERM/SIGINT handlers for graceful shutdown.');
         }
 
         // Start the scanner
         await scanner.start();
-        logger.info('MarketScanner started', { symbols: supportedSymbols });
+        logger.info('MarketScanner started');
 
         // If single mode, wait for completion and cleanup
         if (scannerMode === 'single') {
+            // MarketScanner's start() returns once the single scan is complete in this mode
             await cleanup();
         }
     } catch (err) {
-        logger.error('Worker failed', { error: err });
+        // 4. Error Handling & Cleanup
+        logger.error('Worker failed, performing emergency cleanup', { error: err });
+
+        // Stop all active components
         if (scanner) scanner.stop();
+        if (botController) botController.stop();
         exchange.stopAll();
+
+        // Release the lock and close DB before re-throwing the error
         if (lockType === 'file') {
             await releaseFileLock();
         } else {
@@ -163,6 +187,6 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             await closeDb();
             logger.info('Database connection closed');
         }
-        throw err;
+        throw err; // Re-throw the error to terminate the process cleanly and signal failure
     }
 }
