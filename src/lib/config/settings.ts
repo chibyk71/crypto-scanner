@@ -30,140 +30,155 @@ const ConfigSchema = z.object({
     /**
      * Specifies the environment in which the application is running.
      * @default 'dev'
-     * @example 'dev', 'prod', 'test'
      */
     ENV: z.enum(['dev', 'prod', 'test']).default('dev'),
 
     /**
      * Determines the logging verbosity level for the application.
      * @default 'info'
-     * @example 'error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'
      */
     LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
 
     /**
      * The URL for connecting to the database, required to be a valid URL.
-     * @example 'postgresql://user:password@localhost:5432/dbname'
      */
     DATABASE_URL: z.string().url(),
 
     /**
      * The name of the exchange to interact with.
      * @default 'bybit'
-     * @example 'bybit', 'binance'
      */
     EXCHANGE: z.string().default('bybit'),
 
     /**
-     * The API key for authenticating with the exchange, if required.
-     * Optional, as some exchanges may not require an API key for certain operations.
+     * The API key for authenticating with the exchange.
      */
     EXCHANGE_API_KEY: z.string().optional(),
 
     /**
-     * The API secret for authenticating with the exchange, if required.
-     * Optional, as some exchanges may not require an API secret for certain operations.
+     * The API secret for authenticating with the exchange.
      */
     EXCHANGE_API_SECRET: z.string().optional(),
 
     /**
-     * The Telegram bot token for sending notifications, if Telegram integration is used.
-     * Optional, as Telegram notifications may not be required in all deployments.
+     * The Telegram bot token for sending notifications.
      */
     TELEGRAM_BOT_TOKEN: z.string().optional(),
 
     /**
-     * The Telegram chat ID for sending notifications, if Telegram integration is used.
-     * Optional, as Telegram notifications may not be required in all deployments.
+     * The Telegram chat ID for sending notifications.
      */
     TELEGRAM_CHAT_ID: z.string().optional(),
 
     /**
      * A comma-separated list of trading symbols to monitor or trade.
-     * The string is transformed into an array of trimmed symbol strings.
      * @default ['BTC/USDT', 'ETH/USDT']
-     * @example 'BTC/USDT,ETH/USDT,XRP/USDT'
      */
     SYMBOLS: z.string().transform(str => str.split(',').map(s => s.trim())).optional().default(['BTC/USDT', 'ETH/USDT']),
 
+    // --- SCANNER CONFIGURATION FIELDS ---
+
     /**
-     * The time interval for market data or trading operations.
+     * The primary timeframe for data fetching and signaling.
+     * Maps to config.scanner.primaryTimeframe.
      * @default '1h'
-     * @example '1m', '5m', '1h', '1d'
      */
-    TIMEFRAME: z.string().default('1h'),
+    TIMEFRAME: z.string().default('3m'),
 
     /**
-     * The leverage to apply for trading, coerced to a number from a string if necessary.
-     * @default 1
-     * @example '2', '10'
+     * The higher timeframe used for multi-timeframe analysis.
+     * Maps to config.scanner.htfTimeframe.
+     * @default '4h'
      */
-    LEVERAGE: z.coerce.number().default(1),
-
-    /**
-     * The number of historical data points to fetch or process.
-     * Coerced to a number from a string if necessary.
-     * @default 200
-     * @example '100', '500'
-     */
-    HISTORY_LENGTH: z.coerce.number().default(200),
+    HTF_TIMEFRAME: z.string().default('1h'),
 
     /**
      * The interval (in milliseconds) for polling market data or updates.
-     * Coerced to a number from a string if necessary.
+     * Maps to config.scanner.scanIntervalMs.
      * @default 60000 (1 minute)
-     * @example '30000', '120000'
      */
     POLL_INTERVAL: z.coerce.number().default(60000),
 
     /**
-     * The interval (in seconds) for sending heartbeat signals to monitor application health.
-     * Coerced to a number from a string if necessary.
-     * @default 20
-     * @example '10', '30'
+     * The number of scan cycles between sending heartbeat signals.
+     * Maps to config.scanner.heartBeatInterval.
+     * @default 60
      */
-    HEARTBEAT_INTERVAL: z.coerce.number().default(20),
+    HEARTBEAT_INTERVAL: z.coerce.number().default(60),
 
     /**
-     * The type of locking mechanism to use for concurrency control.
-     * @default 'database'
-     * @example 'file', 'database'
+     * The number of historical data points to fetch or process.
+     * @default 200
      */
-    LOCK_TYPE: z.enum(['file', 'database']).default('database'),
+    HISTORY_LENGTH: z.coerce.number().default(200),
 
     /**
      * The mode in which the scanner operates for monitoring or trading.
      * @default 'periodic'
-     * @example 'single', 'periodic'
      */
     SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
 
+    // --- STRATEGY CONFIGURATION FIELDS (New) ---
+
+    /**
+     * ATR multiplier used for calculating stop-loss distance.
+     * Maps to config.strategy.atrMultiplier.
+     * @default 1.5
+     */
+    ATR_MULTIPLIER: z.coerce.number().default(1.5),
+
+    /**
+     * Minimum risk-to-reward ratio target for trade signals.
+     * Maps to config.strategy.riskRewardTarget.
+     * @default 2 (1:2 R:R)
+     */
+    RISK_REWARD_TARGET: z.coerce.number().default(2),
+
+    /**
+     * Trailing stop distance expressed as a percentage of the price.
+     * Maps to config.strategy.trailingStopPercent.
+     * @default 0.5 (0.5%)
+     */
+    TRAILING_STOP_PERCENT: z.coerce.number().default(0.5),
+
+
+    // --- APPLICATION & LEGACY FIELDS ---
+
+    /**
+     * The leverage to apply for trading.
+     * @default 1
+     */
+    LEVERAGE: z.coerce.number().default(1),
+
+    /**
+     * The type of locking mechanism to use for concurrency control.
+     * @default 'database'
+     */
+    LOCK_TYPE: z.enum(['file', 'database']).default('database'),
+
     /**
      * The port on which the API server listens.
-     * Coerced to a number from a string if necessary.
      * @default 3000
-     * @example '8080', '5000'
      */
     API_PORT: z.coerce.number().default(3000),
+
+    // Existing Backtest fields
+    BACKTEST_START_DATE: z.string().default('2024-01-01'),
+    BACKTEST_END_DATE: z.string().default('2025-10-05'),
+    BACKTEST_TIMEFRAME: z.string().default('1h'),
+    BACKTEST_SYMBOLS: z.string().transform(str => str.split(',').map(s => s.trim())).optional().default(['BTC/USDT']),
+    BACKTEST_CYCLES_SKIP: z.coerce.number().default(5),
 });
 
 /**
  * Parses and validates environment variables against the `ConfigSchema`.
- * Throws a `ZodError` if validation fails, ensuring that the application does not proceed with invalid configuration.
- * The validated configuration is used to construct the exported `config` object.
+ * Throws a `ZodError` if validation fails.
  */
 const validatedConfig = ConfigSchema.parse(process.env);
 
 /**
- * The validated configuration object exported for use throughout the application.
- * This object organizes environment variables into a structured, type-safe format for easy access.
- * @example
- * ```typescript
- * import { config } from './config/settings';
- * console.log(config.env); // 'dev'
- * console.log(config.exchange.name); // 'bybit'
- * console.log(config.symbols); // ['BTC/USDT', 'ETH/USDT']
- * ```
+ * The validated configuration object, restructured into nested objects
+ * (scanner, strategy) to match the application's internal structure.
  */
 export const config = {
     /** The application environment (e.g., 'dev', 'prod', 'test'). */
@@ -196,20 +211,11 @@ export const config = {
     /** The list of trading symbols to monitor or trade. */
     symbols: validatedConfig.SYMBOLS,
 
-    /** The time interval for market data or trading operations (e.g., '1h'). */
-    timeframe: validatedConfig.TIMEFRAME,
-
     /** The leverage to apply for trading. */
     leverage: validatedConfig.LEVERAGE,
 
     /** The number of historical data points to fetch or process. */
     historyLength: validatedConfig.HISTORY_LENGTH,
-
-    /** The polling interval in milliseconds for market data or updates. */
-    pollingInterval: validatedConfig.POLL_INTERVAL,
-
-    /** The heartbeat interval in seconds for monitoring application health. */
-    heartBeatInterval: validatedConfig.HEARTBEAT_INTERVAL,
 
     /** The locking mechanism type for concurrency control (e.g., 'database'). */
     lockType: validatedConfig.LOCK_TYPE,
@@ -219,15 +225,42 @@ export const config = {
 
     /** The port on which the API server listens. */
     apiPort: validatedConfig.API_PORT,
+
+    // --- NEW NESTED STRUCTURES TO FIX MARKETSCANNER ERRORS ---
+
+    /** Configuration specific to the MarketScanner class. */
+    scanner: {
+        /** The primary timeframe for data fetching and signaling (e.g., '1h'). */
+        primaryTimeframe: validatedConfig.TIMEFRAME,
+        /** The higher timeframe used for multi-timeframe analysis (e.g., '4h'). */
+        htfTimeframe: validatedConfig.HTF_TIMEFRAME,
+        /** The interval in milliseconds between full scan cycles. */
+        scanIntervalMs: validatedConfig.POLL_INTERVAL,
+        /** The number of scan cycles between sending a heartbeat notification. */
+        heartBeatInterval: validatedConfig.HEARTBEAT_INTERVAL,
+    },
+
+    /** Configuration specific to the Strategy class. */
+    strategy: {
+        /** ATR multiplier for calculating stop-loss distance. */
+        atrMultiplier: validatedConfig.ATR_MULTIPLIER,
+        /** The minimum risk-to-reward ratio target (e.g., 2 for 1:2 R:R). */
+        riskRewardTarget: validatedConfig.RISK_REWARD_TARGET,
+        /** Trailing stop percentage distance from entry/price. */
+        trailingStopPercent: validatedConfig.TRAILING_STOP_PERCENT,
+    },
+
+    backtest: {
+        startDate: validatedConfig.BACKTEST_START_DATE,
+        endDate: validatedConfig.BACKTEST_END_DATE,
+        timeframe: validatedConfig.BACKTEST_TIMEFRAME,
+        symbols: validatedConfig.BACKTEST_SYMBOLS,
+        cyclesSkip: validatedConfig.BACKTEST_CYCLES_SKIP,
+    },
 };
 
 /**
  * The TypeScript type definition for the `config` object.
  * This type is inferred from the `config` object and ensures type safety when accessing configuration properties.
- * @example
- * ```typescript
- * import { Config } from './config/settings';
- * const myConfig: Config = config;
- * ```
  */
 export type Config = typeof config;
