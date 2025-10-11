@@ -1,159 +1,192 @@
 # Crypto Scanner
 
-A Node.js-based cryptocurrency trading bot that scans markets on Gate.io (or other exchanges via `ccxt`), generates trading signals using technical indicators, and sends alerts to Telegram. It uses a MySQL database for persistent storage of alerts and locks, managed with `drizzle-orm`. The bot supports periodic market scans (e.g., every 5 minutes) via cron jobs on cPanel or other platforms.
+A comprehensive cryptocurrency trading scanner and alert system built with TypeScript. It fetches real-time and historical market data from exchanges via CCXT, performs multi-timeframe technical analysis using indicators like RSI, EMA, MACD, and more, generates trade signals, manages custom alerts, and sends notifications via Telegram. Includes backtesting capabilities for strategy evaluation and a REST API for alert management.
 
 ## Features
 
-- **Market Scanning**: Scans trading pairs (e.g., BTC/USDT, ETH/USDT) for buy/sell signals using `technicalindicators`.
-- **Multi-Timeframe Scanning (NEW)**: Supports **TradingView-style custom alerts** evaluated against **different timeframes** (e.g., check 1h RSI or 4h price levels).
-- **Exchange Integration**: Connects to Gate.io via `ccxt` for real-time market data with efficient **per-timeframe caching**.
-- **Telegram Alerts**: Sends signals and heartbeats to a Telegram chat/channel using `node-telegram-bot-api`.
-- **Database & Alert Cooldowns**: Stores custom alerts and signal locks in MySQL, supporting **alert-specific cooldowns** to prevent notification spam.
-- **Deployment**: Supports cPanel (cron jobs), GitHub Actions, Oracle Cloud, or Render.
+- **Multi-Timeframe Analysis**: Analyzes data from primary (e.g., 3m) and higher timeframes (e.g., 1h) for trend confluence.
+- **Technical Indicators**: Supports SMA, EMA, RSI, MACD, Stochastic, ATR, Bollinger Bands, OBV, ADX, and crossover detection.
+- **Trade Signal Generation**: Weighted scoring system for buy/sell/hold signals with confidence levels, stop-loss, take-profit, and trailing stops.
+- **Custom Alerts**: User-defined conditions (e.g., price > X, RSI crosses above Y) evaluated against market data, with cooldowns.
+- **Telegram Integration**: Sends trade signals and alert notifications; interactive bot for creating/editing/deleting alerts.
+- **Backtesting**: Simulates trading on historical data with metrics like win rate, Sharpe ratio, profit factor, and equity curve.
+- **REST API**: Endpoints for managing alerts (create, read, update, delete).
+- **Database Persistence**: Uses MySQL (via Drizzle ORM) for storing alerts, locks, and heartbeats.
+- **Concurrency Control**: File or database locking to prevent overlapping scans in cron/scheduled environments.
+- **Configurable Modes**: Run in periodic scanning mode (e.g., for servers) or single-scan mode (e.g., for cron jobs).
+- **Error Handling & Retries**: Robust retries for API calls, logging with Winston.
 
-## Prerequisites
+## Architecture Overview
 
-- **Node.js**: Version >= 10.
-- **Git**: For cloning the repository (or ZIP download).
-- **Exchange API Keys**: From Gate.io.
-- **Telegram Bot**: Created via BotFather.
-- **MySQL Database**: Set up via cPanel's MySQL Databases.
-- **cPanel Hosting**: With Node.js support (e.g., A2 Hosting, $2.99/month).
+- **ExchangeService**: Handles CCXT integration for fetching OHLCV data, polling, and symbol validation.
+- **Strategy**: Core logic for signal generation using indicators and multi-timeframe filters.
+- **MarketScanner**: Orchestrates scanning symbols, generating signals, evaluating alerts, and sending notifications.
+- **AlertEvaluatorService**: Evaluates custom alert conditions against OHLCV data.
+- **TelegramService**: Sends messages and photos to Telegram chats.
+- **TelegramBotController**: Interactive bot for alert management via commands.
+- **DatabaseService**: Manages MySQL connections and queries for alerts, locks, and heartbeats.
+- **Backtest Module**: Simulates trades on historical data with detailed metrics.
+- **API Server**: Simple HTTP server for alert CRUD operations.
+- **Worker**: Entry point that initializes services, acquires locks, and starts scanning.
+
+The system supports environments like local development, servers (periodic mode), and cron jobs (single mode with locking).
 
 ## Installation
 
-1. **Clone or Download the Repository**:
-    - Download ZIP from `https://github.com/chibyk71/crypto-scanner/archive/main.zip`.
-    - Extract to `/home/username/crypto-scanner` in cPanel's **File Manager**.
+1. **Clone the Repository**:
+   ```
+   git clone https://github.com/chibyk71/crypto-scanner.git
+   cd crypto-scanner
+   ```
 
 2. **Install Dependencies**:
-    - In cPanel > **Setup Node.js App**, select your app.
-    - Click **Run NPM Install**.
+   ```
+   npm install
+   ```
 
-3. **Set Up MySQL Database**:
-    - In cPanel > **MySQL Databases**:
-        - Create a database (e.g., `username_crypto_scanner`).
-        - Create a user (e.g., `username_crypto_user`) with a password.
-        - Assign the user to the database with **ALL PRIVILEGES**.
-    - Note the connection details: `mysql://username_crypto_user:password@localhost:3306/username_crypto_scanner`.
+3. **Set Up Environment Variables**:
+   Copy `.env.example` to `.env` and fill in your values (see [Configuration](#configuration) for details).
+   ```
+   cp .env.example .env
+   ```
 
-4. **Set Up Environment Variables**:
-    - In **File Manager**, create/edit `.env` in `/home/username/crypto-scanner`.
-    - Example:
-        ```env
-        ENV=prod
-        LOG_LEVEL=INFO
-        HEARTBEAT_INTERVAL=12
-        SYMBOLS=BTC/USDT,ETH/USDT
-        EXCHANGE=gate
-        EXCHANGE_API_KEY=your-key
-        EXCHANGE_API_SECRET=your-secret
-        TELEGRAM_BOT_TOKEN=your-token
-        TELEGRAM_CHAT_ID=your-chat-id
-        DATABASE_URL=mysql://username_crypto_user:password@localhost:3306/username_crypto_scanner
-        ```
-    - Set `.env` permissions to 600.
+4. **Database Setup**:
+   - Ensure MySQL is running and accessible.
+   - Run migrations (if needed):
+     ```
+     npm run db:generate
+     npm run db:migrate
+     ```
+   - Use `npm run db:studio` for a web-based DB explorer.
 
-5. **Run Migrations**:
-    - In **Setup Node.js App**, set **Custom Startup Command**:
-        ```bash
-        npm run db:generate && npm run db:migrate
-        ```
-    - Click **Restart** to apply migrations (creates tables).
+5. **Build the Project**:
+   ```
+   npm run build
+   ```
 
-6. **Build the Project**:
-    - In **Setup Node.js App**, set **Custom Startup Command**:
-        ```bash
-        npm run build
-        ```
-    - Click **Restart**.
+## Usage
 
-7. **Test Locally**:
-    - Set **Custom Startup Command**:
-        ```bash
-        npm run start:github
-        ```
-    - Check **Application Logs** for "MySQL database initialized successfully".
-    - Verify Telegram heartbeats (hourly) and alerts.
+### Running the Scanner
 
-## Environment Variables
+- **Development Mode** (with auto-reload):
+  ```
+  npm run dev
+  ```
 
-See `.env.example` for a template. Key variables:
+- **Production Mode**:
+  ```
+  npm start
+  ```
 
-- `ENV`: `prod` for production, `dev` for development.
-- `LOG_LEVEL`: `INFO` or `DEBUG`.
-- `HEARTBEAT_INTERVAL`: Heartbeats every N scans (e.g., `12` for hourly at 5-min cron).
-- `SYMBOLS`: Comma-separated trading pairs (e.g., `BTC/USDT,ETH/USDT`).
-- `EXCHANGE`: `gate` for Gate.io.
-- `DATABASE_URL`: MySQL connection string (e.g., `mysql://user:pass@localhost:3306/db`).
+- **Backtesting**:
+  ```
+  npm run backtest
+  ```
+  This runs a backtest on configured symbols and timeframes, logging results.
 
-**Example**:
+- **GitHub Actions/Cron Mode**:
+  Set `RUNTIME_ENV=cron` in `.env` or environment variables to use single-scan mode with database locking.
+  ```
+  npm run start:github
+  ```
 
-```env
-ENV=prod
-LOG_LEVEL=INFO
-HEARTBEAT_INTERVAL=12
-SYMBOLS=BTC/USDT,ETH/USDT
-EXCHANGE=gate
-EXCHANGE_API_KEY=your-key
-EXCHANGE_API_SECRET=your-secret
-TELEGRAM_BOT_TOKEN=your-token
-TELEGRAM_CHAT_ID=your-chat-id
-DATABASE_URL=mysql://username_crypto_user:password@localhost:3306/username_crypto_scanner
-```
+### Telegram Bot Commands
 
-## Deployment on cPanel (Cron Job)
+Interact with the bot via Telegram:
+- `/createalert`: Start creating a new alert (interactive workflow for symbol, timeframe, conditions).
+- `/listalerts`: List active alerts.
+- `/editalert`: Edit an existing alert.
+- `/deletealert`: Delete an alert.
+- `/help`: Show available commands.
 
-1. **Choose a Provider**: A2 Hosting ($2.99/month, Node.js support).
-2. **Upload Code**:
-    - In **File Manager**, upload ZIP or files to `/home/username/crypto-scanner`.
-    - Extract ZIP and delete it.
-3. **Set Up Environment**:
-    - Create `.env` (see above).
-    - Set permissions to 600.
-4. **Set Up MySQL**:
-    - Create database and user in **MySQL Databases**.
-    - Update `.env` with connection string.
-5. **Run Migrations**:
-    - In **Setup Node.js App**, run:
-        ```bash
-        npm run db:migrate
-        ```
-6. **Configure Cron Job**:
-    - In cPanel > **Cron Jobs**:
-        - **Common Settings**: “Every 5 minutes” (`*/5 * * * *`).
-        - **Command**:
-            ```bash
-            cd /home/username/crypto-scanner && node dist/index-github.js >> /home/username/crypto-scanner/logs/cron.log 2>&1
-            ```
-    - Create `logs/` folder (permissions 755).
-7. **Monitor**:
-    - Check `logs/cron.log` in **File Manager**.
-    - Verify Telegram heartbeats and alerts.
-    - Set cron email in **Cron Jobs**.
+### REST API Endpoints
 
-## Alternative Deployments
+The API runs on the configured `API_PORT` (default: 3000).
 
-- **GitHub Actions**: Uses `index-github.ts` for scheduled scans (free, 5-min gaps).
-- **Oracle Cloud**: Free tier (4 GB RAM), uses `scanner.ts` with PM2.
-- **Render**: $7.30/month, uses `scanner.ts` with persistent disk.
+- **GET /alerts**: Retrieve all alerts.
+- **POST /alerts**: Create a new alert (body: `{ symbol, conditions, timeframe?, status?, note? }`).
+- **GET /alerts/:id**: Get a specific alert by ID.
+- **PUT /alerts/:id**: Update an alert (body: `{ status, conditions?, timeframe?, note? }`).
+- **DELETE /alerts/:id**: Delete an alert.
 
-## Troubleshooting
+Static files (e.g., UI) are served from `/public`.
 
-- **NetworkError**: If `Failed to initialize exchange`:
-    - Verify `EXCHANGE_API_KEY`/`EXCHANGE_API_SECRET` in `.env`.
-    - Contact support to unblock Gate.io API (port 443).
-- **Database Issues**: Ensure MySQL credentials are correct in `.env`. Check tables in **phpMyAdmin**.
-- **Cron Failures**: Check `logs/cron.log` or cron email output.
+### Configuration
+
+Configure via `.env` file (see `.env.example` for all options):
+
+- **General**:
+  - `ENV`: 'dev' | 'prod' | 'test' (default: 'dev').
+  - `LOG_LEVEL`: 'error' | 'warn' | 'info' | ... (default: 'info').
+
+- **Database**:
+  - `DATABASE_URL`: MySQL connection URL (e.g., 'mysql://user:pass@localhost:3306/dbname').
+
+- **Exchange**:
+  - `EXCHANGE`: Exchange ID (e.g., 'bybit').
+  - `EXCHANGE_API_KEY` & `EXCHANGE_API_SECRET`: Optional for authenticated access.
+
+- **Telegram**:
+  - `TELEGRAM_BOT_TOKEN`: Bot token.
+  - `TELEGRAM_CHAT_ID`: Chat ID for notifications.
+
+- **Symbols & Timeframes**:
+  - `SYMBOLS`: Comma-separated list (e.g., 'BTC/USDT,ETH/USDT').
+  - `TIMEFRAME`: Primary timeframe (e.g., '3m').
+  - `HTF_TIMEFRAME`: Higher timeframe (e.g., '1h').
+
+- **Scanner**:
+  - `POLL_INTERVAL`: Scan interval in ms (default: 60000).
+  - `HEARTBEAT_INTERVAL`: Cycles between heartbeats (default: 60).
+
+- **Strategy**:
+  - `ATR_MULTIPLIER`: For stop-loss (default: 1.5).
+  - `RISK_REWARD_TARGET`: Target R:R ratio (default: 2).
+  - `TRAILING_STOP_PERCENT`: Trailing stop % (default: 3).
+
+- **Backtest**:
+  - `BACKTEST_START_DATE`, `BACKTEST_END_DATE`: Date range.
+  - `BACKTEST_TIMEFRAME`: Timeframe for backtest.
+  - `BACKTEST_SYMBOLS`: Symbols to test.
+  - `BACKTEST_CYCLES_SKIP`: Cycles to skip.
+
+- **Other**:
+  - `LEVERAGE`: Trading leverage (default: 1).
+  - `LOCK_TYPE`: 'file' | 'database' (default: 'database').
+  - `SCANNER_MODE`: 'single' | 'periodic' (default: 'periodic').
+  - `API_PORT`: API server port (default: 3000).
+
+## Backtesting
+
+The backtest module (`backtest.ts`) simulates trading on historical data:
+- Fetches OHLCV for configured symbols/timeframes.
+- Applies strategy signals with fees, slippage, and cooldowns.
+- Outputs metrics: PnL, win rate, max drawdown, Sharpe ratio, profit factor, expectancy, etc.
+- Logs trade details and equity curve.
+
+Run with `npm run backtest`. Customize via `.env` backtest variables.
 
 ## Contributing
 
-- Fork the repository.
-- Create a feature branch: `git checkout -b feature-name`.
-- Commit changes: `git commit -m "Add feature"`.
-- Push: `git push origin feature-name`.
-- Open a pull request.
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feature/new-feature`.
+3. Commit changes: `git commit -am 'Add new feature'`.
+4. Push to the branch: `git push origin feature/new-feature`.
+5. Submit a pull request.
+
+Run tests: `npm test`.
+Lint: `npm run test:lint`.
+Prettier: `npm run fix:prettier`.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- Built with [CCXT](https://github.com/ccxt/ccxt) for exchange integration.
+- [technicalindicators](https://github.com/anandanand84/technicalindicators) for TA calculations.
+- [Drizzle ORM](https://orm.drizzle.team/) for database management.
+- [node-telegram-bot-api](https://github.com/yagop/node-telegram-bot-api) for Telegram support.
+- [Winston](https://github.com/winstonjs/winston) for logging.
+- [Zod](https://github.com/colinhacks/zod) for validation.

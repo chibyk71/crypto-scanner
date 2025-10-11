@@ -328,8 +328,6 @@ export class ExchangeService {
             logger.error('Invalid OhlcvData after conversion');
             throw new Error('Invalid OhlcvData: Contains NaN or negative values');
         }
-
-        logger.info(`Successfully fetched ${JSON.stringify(result)} candles for ${symbol}:${timeframe}`);
         return result;
     }
 
