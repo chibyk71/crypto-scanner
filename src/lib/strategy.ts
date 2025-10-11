@@ -54,7 +54,8 @@ const MA_TREND_POINTS = 25;
 const MOMENTUM_POINTS = 20; // Reduced weight as we simplify the check
 const VOLUME_POINTS = 15;
 const TREND_STRENGTH_POINTS = 10;
-const MAX_SCORE_PER_SIDE = HTF_TREND_POINTS + MA_TREND_POINTS + 3 * MOMENTUM_POINTS + VOLUME_POINTS + TREND_STRENGTH_POINTS;
+const BB_POINTS = 15; // Points allocated for Bollinger Bands signals
+const MAX_SCORE_PER_SIDE = HTF_TREND_POINTS + MA_TREND_POINTS + 3 * MOMENTUM_POINTS + VOLUME_POINTS + TREND_STRENGTH_POINTS + BB_POINTS;
 
 const FIXED_RISK_PERCENT = 1.0;
 const MAX_ATR_RISK_FACTOR = 1.0;
@@ -122,7 +123,7 @@ export class Strategy {
      * @returns TradeSignal with signal, confidence, reasons, and risk management levels.
      */
     public generateSignal(input: StrategyInput): TradeSignal {
-        const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget, trailingStopPercent } = input;
+        const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
         let buyScore = 0;
         let sellScore = 0;
         const reasons: string[] = [];
@@ -211,6 +212,31 @@ export class Strategy {
                 reasons.push(`TTF ADX/DMI: Strong Bearish Trend ($\text{ADX} > ${this.adxThreshold}$ & $\text{DI}- > \text{DI}+$) [${TREND_STRENGTH_POINTS} pts]`);
             } else {
                 reasons.push('TTF ADX/DMI: Weak or Conflicting Trend [0 pts]');
+            }
+
+
+            // --- Improvement 4: Volatility & Mean Reversion (Bollinger Bands) ---
+            const bbNow = bb.at(-1) ?? { middle: 0, upper: 0, lower: 0 };
+
+            // 3A. Mean Reversion Check (Price near Bands)
+            if (price <= bbNow.lower) {
+                buyScore += BB_POINTS / 2; // Half points for touch/oversold
+                reasons.push(`TTF BB: Price touched or below Lower Band (Oversold) [${BB_POINTS / 2} pts]`);
+            } else if (price >= bbNow.upper) {
+                sellScore += BB_POINTS / 2; // Half points for touch/overbought
+                reasons.push(`TTF BB: Price touched or above Upper Band (Overbought) [${BB_POINTS / 2} pts]`);
+            }
+
+            // 3B. Volatility Squeeze Filter (Optional: Only trade if bands are wide, or vice versa)
+            // A common measure: Band width relative to the middle band (SMA)
+            const bbWidth = (bbNow.upper - bbNow.lower) / bbNow.middle * 100;
+            const SQUEEZE_THRESHOLD_PERCENT = 1.0; // Example: Band width is less than 1.0% of the price
+
+            if (bbWidth < SQUEEZE_THRESHOLD_PERCENT) {
+                buyScore -= BB_POINTS / 2;
+                sellScore -= BB_POINTS / 2;
+                reasons.push(`TTF BB: Squeeze - Reduced confidence in both buy and sell signals [-${BB_POINTS / 2} pts each]`);
+                reasons.push(`TTF BB: Volatility Squeeze detected (${bbWidth.toFixed(2)}%) - Exercise caution.`);
             }
 
             // --- Momentum Indicators (Simplified Confluence) ---
