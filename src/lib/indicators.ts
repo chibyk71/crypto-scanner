@@ -1,226 +1,163 @@
-// src/lib/indicators.ts
-
+/**
+ * Technical indicators for trading analysis, using the technicalindicators library.
+ * Includes SMA, EMA, RSI, MACD, Stochastic, ATR, Bollinger Bands, OBV, and ADX calculations.
+ */
 import * as ti from 'technicalindicators';
+import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX';
 import type { StochasticOutput } from 'technicalindicators/declarations/momentum/Stochastic';
+import type { MACDOutput } from 'technicalindicators/declarations/moving_averages/MACD';
+import type { BollingerBandsOutput } from 'technicalindicators/declarations/volatility/BollingerBands';
 
 /**
- * =========================
- * UTILITY TYPES
- * =========================
- */
-// Define custom types for clarity (assuming these are in '../types' or similar)
-type ClosePrices = number[];
-type HighPrices = number[];
-type LowPrices = number[];
-type Volumes = number[];
-
-/**
- * =========================
- * TREND INDICATORS
- * =========================
- */
-
-/**
- * Exponential Moving Average (EMA)
- * @param closes - Closing price series.
- * @param period - Lookback period (Default: 200 for long-term trend, or 20 for short-term).
- * @returns Array of EMA values.
- */
-export function calculateEMA(closes: ClosePrices, period: number = 200): number[] {
-    if (closes.length < period) return [];
-    return ti.ema({ values: closes, period }) as number[];
-}
-
-/**
- * Simple Moving Average (SMA)
- * @param closes - Closing price series.
- * @param period - Lookback period (Default: 50).
+ * Calculates Simple Moving Average (SMA).
+ * @param values - Array of price data.
+ * @param period - SMA period (default: 50).
  * @returns Array of SMA values.
  */
-export function calculateSMA(closes: ClosePrices, period: number = 50): number[] {
-    if (closes.length < period) return [];
-    return ti.sma({ values: closes, period }) as number[];
+export function calculateSMA(values: number[], period: number = 50): number[] {
+    if (values.length < period) return [];
+    return ti.sma({ values, period });
 }
 
 /**
- * Moving Average Crossover Check
- * NOTE: This function's logic remains intact as it doesn't take a period, but uses the results of MA functions.
+ * Calculates Exponential Moving Average (EMA).
+ * @param values - Array of price data.
+ * @param period - EMA period (default: 50).
+ * @returns Array of EMA values.
+ */
+export function calculateEMA(values: number[], period: number = 50): number[] {
+    if (values.length < period) return [];
+    return ti.ema({ values, period });
+}
+
+/**
+ * Calculates Relative Strength Index (RSI).
+ * @param values - Array of price data.
+ * @param period - RSI period (default: 14).
+ * @returns Array of RSI values.
+ */
+export function calculateRSI(values: number[], period: number = 14): number[] {
+    if (values.length < period) return [];
+    return ti.rsi({ values, period });
+}
+
+/**
+ * Calculates Moving Average Convergence Divergence (MACD).
+ * @param values - Array of price data.
+ * @param fastPeriod - Fast EMA period (default: 12).
+ * @param slowPeriod - Slow EMA period (default: 26).
+ * @param signalPeriod - Signal line period (default: 9).
+ * @returns Array of MACD objects with MACD, signal, and histogram.
+ */
+export function calculateMACD(
+    values: number[],
+    fastPeriod: number = 12,
+    slowPeriod: number = 26,
+    signalPeriod: number = 9
+): MACDOutput[] {
+    if (values.length < slowPeriod) return [{ MACD: 0, signal: 0, histogram: 0 }];
+    return ti.macd({ values, fastPeriod, slowPeriod, signalPeriod, SimpleMAOscillator: false, SimpleMASignal: false });
+}
+
+/**
+ * Calculates Stochastic Oscillator.
+ * @param highs - Array of high prices.
+ * @param lows - Array of low prices.
+ * @param closes - Array of closing prices.
+ * @param kPeriod - %K period (default: 14).
+ * @param dPeriod - %D period (default: 3).
+ * @returns Array of Stochastic objects with k and d values.
+ */
+export function calculateStochastic(
+    highs: number[],
+    lows: number[],
+    closes: number[],
+    kPeriod: number = 14,
+    dPeriod: number = 3
+): StochasticOutput[] {
+    if (highs.length < kPeriod || lows.length < kPeriod || closes.length < kPeriod) return [];
+    if (highs.length !== lows.length || lows.length !== closes.length) {
+        throw new Error('Input arrays (highs, lows, closes) must have equal length');
+    }
+    return ti.stochastic({ high: highs, low: lows, close: closes, period: kPeriod, signalPeriod: dPeriod });
+}
+
+/**
+ * Calculates Average True Range (ATR).
+ * @param highs - Array of high prices.
+ * @param lows - Array of low prices.
+ * @param closes - Array of closing prices.
+ * @param period - ATR period (default: 14).
+ * @returns Array of ATR values.
+ */
+export function calculateATR(highs: number[], lows: number[], closes: number[], period: number = 14): number[] {
+    if (highs.length < period || lows.length < period || closes.length < period) return [];
+    if (highs.length !== lows.length || lows.length !== closes.length) {
+        throw new Error('Input arrays (highs, lows, closes) must have equal length');
+    }
+    return ti.atr({ high: highs, low: lows, close: closes, period });
+}
+
+/**
+ * Calculates Bollinger Bands.
+ * @param values - Array of price data.
+ * @param period - Period for SMA (default: 20).
+ * @param stdDev - Standard deviation multiplier (default: 2).
+ * @returns Array of Bollinger Bands objects with upper, middle, and lower bands.
+ */
+export function calculateBollingerBands(values: number[], period: number = 20, stdDev: number = 2): BollingerBandsOutput[] {
+    if (values.length < period) return [];
+    return ti.bollingerbands({ values, period, stdDev });
+}
+
+/**
+ * Calculates On-Balance Volume (OBV).
+ * @param closes - Array of closing prices.
+ * @param volumes - Array of volume data.
+ * @returns Array of OBV values.
+ */
+export function calculateOBV(closes: number[], volumes: number[]): number[] {
+    if (closes.length < 2 || volumes.length < 2 || closes.length !== volumes.length) return [];
+    return ti.obv({ close: closes, volume: volumes });
+}
+
+/**
+ * Checks for Moving Average crossover signals.
+ * @param shortMA - Array of short-term MA values.
+ * @param longMA - Array of long-term MA values.
+ * @returns 'bullish', 'bearish', or 'none' based on crossover detection.
  */
 export function checkMACrossover(shortMA: number[], longMA: number[]): 'bullish' | 'bearish' | 'none' {
-    if (shortMA.length < 2 || longMA.length < 2) return 'none';
-
-    // Check if the latest short MA is above the long MA
+    if (shortMA.length < 2 || longMA.length < 2 || shortMA.length !== longMA.length) return 'none';
     const lastShort = shortMA.at(-1)!;
-    const lastLong = longMA.at(-1)!;
-
-    // Check if the crossover occurred on the last bar
     const prevShort = shortMA.at(-2)!;
+    const lastLong = longMA.at(-1)!;
     const prevLong = longMA.at(-2)!;
 
     if (lastShort > lastLong && prevShort <= prevLong) {
-        return 'bullish'; // Bullish Crossover
+        return 'bullish';
+    } else if (lastShort < lastLong && prevShort >= prevLong) {
+        return 'bearish';
+    } else if (lastShort > lastLong) {
+        return 'bullish'; // Trend continuation
+    } else if (lastShort < lastLong) {
+        return 'bearish'; // Trend continuation
     }
-    if (lastShort < lastLong && prevShort >= prevLong) {
-        return 'bearish'; // Bearish Crossover
-    }
-    if (lastShort > lastLong) {
-        return 'bullish'; // Trend aligned bullish
-    }
-    if (lastShort < lastLong) {
-        return 'bearish'; // Trend aligned bearish
-    }
-
     return 'none';
 }
 
 /**
- * Moving Average Convergence Divergence (MACD)
- * @param closes - Closing price series.
- * @param fastPeriod - Fast EMA period (Default: 5 for fast trading, or 12 standard).
- * @param slowPeriod - Slow EMA period (Default: 13 for fast trading, or 26 standard).
- * @param signalPeriod - Signal line period (Default: 8 for fast trading, or 9 standard).
- * @returns Object containing macd, signal, and histogram arrays.
+ * Calculates Average Directional Index (ADX).
+ * @param highs - Array of high prices.
+ * @param lows - Array of low prices.
+ * @param closes - Array of closing prices.
+ * @param period - ADX period (default: 14).
+ * @returns Array of ADX objects with adx, pdi (+DI), and mdi (-DI) values.
  */
-export function calculateMACD(
-    closes: ClosePrices,
-    fastPeriod: number = 5,    // Suggested fast setting for 3m chart
-    slowPeriod: number = 13,   // Suggested fast setting for 3m chart
-    signalPeriod: number = 8   // Suggested fast setting for 3m chart
-) {
-    const period = Math.max(fastPeriod, slowPeriod, signalPeriod);
-    if (closes.length < period) return [{ MACD: 0, signal: 0, histogram: 0 }];
-
-    return ti.macd({
-        values: closes,
-        fastPeriod,
-        slowPeriod,
-        signalPeriod,
-        SimpleMAOscillator: false,
-        SimpleMASignal: false,
-    });
-}
-
-
-/**
- * =========================
- * MOMENTUM INDICATORS
- * =========================
- */
-
-/**
- * Relative Strength Index (RSI)
- * @param closes - Closing price series.
- * @param period - Lookback period (Default: 10 for fast trading, or 14 standard).
- * @returns Array of RSI values.
- */
-export function calculateRSI(closes: ClosePrices, period: number = 10): number[] {
-    if (closes.length < period) return [];
-    return ti.rsi({ values: closes, period }) as number[];
-}
-
-/**
- * Stochastic Oscillator
- * @param highs - High price series.
- * @param lows - Low price series.
- * @param closes - Closing price series.
- * @param period - %K period (Default: 14).
- * @param signalPeriod - %D period (Default: 3).
- * @returns Object containing %K and %D arrays.
- */
-export function calculateStochastic(
-    highs: HighPrices,
-    lows: LowPrices,
-    closes: ClosePrices,
-    period: number = 14,
-    signalPeriod: number = 3
-): StochasticOutput[] {
-    if (highs.length < period || lows.length < period || closes.length < period) {
-        return [{ k: 0, d: 0 }];
-    }
-
-    return ti.stochastic({
-        high: highs,
-        low: lows,
-        close: closes,
-        period,
-        signalPeriod,
-    });
-}
-
-/**
- * =========================
- * VOLATILITY INDICATORS
- * =========================
- */
-
-/**
- * Average True Range (ATR)
- * @param highs - High price series.
- * @param lows - Low price series.
- * @param closes - Closing price series.
- * @param period - Lookback period (Default: 12 for fast trading, or 14 standard).
- * @returns Array of ATR values.
- */
-export function calculateATR(highs: HighPrices, lows: LowPrices, closes: ClosePrices, period: number = 12): number[] {
+export function calculateADX(highs: number[], lows: number[], closes: number[], period: number = 14): ADXOutput[] {
     if (highs.length < period || lows.length < period || closes.length < period) return [];
-    return ti.atr({ high: highs, low: lows, close: closes, period }) as number[];
-}
-
-/**
- * Bollinger Bands (BB)
- * @param closes - Closing price series.
- * @param period - Lookback period (Default: 20).
- * @param stdDev - Standard deviation multiplier (Default: 2).
- * @returns Array of objects with lower, middle, and upper band values.
- */
-export function calculateBollingerBands(closes: ClosePrices, period: number = 20, stdDev: number = 2) {
-    if (closes.length < period) return [];
-    return ti.bollingerbands({
-        values: closes,
-        period,
-        stdDev,
-    }) as Array<{ lower: number; middle: number; upper: number }>;
-}
-
-
-/**
- * =========================
- * VOLUME-BASED INDICATORS
- * =========================
- */
-
-/**
- * On-Balance Volume (OBV)
- * @param closes - Closing price series.
- * @param volumes - Volume series.
- * @returns Array of OBV values.
- */
-export function calculateOBV(closes: ClosePrices, volumes: Volumes): number[] {
-    if (closes.length !== volumes.length || closes.length === 0) return [];
-    return ti.obv({ close: closes, volume: volumes }) as number[];
-}
-
-/**
- * Volume Weighted Average Price (VWAP)
- * NOTE: VWAP does not take a 'period' and typically uses all data since the start of the session.
- */
-export function calculateVWAP(highs: HighPrices, lows: LowPrices, closes: ClosePrices, volumes: Volumes): number[] {
-    const vwap: number[] = [];
-    let cumulativeVolume = 0;
-    let cumulativePV = 0;
-
-    for (let i = 0; i < closes.length; i++) {
-        const typicalPrice = (highs[i] + lows[i] + closes[i]) / 3;
-        const PV = typicalPrice * volumes[i];
-
-        cumulativeVolume += volumes[i];
-        cumulativePV += PV;
-
-        if (cumulativeVolume > 0) {
-            vwap.push(cumulativePV / cumulativeVolume);
-        } else {
-            vwap.push(vwap.length > 0 ? vwap.at(-1)! : typicalPrice); // Push previous VWAP or typical price
-        }
+    if (highs.length !== lows.length || lows.length !== closes.length) {
+        throw new Error('Input arrays (highs, lows, closes) must have equal length');
     }
-    return vwap;
+    return ti.adx({ high: highs, low: lows, close: closes, period });
 }
