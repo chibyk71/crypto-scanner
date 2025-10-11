@@ -1,329 +1,492 @@
-/**
- * BacktestService runs backtests on historical OHLCV data using a provided strategy.
- * Supports multi-timeframe data, technical indicators, and realistic trade simulation.
- */
+// src/lib/backtest.ts
 
-import { ExchangeService } from './exchange';
-import { Strategy, TradeSignal, StrategyInput } from '../strategy';
-import { createLogger } from '../logger';
-import { config } from '../config/settings';
+/**
+ * Improved backtesting module to simulate trading performance using historical OHLCV data.
+ * - Proper entry/exit fee handling (entry fee applied on entry, exit fee applied on exit)
+ * - Allocation reserved on entry and restored on exit
+ * - Candle path-based SL/TP hit ordering to avoid lookahead bias
+ * - Equity curve + per-bar returns for correct Sharpe calculation
+ * - Additional metrics: profit factor, expectancy, payoff ratio, time-in-market
+ * - Minor resampling fixes (rounding)
+ */
+import { Strategy, StrategyInput, TradeSignal } from '../strategy';
 import type { OhlcvData } from '../../types';
 
-const logger = createLogger('BacktestService');
-
-/**
- * The structure for the final output of the backtest.
- */
 export interface BacktestResult {
-    symbol: string;
-    timeframe: string;
     initialCapital: number;
     finalCapital: number;
-    totalPnLPercent: number;
+    totalPnL: number; // percent
     totalTrades: number;
     winningTrades: number;
-    losingTrades: number;
-    maxDrawdownPercent: number;
-    trades: Trade[];
+    winRate: number; // percent
+    maxDrawdown: number; // percent
+    avgTradePnL: number; // percent (of initial capital)
+    sharpeRatio: number;
+    avgHoldTime: number; // In minutes
+    trades: TradeLog[];
+    signalStats?: { buysGenerated: number; sellsGenerated: number; holdsGenerated: number };
+    equityCurve?: { time: number; equity: number }[];
+    profitFactor?: number;
+    expectancy?: number; // percent of initial capital per trade
+    payoffRatio?: number;
+    timeInMarketPercent?: number;
+    grossProfit?: number;
+    grossLoss?: number;
 }
 
-/**
- * Represents a single executed trade in the backtest.
- */
-interface Trade {
+export interface TradeLog {
     entryTime: number;
-    exitTime?: number;
+    exitTime: number;
+    signal: 'buy' | 'sell';
     entryPrice: number;
-    exitPrice?: number;
-    type: 'buy' | 'sell';
-    status: 'closed' | 'open';
-    pnlPercent: number;
-    size: number; // Capital allocated to the trade
-    stopLoss?: number;   // NEW: Store calculated SL price
-    takeProfit?: number; // NEW: Store calculated TP price
+    exitPrice: number;
+    positionSize: number; // in asset units (can be negative)
+    allocatedCapital: number; // capital allocated (reserved) at entry
+    pnL: number; // absolute $ PnL (after fees)
+    pnLPercentOfInitial: number; // PnL as percent of initial capital
+    reasons: string[];
+    stopLoss?: number;
+    takeProfit?: number;
+    exitReason?: string;
 }
 
+export interface BacktestConfig {
+    initialCapital: number;
+    positionSizePercent: number; // fraction of capital to allocate per trade, e.g. 0.02 for 2%
+    feePercent: number; // percent (applied on entry and exit)
+    slippagePercent: number; // percent applied to fills
+    spreadPercent: number; // additional spread adjustment on entry
+    cooldownMinutes: number;
+}
 
-export class BacktestService {
-    private exchange: ExchangeService;
-    private strategy: Strategy;
+/** Resample 3m OHLCV to HTF (e.g., 1h) */
+function resampleToHTF(primaryData: OhlcvData, timeframeMinutes: number = 60): OhlcvData {
+    const { timestamps, highs, lows, closes, volumes, opens } = primaryData;
+    const result: OhlcvData = { timestamps: [], highs: [], lows: [], closes: [], volumes: [], opens: [], length: 0 };
+    const barsPerHTF = Math.max(1, Math.round(timeframeMinutes / 3)); // rounding to nearest integer
 
-    constructor(exchange: ExchangeService, strategy: Strategy) {
-        this.exchange = exchange;
-        this.strategy = strategy;
+    for (let i = 0; i < timestamps.length; i += barsPerHTF) {
+        const sliceEnd = Math.min(i + barsPerHTF, timestamps.length);
+        const sliceHighs = highs.slice(i, sliceEnd);
+        const sliceLows = lows.slice(i, sliceEnd);
+        const sliceCloses = closes.slice(i, sliceEnd);
+        const sliceOpens = opens.slice(i, sliceEnd);
+        const sliceVolumes = volumes.slice(i, sliceEnd);
+        const sliceTimestamps = timestamps.slice(i, sliceEnd);
+
+        if (sliceTimestamps.length === 0) continue;
+
+        result.timestamps.push(sliceTimestamps[sliceTimestamps.length - 1]);
+        result.highs.push(Math.max(...sliceHighs));
+        result.lows.push(Math.min(...sliceLows));
+        result.closes.push(sliceCloses[sliceCloses.length - 1]);
+        result.opens.push(sliceOpens[0]);
+        result.volumes.push(sliceVolumes.reduce((s, v) => s + v, 0));
+    }
+    result.length = result.timestamps.length;
+    return result;
+}
+
+/** Helper: simulate the intra-candle price path to decide which level (SL or TP) hit first.
+ * We assume:
+ *  - If candle is bullish (close >= open): path = open -> high -> low -> close
+ *  - If candle is bearish (close < open): path = open -> low -> high -> close
+ * This is a deterministic, common approximation (not perfect but avoids lookahead).
+ */
+function firstHitInCandle(open: number, high: number, low: number, close: number, levels: number[]) {
+    // levels: array of numeric levels to check (e.g., [stopLoss, takeProfit]) - return first touched level or null
+    const path: number[] = [];
+    if (close >= open) {
+        path.push(high, low, close);
+    } else {
+        path.push(low, high, close);
     }
 
-    /**
-     * Converts timeframe string to milliseconds (e.g., '1h' -> 3600000).
-     */
-    private timeframeToMs(timeframe: string): number {
-        const units: { [key: string]: number } = {
-            '1m': 60 * 1000,
-            '3m': 3 * 60 * 1000,
-            '5m': 5 * 60 * 1000,
-            '15m': 15 * 60 * 1000,
-            '30m': 30 * 60 * 1000,
-            '1h': 60 * 60 * 1000,
-            '4h': 4 * 60 * 60 * 1000,
-            '1d': 24 * 60 * 60 * 1000,
-            '1w': 7 * 24 * 60 * 60 * 1000,
-        };
-        const match = timeframe.match(/^(\d+)([mhdw])$/);
-        if (!match) throw new Error(`Invalid timeframe: ${timeframe}`);
-        const value = parseInt(match[1]);
-        const unit = match[2];
-        return value * units[`1${unit}`];
+    // simulate that price starts at open and then moves to each path point in sequence;
+    // a level is hit if it's between the previous point and the next point inclusive.
+    let prev = open;
+    for (const point of path) {
+        for (const level of levels) {
+            // If level lies between prev and point (inclusive), we consider it hit
+            if ((level >= Math.min(prev, point) && level <= Math.max(prev, point))) {
+                return level;
+            }
+        }
+        prev = point;
+    }
+    return null;
+}
+
+export function runBacktest(
+    symbol: string,
+    primaryData: OhlcvData,
+    config: BacktestConfig,
+    strategy: Strategy
+): BacktestResult {
+    const {
+        initialCapital,
+        positionSizePercent,
+        feePercent,
+        slippagePercent,
+        spreadPercent,
+        cooldownMinutes,
+    } = config;
+
+    // Basic validation
+    const N = primaryData.timestamps.length;
+    if (
+        N < 200 ||
+        primaryData.highs.length !== N ||
+        primaryData.lows.length !== N ||
+        primaryData.closes.length !== N ||
+        primaryData.opens.length !== N ||
+        primaryData.volumes.length !== N
+    ) {
+        throw new Error('Insufficient or invalid primary OHLCV data');
     }
 
-    /**
-     * Runs the backtest over historical data.
-     * @param symbol - The symbol (e.g., 'BTC/USDT').
-     * @param timeframe - The primary timeframe (e.g., '3m').
-     * @param initialCapital - Starting equity.
-     * @param limit - Number of historical candles to fetch.
-     * @returns The backtest performance metrics.
-     */
-    public async runBacktest(
-        symbol: string,
-        timeframe: string = config.scanner.primaryTimeframe || '3m',
-        initialCapital: number = 1000,
-        limit: number = 5000
-    ): Promise<BacktestResult | null> {
-        logger.info(`Starting backtest for ${symbol}:${timeframe} with ${initialCapital} capital over ${limit} candles.`);
+    const htfData = resampleToHTF(primaryData, 60);
+    if (htfData.timestamps.length < 200) {
+        throw new Error('Insufficient HTF data after resampling');
+    }
 
-        // Validate symbol
-        if (!await this.exchange.validateSymbol(symbol)) {
-            logger.error(`Symbol ${symbol} not supported by exchange.`);
-            return null;
-        }
+    let capital = initialCapital;
+    let reservedCapital = 0; // capital currently reserved for open position(s)
+    let maxCapitalSeen = initialCapital;
+    let maxDrawdown = 0;
+    const trades: TradeLog[] = [];
+    const equityCurve: { time: number; equity: number }[] = [];
+    const perBarReturns: number[] = []; // returns computed from equity curve per bar
+    let lastExitTime = -Infinity;
+    let openTrade: {
+        entryTime: number;
+        signal: 'buy' | 'sell';
+        entryPrice: number;
+        positionSize: number;
+        allocatedCapital: number;
+        stopLoss?: number;
+        takeProfit?: number;
+        reasons: string[];
+    } | null = null;
 
-        // Validate timeframe
-        const validTimeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'];
-        if (!validTimeframes.includes(timeframe)) {
-            logger.error(`Invalid timeframe: ${timeframe}. Supported: ${validTimeframes.join(', ')}`);
-            return null;
-        }
+    let buysGenerated = 0;
+    let sellsGenerated = 0;
+    let holdsGenerated = 0;
 
-        // Calculate since timestamp for historical data
-        const timeframeMs = this.timeframeToMs(timeframe);
-        const since = Date.now() - (limit * timeframeMs);
+    // Precompute bars per HTF ratio to pick HTF slices later
+    const barsPerHTF = Math.max(1, Math.round(60 / 3)); // 20 for 1h on 3m bars
 
-        logger.info(`Fetching historical data since ${new Date(since).toISOString()}`);
+    // Start loop from index 200 to ensure enough data for indicators (as original)
+    for (let i = 200; i < N; i++) {
+        const timestamp = primaryData.timestamps[i];
+        const open = primaryData.opens[i];
+        const high = primaryData.highs[i];
+        const low = primaryData.lows[i];
+        const close = primaryData.closes[i];
 
-        // Fetch historical data
-        const primaryCandles: OhlcvData = await this.exchange.fetchHistoricalOHLCV(symbol, timeframe, limit);
-        if (!primaryCandles || primaryCandles.length < limit) {
-            logger.error(`Insufficient data for ${symbol}:${timeframe}. Need ${limit} candles, got ${primaryCandles?.length || 0}.`);
-            return null;
-        }
-
-        // Fetch higher timeframe data if required
-        const higherTimeframe = config.scanner.htfTimeframe || '1h';
-        let higherCandles: OhlcvData = { timestamps: [], opens: [], highs: [], lows: [], closes: [], volumes: [], length: 0 };
-        if (higherTimeframe !== timeframe) {
-            const higherLimit = Math.ceil(limit * (timeframeMs / this.timeframeToMs(higherTimeframe)));
-            higherCandles = await this.exchange.fetchHistoricalOHLCV(symbol, higherTimeframe, higherLimit);
-            if (!higherCandles || higherCandles.length < higherLimit) {
-                logger.warn(`Insufficient higher timeframe data for ${symbol}:${higherTimeframe}. Got ${higherCandles?.length || 0} candles, needed ${higherLimit}. Proceeding with primary timeframe only.`);
-                higherCandles = { timestamps: [], opens: [], highs: [], lows: [], closes: [], volumes: [], length: 0 };
-            }
-        }
-
-        const requiredHistory = config.historyLength || 200;
-        if (primaryCandles.length < requiredHistory) {
-            logger.error(`Insufficient data. Need at least ${requiredHistory} candles, got ${primaryCandles.length}.`);
-            return null;
-        }
-
-        // Setup simulation parameters
-        const candlesToSimulate = primaryCandles.timestamps.slice(requiredHistory);
-        let currentCapital = initialCapital;
-        const trades: Trade[] = [];
-        let openTrade: Trade | null = null;
-        const equityCurve: number[] = [initialCapital];
-        let peakEquity = initialCapital;
-        let maxDrawdown = 0;
-        const positionSizePercent = 0.1; // 10% of capital per trade
-        const feePercent = 0.1; // 0.1% trading fee per side
-        const slippagePercent = 0.05; // 0.05% slippage
-
-        // Main simulation loop
-        for (let i = 0; i < candlesToSimulate.length; i++) {
-            const fullIndex = requiredHistory + i;
-            const timestamp = primaryCandles.timestamps[fullIndex];
-            const closePrice = primaryCandles.closes[fullIndex];
-            const highPrice = primaryCandles.highs[fullIndex];
-            const lowPrice = primaryCandles.lows[fullIndex];
-
-            if (!timestamp || closePrice === undefined) {
-                logger.warn(`Skipping candle at index ${fullIndex} due to missing timestamp or close price.`);
-                continue;
-            }
-
-            // Get corresponding higher timeframe candle
-            let higherMarketData: OhlcvData | null = null;
-            if (higherCandles.length > 0) {
-                // Find the higher timeframe candle that covers the current primary candle's timestamp
-                const higherIndex = higherCandles.timestamps.findIndex(
-                    (t, idx) => t <= timestamp && (idx + 1 >= higherCandles.length || higherCandles.timestamps[idx + 1] > timestamp)
-                );
-                if (higherIndex >= 0) {
-                    higherMarketData = {
-                        symbol,
-                        timestamps: higherCandles.timestamps.slice(0, higherIndex + 1),
-                        opens: higherCandles.opens.slice(0, higherIndex + 1),
-                        highs: higherCandles.highs.slice(0, higherIndex + 1),
-                        lows: higherCandles.lows.slice(0, higherIndex + 1),
-                        closes: higherCandles.closes.slice(0, higherIndex + 1),
-                        volumes: higherCandles.volumes.slice(0, higherIndex + 1),
-                        length: higherIndex + 1,
-                    };
-                }
-            }
-
-            // Prepare market data for strategy
-            const primaryMarketData: OhlcvData = {
-                symbol,
-                timestamps: primaryCandles.timestamps.slice(0, fullIndex),
-                opens: primaryCandles.opens.slice(0, fullIndex),
-                highs: primaryCandles.highs.slice(0, fullIndex),
-                lows: primaryCandles.lows.slice(0, fullIndex),
-                closes: primaryCandles.closes.slice(0, fullIndex),
-                volumes: primaryCandles.volumes.slice(0, fullIndex),
-                length: fullIndex,
-            };
-
-            const strategyInput: StrategyInput = {
-                primaryData: primaryMarketData,
-                htfData: higherMarketData || { timestamps: [], opens: [], highs: [], lows: [], closes: [], volumes: [], length: 0 },
-                symbol,
-                price: closePrice,
-                atrMultiplier: this.strategy.atrMultiplier, // Use strategy's configured multiplier (1.5)
-                riskRewardTarget: this.strategy.riskRewardTarget, // Use strategy's configured RRR (3)
-                trailingStopPercent: this.strategy.trailingStopPercent, // Use strategy's configured trailing stop (3)
-            };
-
-            // Generate signal
-            const signal: TradeSignal = this.strategy.generateSignal(strategyInput);
-
-            // Trade management logic
-            if (openTrade) {
-                let isClosed = false;
-                let exitPrice = closePrice; // Default exit price is the close
-
-                // 1. Check for Stop-Loss and Take-Profit (Using High/Low for more realistic execution)
-                if (openTrade.type === 'buy' && openTrade.stopLoss && openTrade.takeProfit) {
-                    if (lowPrice <= openTrade.stopLoss) {
-                        isClosed = true;
-                        exitPrice = openTrade.stopLoss; // SL hit price
-                    } else if (highPrice >= openTrade.takeProfit) {
-                        isClosed = true;
-                        exitPrice = openTrade.takeProfit; // TP hit price
-                    } else if (signal.signal === 'sell') {
-                        // 2. Check for Reversal Signal
-                        isClosed = true;
-                        exitPrice = closePrice; // Exit at the bar's close price
-                    }
-                } else if (openTrade.type === 'sell' && openTrade.stopLoss && openTrade.takeProfit) {
-                    if (highPrice >= openTrade.stopLoss) {
-                        isClosed = true;
-                        exitPrice = openTrade.stopLoss; // SL hit price
-                    } else if (lowPrice <= openTrade.takeProfit) {
-                        isClosed = true;
-                        exitPrice = openTrade.takeProfit; // TP hit price
-                    } else if (signal.signal === 'buy') {
-                        // 2. Check for Reversal Signal
-                        isClosed = true;
-                        exitPrice = closePrice; // Exit at the bar's close price
-                    }
-                }
-
-                // 3. Execute closure
-                if (isClosed) {
-                    // Apply slippage to the exit price (SL price, TP price, or Close price)
-                    const finalExitPrice = exitPrice * (1 + (openTrade.type === 'buy' ? slippagePercent : -slippagePercent) / 100);
-
-                    openTrade = this.closeTrade(openTrade, finalExitPrice, timestamp, feePercent);
-                    trades.push(openTrade);
-                    currentCapital += openTrade.size * (openTrade.pnlPercent / 100);
-                    openTrade = null;
-                }
-            }
-
-            // Open a new trade
-            if (!openTrade && signal.confidence >= 65 && (signal.signal === 'buy' || signal.signal === 'sell')) {
-                const size = currentCapital * positionSizePercent;
-                openTrade = {
-                    entryTime: timestamp,
-                    // Apply slippage to entry price
-                    entryPrice: closePrice * (1 + (signal.signal === 'buy' ? slippagePercent : -slippagePercent) / 100),
-                    type: signal.signal,
-                    status: 'open',
-                    pnlPercent: 0,
-                    size,
-                    // NEW: Store dynamic risk management values
-                    stopLoss: signal.stopLoss,
-                    takeProfit: signal.takeProfit,
-                };
-                currentCapital -= size * (feePercent / 100); // Deduct entry fee
-            }
-
-            // Update equity curve and drawdown
-             const currentEquity = openTrade
-                ? currentCapital + openTrade.size * (((closePrice * (1 + (openTrade.type === 'buy' ? -slippagePercent : slippagePercent) / 100) - openTrade.entryPrice) / openTrade.entryPrice) * (openTrade.type === 'buy' ? 1 : -1))
-                : currentCapital;
-            equityCurve.push(currentEquity);
-            peakEquity = Math.max(peakEquity, currentEquity);
-            maxDrawdown = Math.max(maxDrawdown, (peakEquity - currentEquity) / peakEquity);
-        }
-
-        // Finalize open trade
-        if (openTrade) {
-            const finalPrice = primaryCandles.closes[primaryCandles.length - 1] * (1 + (openTrade.type === 'buy' ? -slippagePercent : slippagePercent) / 100);
-            const finalTimestamp = primaryCandles.timestamps[primaryCandles.length - 1];
-            openTrade = this.closeTrade(openTrade, finalPrice, finalTimestamp, feePercent);
-            trades.push(openTrade);
-            currentCapital += openTrade.size * (openTrade.pnlPercent / 100);
-        }
-
-        // Calculate final results
-        const totalPnLPercent = ((currentCapital - initialCapital) / initialCapital) * 100;
-        const winningTrades = trades.filter(t => t.pnlPercent > 0).length;
-        const losingTrades = trades.filter(t => t.pnlPercent <= 0).length;
-
-        const result: BacktestResult = {
+        // Build StrategyInput (slices up to current bar inclusive)
+        const input: StrategyInput = {
             symbol,
-            timeframe,
-            initialCapital,
-            finalCapital: currentCapital,
-            totalPnLPercent,
-            totalTrades: trades.length,
-            winningTrades,
-            losingTrades,
-            maxDrawdownPercent: maxDrawdown * 100,
-            trades,
+            primaryData: {
+                timestamps: primaryData.timestamps.slice(0, i + 1),
+                highs: primaryData.highs.slice(0, i + 1),
+                lows: primaryData.lows.slice(0, i + 1),
+                closes: primaryData.closes.slice(0, i + 1),
+                volumes: primaryData.volumes.slice(0, i + 1),
+                opens: primaryData.opens.slice(0, i + 1),
+                length: i + 1,
+            },
+            htfData: {
+                timestamps: htfData.timestamps.slice(0, Math.floor(i / barsPerHTF) + 1),
+                highs: htfData.highs.slice(0, Math.floor(i / barsPerHTF) + 1),
+                lows: htfData.lows.slice(0, Math.floor(i / barsPerHTF) + 1),
+                closes: htfData.closes.slice(0, Math.floor(i / barsPerHTF) + 1),
+                volumes: htfData.volumes.slice(0, Math.floor(i / barsPerHTF) + 1),
+                opens: htfData.opens.slice(0, Math.floor(i / barsPerHTF) + 1),
+                length: Math.floor(i / barsPerHTF) + 1,
+            },
+            price: close,
+            atrMultiplier: strategy.atrMultiplier,
+            riskRewardTarget: strategy.riskRewardTarget,
+            trailingStopPercent: strategy.trailingStopPercent,
         };
 
-        logger.info(`Backtest completed for ${symbol}:${timeframe}`, {
-            totalPnLPercent: result.totalPnLPercent.toFixed(2),
-            totalTrades: result.totalTrades,
-            winRate: result.totalTrades > 0 ? ((winningTrades / result.totalTrades) * 100).toFixed(2) : '0.00',
-            maxDrawdownPercent: result.maxDrawdownPercent.toFixed(2),
+        // Skip if in cooldown
+        if (timestamp < lastExitTime + cooldownMinutes * 60 * 1000) {
+            // push equity point for this bar (no trade decision)
+            equityCurve.push({ time: timestamp, equity: capital + reservedCapital });
+            const prevEquity = equityCurve.length > 1 ? equityCurve[equityCurve.length - 2].equity : capital;
+            perBarReturns.push((capital + reservedCapital) / prevEquity - 1);
+            continue;
+        }
+
+        // Generate signal
+        const signal = strategy.generateSignal(input);
+        if (signal.signal === 'buy') buysGenerated++;
+        else if (signal.signal === 'sell') sellsGenerated++;
+        else holdsGenerated++;
+
+        // If there is an open trade, evaluate exit conditions inside this candle
+        if (openTrade) {
+            let exitPrice: number | undefined;
+            let exitReason = '';
+
+            const stopLevel = openTrade.stopLoss;
+            const takeLevel = openTrade.takeProfit;
+
+            // 1) Check intra-candle hits (SL/TP). Determine which level is hit first in this candle path.
+            if (stopLevel !== undefined && takeLevel !== undefined) {
+                const levelsToCheck = [stopLevel, takeLevel];
+                const firstHit = firstHitInCandle(open, high, low, close, levelsToCheck);
+                if (firstHit !== null) {
+                    // Adjust for slippage depending on direction of trade and type of level
+                    if (openTrade.signal === 'buy') {
+                        if (firstHit === stopLevel) {
+                            // buyer stops out -> likely filled at stopLevel plus slippage
+                            exitPrice = Math.min(stopLevel * (1 + slippagePercent / 100), high); // conservative
+                            exitReason = 'Stop-loss hit';
+                        } else if (firstHit === takeLevel) {
+                            exitPrice = Math.max(takeLevel * (1 - slippagePercent / 100), low);
+                            exitReason = 'Take-profit hit';
+                        }
+                    } else {
+                        // sell position
+                        if (firstHit === stopLevel) {
+                            exitPrice = Math.max(stopLevel * (1 - slippagePercent / 100), low);
+                            exitReason = 'Stop-loss hit';
+                        } else if (firstHit === takeLevel) {
+                            exitPrice = Math.min(takeLevel * (1 + slippagePercent / 100), high);
+                            exitReason = 'Take-profit hit';
+                        }
+                    }
+                }
+            }
+
+            // 2) If reversal signal appears (opposite direction), exit at current bar close adjusted for slippage
+            if (!exitPrice) {
+                if ((openTrade.signal === 'buy' && signal.signal === 'sell') ||
+                    (openTrade.signal === 'sell' && signal.signal === 'buy')) {
+                    // exit at a conservative fill price (close with slippage)
+                    exitPrice = close * (openTrade.signal === 'buy' ? (1 - slippagePercent / 100) : (1 + slippagePercent / 100));
+                    exitReason = 'Reversal signal';
+                }
+            }
+
+            // If exit was triggered, close the trade
+            if (exitPrice !== undefined) {
+                const usdEntryValue = openTrade.allocatedCapital;
+                const usdExitValue = Math.abs(openTrade.positionSize) * exitPrice;
+                // entry fee was already deducted at entry (we tracked entryFee), apply exit fee now
+                const exitFee = usdExitValue * (feePercent / 100);
+
+                // compute raw PnL based on direction
+                const rawPnL = openTrade.signal === 'buy'
+                    ? (exitPrice - openTrade.entryPrice) * openTrade.positionSize
+                    : (openTrade.entryPrice - exitPrice) * openTrade.positionSize;
+
+                const pnL = rawPnL - exitFee; // entry fee already accounted earlier by subtracting it from capital when opening
+
+                // Restore allocation and add PnL to capital
+                capital += openTrade.allocatedCapital; // release reserved capital back
+                reservedCapital -= openTrade.allocatedCapital;
+                capital += pnL; // add PnL (may be negative)
+                maxCapitalSeen = Math.max(maxCapitalSeen, capital);
+                const drawdown = (maxCapitalSeen - capital) / maxCapitalSeen * 100;
+                maxDrawdown = Math.max(maxDrawdown, drawdown);
+
+                // finalize trade log
+                const tradePnLPercent = (pnL / initialCapital) * 100;
+                trades.push({
+                    entryTime: openTrade.entryTime,
+                    exitTime: timestamp,
+                    signal: openTrade.signal,
+                    entryPrice: openTrade.entryPrice,
+                    exitPrice,
+                    positionSize: openTrade.positionSize,
+                    allocatedCapital: openTrade.allocatedCapital,
+                    pnL,
+                    pnLPercentOfInitial: tradePnLPercent,
+                    reasons: openTrade.reasons.concat([exitReason]),
+                    stopLoss: openTrade.stopLoss,
+                    takeProfit: openTrade.takeProfit,
+                    exitReason,
+                });
+
+                lastExitTime = timestamp;
+                openTrade = null;
+            }
+        }
+
+        // Update mark-to-market drawdown while trade is open (conservative update)
+        if (openTrade) {
+            const currentPrice = close;
+            const rawPnL = openTrade.signal === 'buy'
+                ? (currentPrice - openTrade.entryPrice) * openTrade.positionSize
+                : (openTrade.entryPrice - currentPrice) * openTrade.positionSize;
+            const currentCapital = capital + reservedCapital + rawPnL;
+            const drawdown = (maxCapitalSeen - currentCapital) / maxCapitalSeen * 100;
+            maxDrawdown = Math.max(maxDrawdown, drawdown);
+        }
+
+        // Open new trade if none open and signal valid and SL/TP provided
+        if (!openTrade && signal.signal !== 'hold' && signal.stopLoss !== undefined && signal.takeProfit !== undefined) {
+            // compute allocation and position size
+            const allocation = capital * positionSizePercent * (signal.positionSizeMultiplier ?? 1);
+            if (allocation <= 0) {
+                // nothing to allocate
+            } else {
+                // compute entry price with slippage & spread applied conservatively
+                const entryPrice = signal.signal === 'buy'
+                    ? close * (1 + slippagePercent / 100 + spreadPercent / 100)
+                    : close * (1 - slippagePercent / 100 - spreadPercent / 100);
+
+                const positionSize = allocation / entryPrice; // asset units
+
+                if (positionSize > 0) {
+                    // apply entry fee now (deduct from capital)
+                    const entryUsdValue = allocation;
+                    const entryFee = entryUsdValue * (feePercent / 100);
+                    capital -= entryFee;
+                    // reserve allocation (we remove from free capital while trade is open)
+                    capital -= allocation;
+                    reservedCapital += allocation;
+
+                    openTrade = {
+                        entryTime: timestamp,
+                        signal: signal.signal,
+                        entryPrice,
+                        positionSize: signal.signal === 'buy' ? positionSize : positionSize, // direction encoded in signal
+                        allocatedCapital: allocation,
+                        stopLoss: signal.stopLoss,
+                        takeProfit: signal.takeProfit,
+                        reasons: signal.reason,
+                    };
+
+                    // Immediately track equity after opening
+                    maxCapitalSeen = Math.max(maxCapitalSeen, capital + reservedCapital);
+                }
+            }
+        }
+
+        // push equity curve point at current bar (total equity = cash + reserved capital + mark-to-market unrealized)
+        let currentEquity = capital + reservedCapital;
+        if (openTrade) {
+            // compute unrealized PnL at close price
+            const currentPrice = close;
+            const unrealized = openTrade.signal === 'buy'
+                ? (currentPrice - openTrade.entryPrice) * openTrade.positionSize
+                : (openTrade.entryPrice - currentPrice) * openTrade.positionSize;
+            currentEquity += unrealized;
+        }
+        equityCurve.push({ time: timestamp, equity: currentEquity });
+
+        // compute per-bar return relative to previous equity point (if exists)
+        if (equityCurve.length > 1) {
+            const prev = equityCurve[equityCurve.length - 2].equity;
+            const r = prev > 0 ? (currentEquity / prev - 1) : 0;
+            perBarReturns.push(r);
+        } else {
+            perBarReturns.push(0);
+        }
+    }
+
+    // If an open trade remains at the end, close it at last close price conservatively and include exit fees
+    if (openTrade) {
+        const lastIdx = N - 1;
+        const timestamp = primaryData.timestamps[lastIdx];
+        const finalPrice = primaryData.closes[lastIdx];
+        const exitPrice = finalPrice * (openTrade.signal === 'buy' ? (1 - slippagePercent / 100) : (1 + slippagePercent / 100));
+        const usdExitValue = Math.abs(openTrade.positionSize) * exitPrice;
+        const exitFee = usdExitValue * (feePercent / 100);
+
+        const rawPnL = openTrade.signal === 'buy'
+            ? (exitPrice - openTrade.entryPrice) * openTrade.positionSize
+            : (openTrade.entryPrice - exitPrice) * openTrade.positionSize;
+        const pnL = rawPnL - exitFee;
+
+        // restore allocation and add PnL
+        capital += openTrade.allocatedCapital;
+        reservedCapital -= openTrade.allocatedCapital;
+        capital += pnL;
+
+        maxCapitalSeen = Math.max(maxCapitalSeen, capital);
+        const drawdown = (maxCapitalSeen - capital) / maxCapitalSeen * 100;
+        maxDrawdown = Math.max(maxDrawdown, drawdown);
+
+        trades.push({
+            entryTime: openTrade.entryTime,
+            exitTime: timestamp,
+            signal: openTrade.signal,
+            entryPrice: openTrade.entryPrice,
+            exitPrice,
+            positionSize: openTrade.positionSize,
+            allocatedCapital: openTrade.allocatedCapital,
+            pnL,
+            pnLPercentOfInitial: (pnL / initialCapital) * 100,
+            reasons: openTrade.reasons.concat(['Forced close at end']),
+            stopLoss: openTrade.stopLoss,
+            takeProfit: openTrade.takeProfit,
+            exitReason: 'EOD close',
         });
 
-        return result;
+        openTrade = null;
     }
 
-    /**
-     * Closes a trade and calculates PNL with fees.
-     */
-    private closeTrade(trade: Trade, exitPrice: number, exitTime: number, feePercent: number): Trade {
-        const rawPnl = (exitPrice - trade.entryPrice) / trade.entryPrice;
-        const feeMultiplier = 1 - (2 * feePercent) / 100; // Entry and exit fees
-        trade.pnlPercent = rawPnl * 100 * (trade.type === 'buy' ? 1 : -1) * feeMultiplier;
-        trade.exitPrice = exitPrice;
-        trade.exitTime = exitTime;
-        trade.status = 'closed';
-        return trade;
-    }
+    // Metrics calculations
+    const totalPnL = ((capital - initialCapital) / initialCapital) * 100;
+    const totalTrades = trades.length;
+    const winningTrades = trades.filter(t => t.pnL > 0).length;
+    const winRate = totalTrades > 0 ? (winningTrades / totalTrades * 100) : 0;
+    const avgTradePnL = totalTrades > 0 ? (trades.reduce((s, t) => s + t.pnLPercentOfInitial, 0) / totalTrades) : 0;
+    const avgHoldTime = totalTrades > 0 ? (trades.reduce((s, t) => s + (t.exitTime - t.entryTime) / 1000 / 60, 0) / totalTrades) : 0;
+
+    // Sharpe: use per-bar returns -> annualize properly
+    const barsPerDay = (24 * 60) / 3; // 480 bars/day for 3-minute bars
+    const barsPerYear = 365 * barsPerDay; // use 365 for crypto
+    const meanBarReturn = perBarReturns.length > 0 ? perBarReturns.reduce((s, r) => s + r, 0) / perBarReturns.length : 0;
+    const stdBarReturn = perBarReturns.length > 1 ? Math.sqrt(perBarReturns.reduce((s, r) => s + Math.pow(r - meanBarReturn, 2), 0) / (perBarReturns.length - 1)) : 0;
+    const riskFreeRateAnnual = 0.02; // 2% annual
+    // annualized Sharpe = (mean_bar * barsPerYear - rf) / (std_bar * sqrt(barsPerYear))
+    const sharpeRatio = stdBarReturn > 0
+        ? ((meanBarReturn * barsPerYear) - riskFreeRateAnnual) / (stdBarReturn * Math.sqrt(barsPerYear))
+        : 0;
+
+    // Profit Factor, Expectancy, Payoff Ratio
+    const grossProfit = trades.filter(t => t.pnL > 0).reduce((s, t) => s + t.pnL, 0);
+    const grossLoss = trades.filter(t => t.pnL < 0).reduce((s, t) => s + t.pnL, 0); // negative
+    const profitFactor = grossLoss < 0 ? (grossProfit / Math.abs(grossLoss)) : (grossProfit > 0 ? Infinity : 0);
+
+    const avgWin = trades.filter(t => t.pnL > 0).length > 0 ? trades.filter(t => t.pnL > 0).reduce((s, t) => s + t.pnL, 0) / trades.filter(t => t.pnL > 0).length : 0;
+    const avgLoss = trades.filter(t => t.pnL < 0).length > 0 ? trades.filter(t => t.pnL < 0).reduce((s, t) => s + t.pnL, 0) / trades.filter(t => t.pnL < 0).length : 0; // negative
+    const payoffRatio = avgLoss !== 0 ? (avgWin / Math.abs(avgLoss)) : (avgWin > 0 ? Infinity : 0);
+
+    const expectancy = totalTrades > 0
+        ? ((winningTrades / totalTrades) * (avgWin / initialCapital * 100) + ((totalTrades - winningTrades) / totalTrades) * (avgLoss / initialCapital * 100))
+        : 0;
+
+    const totalTime = primaryData.timestamps[primaryData.timestamps.length - 1] - primaryData.timestamps[0];
+    const timeInMarketMs = trades.reduce((s, t) => s + (t.exitTime - t.entryTime), 0);
+    const timeInMarketPercent = totalTime > 0 ? (timeInMarketMs / totalTime) * 100 : 0;
+
+    return {
+        initialCapital,
+        finalCapital: capital,
+        totalPnL,
+        totalTrades,
+        winningTrades,
+        winRate,
+        maxDrawdown,
+        avgTradePnL,
+        sharpeRatio,
+        avgHoldTime,
+        trades,
+        signalStats: { buysGenerated, sellsGenerated, holdsGenerated },
+        equityCurve,
+        profitFactor,
+        expectancy,
+        payoffRatio,
+        timeInMarketPercent,
+        grossProfit,
+        grossLoss,
+    };
 }
