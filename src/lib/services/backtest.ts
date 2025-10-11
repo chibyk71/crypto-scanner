@@ -9,7 +9,7 @@
  * - Additional metrics: profit factor, expectancy, payoff ratio, time-in-market
  * - Minor resampling fixes (rounding)
  */
-import { Strategy, StrategyInput, TradeSignal } from '../strategy';
+import { Strategy, StrategyInput } from '../strategy';
 import type { OhlcvData } from '../../types';
 
 export interface BacktestResult {
@@ -274,7 +274,6 @@ export function runBacktest(
 
             // If exit was triggered, close the trade
             if (exitPrice !== undefined) {
-                const usdEntryValue = openTrade.allocatedCapital;
                 const usdExitValue = Math.abs(openTrade.positionSize) * exitPrice;
                 // entry fee was already deducted at entry (we tracked entryFee), apply exit fee now
                 const exitFee = usdExitValue * (feePercent / 100);

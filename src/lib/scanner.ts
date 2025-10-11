@@ -11,7 +11,6 @@ import { Strategy, type TradeSignal } from './strategy';
 import { createLogger } from './logger';
 import { config } from './config/settings';
 import type { OhlcvData } from '../types';
-import { type OHLCV } from 'ccxt';
 import { AlertEvaluatorService } from './services/alertEvaluator';
 import type { Alert } from './db/schema';
 
@@ -248,7 +247,7 @@ export class MarketScanner {
 
         for (const [timeframe, tfAlerts] of Object.entries(groupedAlerts)) {
             for (const alert of tfAlerts) {
-                const { symbol, conditions } = alert;
+                const { symbol } = alert;
                 const now = Date.now();
                 if (alert.lastAlertAt && now - alert.lastAlertAt < (this.opts.cooldownMs!)) {
                     logger.debug(`Alert ${alert.id} for ${symbol} in cooldown`);

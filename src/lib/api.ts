@@ -1,4 +1,3 @@
-// src/lib/api.ts
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { parse } from 'url';
 import { z } from 'zod';
@@ -8,6 +7,7 @@ import { createReadStream } from 'fs';
 import { join } from 'path';
 import { eq } from 'drizzle-orm';
 import { alert as alertTable, type NewAlert } from './db/schema';
+import type { Condition } from '../types';
 
 /**
  * Logger instance for API operations, used to log requests, errors, and server events.
@@ -30,18 +30,18 @@ const API_PORT = Number(process.env.API_PORT) || 3000;
 
 /**
  * Zod schema for validating individual alert conditions.
- * Ensures conditions match the structure in db/schema.ts, with value as number or [number, number].
+ * Aligns with the Condition type in db/schema.ts.
  * @constant
  */
 const ConditionSchema = z.object({
-    type: z.enum(['price', 'volume', 'rsi', 'trend'], {
-        message: 'Condition type must be one of: price, volume, rsi, trend',
+    indicator: z.enum(['price', 'volume', 'rsi', 'trend'], {
+        message: 'Indicator must be one of: price, volume, rsi, trend',
     }),
     operator: z.enum(['>', '<', '>=', '<=', 'in', 'crosses_above', 'crosses_below'], {
         message: 'Operator must be one of: >, <, >=, <=, in, crosses_above, crosses_below',
     }),
-    value: z.union([z.number(), z.tuple([z.number(), z.number()])], {
-        message: 'Value must be a number or an array of exactly two numbers',
+    target: z.union([z.number(), z.tuple([z.number(), z.number()])], {
+        message: 'Target must be a number or an array of exactly two numbers',
     }),
 });
 
@@ -80,7 +80,7 @@ const UpdateSchema = z.object({
  * @returns {Promise<any>} A promise resolving to the parsed JSON body, or an empty object if no body.
  * @throws {Error} If JSON parsing fails, rejected with the parsing error.
  * @example
- * // Example request body: {"symbol":"SOL/USDT","conditions":[{"type":"price","operator":">","value":3.54}]}
+ * // Example request body: {"symbol":"SOL/USDT","conditions":[{"indicator":"price","operator":">","target":3.54}]}
  * const body = await getRequestBody(req);
  */
 async function getRequestBody(req: IncomingMessage): Promise<any> {
@@ -190,11 +190,11 @@ export async function startApiServer() {
                 }
                 /**
                  * Maps parsed data to NewAlert, ensuring conditions match Condition[].
-                 * Conditions are already validated as { type, operator, value: number | [number, number] }[].
+                 * Conditions are already validated as { indicator, operator, target }[].
                  */
                 const alertData: NewAlert = {
                     symbol: parsed.data.symbol,
-                    conditions: parsed.data.conditions,
+                    conditions: parsed.data.conditions as Condition[], // Type assertion since schema matches
                     timeframe: parsed.data.timeframe,
                     status: parsed.data.status,
                     note: parsed.data.note,
@@ -208,7 +208,6 @@ export async function startApiServer() {
             /**
              * Updates an existing alert by ID.
              * Validates the request body against UpdateSchema.
-             * Serializes conditions to JSON for database storage.
              * Retains existing conditions if not provided in the request.
              */
             if (method === 'PUT' && path?.startsWith('/alerts/')) {
@@ -229,10 +228,9 @@ export async function startApiServer() {
                     return;
                 }
                 /**
-                 * Serializes conditions to JSON for database storage.
                  * Uses new conditions if provided; otherwise, retains existing conditions.
                  */
-                const conditionsToUpdate = parsed.data.conditions ? parsed.data.conditions : alert.conditions;
+                const conditionsToUpdate = parsed.data.conditions ? (parsed.data.conditions as Condition[]) : alert.conditions;
                 const updated = await dbService.db
                     .update(alertTable)
                     .set({
@@ -247,7 +245,7 @@ export async function startApiServer() {
                     sendResponse(res, 404, { error: `Alert with ID ${id} not found` });
                     return;
                 }
-                sendResponse(res, 200, { id, ...parsed.data });
+                sendResponse(res, 200, { id, ...parsed.data, conditions: conditionsToUpdate });
                 return;
             }
 
