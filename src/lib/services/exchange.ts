@@ -49,7 +49,11 @@ export class ExchangeService {
             logger.error(`Exchange ${id} is not supported`);
             throw new Error(`Exchange ${id} is not supported`);
         }
-        return new exchangeClass({ enableRateLimit: true, timeout: 60000 }) as Exchange;
+        return new exchangeClass({
+            enableRateLimit: true, timeout: 60000, option: {
+                defaultType: 'future'
+            }
+        }) as Exchange;
     }
 
     /**
@@ -225,69 +229,108 @@ export class ExchangeService {
     }
 
     /**
-  * Fetches a specific limit of historical OHLCV data using pagination (looping).
-  * @param symbol - The symbol (e.g., 'BTC/USDT').
-  * @param timeframe - The timeframe (e.g., '1h').
-  * @param desiredLimit - The total number of historical candles to fetch.
-  * @returns {Promise<OhlcvData>} The array of historical candles.
-  */
+ * Fetches a specific limit of historical OHLCV data using pagination.
+ * @param symbol - The symbol (e.g., 'BTC/USDT').
+ * @param timeframe - The timeframe (e.g., '3m').
+ * @param desiredLimit - The total number of historical candles to fetch.
+ * @returns {Promise<OhlcvData>} The historical OHLCV data.
+ */
     public async fetchHistoricalOHLCV(symbol: string, timeframe: string, desiredLimit: number): Promise<OhlcvData> {
         const allCandles: OHLCV[] = [];
-        let currentSince: number | undefined = undefined; // Start from the latest data (undefined)
+        let currentSince: number | undefined = undefined; // Start from latest data
         let remaining = desiredLimit;
 
         logger.info(`Starting paginated fetch for ${symbol}:${timeframe}. Target: ${desiredLimit} candles.`);
 
         try {
-            while (remaining > 0) {
-                // Determine the limit for the current CCXT call (max 1000 or remaining needed)
+            while (remaining > 0 && allCandles.length < desiredLimit) {
+                // Determine fetch limit (max 1000 or remaining)
                 const fetchLimit = Math.min(remaining, this.MAX_EXCHANGE_LIMIT);
 
-                // Fetch data from the exchange
-                const fetchedData = await this.exchange.fetchOHLCV(
-                    symbol,
-                    timeframe,
-                    currentSince,
-                    fetchLimit
-                );
+                // Fetch data
+                const fetchedData = await this.exchange.fetchOHLCV(symbol, timeframe, currentSince, fetchLimit);
 
                 if (!fetchedData || fetchedData.length === 0) {
-                    logger.warn(`Fetch returned no data. Stopping pagination early. Fetched ${allCandles.length} / ${desiredLimit}.`);
+                    logger.warn(`Fetch returned no data. Stopping pagination. Fetched ${allCandles.length}/${desiredLimit}.`);
                     break;
                 }
 
-                // CCXT returns data from oldest to newest.
-                // 1. Combine the newly fetched (older) data with the previously collected (newer) data.
-                //    We use the spread operator to prepend the new data to the front of the combined array.
-                allCandles.unshift(...fetchedData);
+                // Validate candles
+                for (const candle of fetchedData) {
+                    const [timestamp, open, high, low, close, volume] = candle.map(Number);
+                    if (
+                        isNaN(timestamp) || isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close) || isNaN(volume) ||
+                        open <= 0 || high <= 0 || low <= 0 || close <= 0 || volume < 0 ||
+                        high < low
+                    ) {
+                        logger.warn(`Invalid candle detected: ${JSON.stringify(candle)}`);
+                        continue;
+                    }
+                    allCandles.push(candle);
+                }
 
-                // 2. Update 'since' for the next iteration.
-                //    The next 'since' must be the timestamp of the OLDEST candle fetched (index 0).
-                //    We subtract the timeframe duration (1ms) to ensure we overlap and get the next full bar.
-                const oldestTimestamp = fetchedData[0][0] as number;
+                // Sort to ensure ascending order (oldest first)
+                const sortedData = [...fetchedData].sort((a, b) => (a[0] as number) - (b[0] as number));
+
+                // Log sample candle for debugging
+                if (allCandles.length <= 5) {
+                    logger.debug(`Sample candle: ${JSON.stringify(sortedData[0])}`);
+                }
+
+                // Check timestamp continuity (e.g., 3m = 180,000ms)
                 const timeframeMs = this.timeframeToMs(timeframe);
+                for (let i = 1; i < sortedData.length; i++) {
+                    const diff = (sortedData[i][0] as number) - (sortedData[i - 1][0] as number);
+                    if (diff > timeframeMs * 1.5) {
+                        logger.warn(`Timestamp gap detected: ${diff / 1000}s between candles at ${new Date(sortedData[i - 1][0] as number).toISOString()}`);
+                    }
+                }
+
+                // Update 'currentSince' to oldest timestamp minus timeframe
+                const oldestTimestamp = sortedData[0][0] as number;
                 currentSince = oldestTimestamp - timeframeMs;
 
-                // 3. Update remaining count
+                // Update remaining count
                 remaining = desiredLimit - allCandles.length;
 
                 logger.info(`Fetched ${fetchedData.length} candles. Total collected: ${allCandles.length}. Remaining: ${remaining}.`);
 
-                // Safety break for unexpected behavior (e.g., if exchange keeps returning the same 1000 candles)
+                // Break if exchange returns less than requested and we haven't hit the limit
                 if (fetchedData.length < fetchLimit && allCandles.length < desiredLimit) {
-                    logger.warn(`Exchange returned less than MAX_EXCHANGE_LIMIT (${fetchedData.length}) but total is still below target. Assuming end of historical data.`);
+                    logger.warn(`Exchange returned ${fetchedData.length} candles, less than ${fetchLimit}. Assuming end of data.`);
                     break;
                 }
             }
-        } catch (error) {
-            logger.error(`Error during paginated historical OHLCV fetch for ${symbol}:${timeframe}`, { error });
+        } catch (error: any) {
+            logger.error(`Error during paginated fetch for ${symbol}:${timeframe}`, {
+                error: error.message,
+                code: error.code || 'N/A',
+                stack: error.stack,
+            });
+            throw error; // Rethrow to let index.backtest.ts handle
         }
 
-        // Return only the most recent 'desiredLimit' candles if more were collected (due to starting point uncertainty)
-        const finalCandles = allCandles.slice(allCandles.length - desiredLimit);
+        // Trim to desiredLimit, taking most recent candles
+        const finalCandles = allCandles.slice(-desiredLimit);
         logger.info(`Final collected data length: ${finalCandles.length}.`);
 
-        return this.toOhlcvData(finalCandles);
+        // Convert to OhlcvData
+        const result = this.toOhlcvData(finalCandles);
+
+        // Validate OhlcvData
+        if (
+            result.timestamps.some(t => isNaN(t)) ||
+            result.highs.some(h => isNaN(h) || h <= 0) ||
+            result.lows.some(l => isNaN(l) || l <= 0) ||
+            result.closes.some(c => isNaN(c) || c <= 0) ||
+            result.volumes.some(v => isNaN(v) || v < 0)
+        ) {
+            logger.error('Invalid OhlcvData after conversion');
+            throw new Error('Invalid OhlcvData: Contains NaN or negative values');
+        }
+
+        logger.info(`Successfully fetched ${JSON.stringify(result)} candles for ${symbol}:${timeframe}`);
+        return result;
     }
 
     static toTimeframeMs(timeframe: string): number {
