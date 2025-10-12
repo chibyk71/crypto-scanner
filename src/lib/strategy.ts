@@ -48,14 +48,14 @@ export interface StrategyInput {
 
 
 // Configuration Constants
-const CONFIDENCE_THRESHOLD = 70;
+const CONFIDENCE_THRESHOLD = 85;
 const HTF_TREND_POINTS = 40;
 const MA_TREND_POINTS = 25;
 const MOMENTUM_POINTS = 20; // Reduced weight as we simplify the check
 const VOLUME_POINTS = 15;
 const TREND_STRENGTH_POINTS = 10;
 const BB_POINTS = 15; // Points allocated for Bollinger Bands signals
-const MAX_SCORE_PER_SIDE = HTF_TREND_POINTS + MA_TREND_POINTS + 3 * MOMENTUM_POINTS + VOLUME_POINTS + TREND_STRENGTH_POINTS + BB_POINTS;
+const MAX_SCORE_PER_SIDE = HTF_TREND_POINTS + MA_TREND_POINTS + 3 * MOMENTUM_POINTS + VOLUME_POINTS + TREND_STRENGTH_POINTS + BB_POINTS // equals 140
 
 const FIXED_RISK_PERCENT = 1.0;
 const MAX_ATR_RISK_FACTOR = 1.0;

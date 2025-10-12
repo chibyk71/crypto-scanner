@@ -219,15 +219,15 @@ export class MarketScanner {
         }
 
         const message = [
-            `🚨 **${signal.signal.toUpperCase()} SIGNAL** 🚨`,
-            `**Symbol:** ${symbol}`,
-            `**Confidence:** ${signal.confidence.toFixed(0)}%`,
-            `**Price:** $${currentPrice.toFixed(4)}`,
-            signal.stopLoss ? `**Stop Loss:** $${signal.stopLoss.toFixed(4)}` : '',
-            signal.takeProfit ? `**Take Profit:** $${signal.takeProfit.toFixed(4)} (~${config.strategy.riskRewardTarget}%)` : '',
-            signal.trailingStopDistance ? `**Trailing Stop:** $${signal.trailingStopDistance.toFixed(4)}` : '',
-            '**Reasons:**',
-            ...signal.reason.map(r => `  • ${r}`),
+            `🚨 <b>${signal.signal.toUpperCase()} SIGNAL</b> 🚨`,
+            `<b>Symbol:</b> ${symbol}`,
+            `<b>Confidence:</b> ${signal.confidence.toFixed(0)}%`,
+            `<b>Price:</b> $${currentPrice.toFixed(4)}`,
+            signal.stopLoss ? `<b>Stop Loss:</b> $${signal.stopLoss.toFixed(4)}` : '',
+            signal.takeProfit ? `<b>Take Profit:</b> $${signal.takeProfit.toFixed(4)} (~${config.strategy.riskRewardTarget}%)` : '',
+            signal.trailingStopDistance ? `<b>Trailing Stop:</b> $${signal.trailingStopDistance.toFixed(4)}` : '',
+            '<b>Reasons:</b>',
+            ...signal.reason.map(r => `<li>${r}</li>`),
         ].filter(Boolean).join('\n');
 
         await this.telegramService.sendMessage(message)
