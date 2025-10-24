@@ -7,24 +7,48 @@ import { createLogger } from './logger';
 import * as fs from 'fs/promises';
 import { config } from './config/settings';
 import { TelegramBotController } from './services/telegramBotController';
+import { MLService } from './services/mlService';
 
+/**
+ * Logger instance for worker-related events and errors.
+ */
 const logger = createLogger('worker');
 
+/**
+ * Lock types for preventing concurrent worker executions.
+ */
 type LockType = 'file' | 'database';
+
+/**
+ * Configuration options for the worker.
+ */
 type WorkerOptions = {
-    lockType?: LockType; // 'file' for server, 'database' for GitHub Actions
-    scannerMode?: 'single' | 'periodic'; // Aligns with MarketScanner mode
+    lockType?: LockType; // Locking mechanism ('file' or 'database')
+    scannerMode?: 'single' | 'periodic'; // Scanner execution mode
+    maxRetries?: number; // Maximum retries for initialization
 };
 
+/**
+ * Path to the file-based lock.
+ */
 const LOCK_FILE = './worker.lock';
 
-// ----------------------------------------------------------------
-// Lock Management Helpers
-// ----------------------------------------------------------------
+/**
+ * Maximum retries for service initialization.
+ */
+const MAX_RETRIES = 3;
 
+/**
+ * Delay between retries in milliseconds.
+ */
+const RETRY_DELAY_MS = 2000;
+
+/**
+ * Acquires a file-based lock to prevent concurrent worker executions.
+ * @returns {Promise<boolean>} True if lock acquired, false if another instance holds the lock.
+ */
 async function acquireFileLock(): Promise<boolean> {
     try {
-        // 'wx' flag ensures the file is created ONLY if it doesn't already exist
         await fs.writeFile(LOCK_FILE, process.pid.toString(), { flag: 'wx' });
         logger.info('File lock acquired', { pid: process.pid });
         return true;
@@ -34,6 +58,9 @@ async function acquireFileLock(): Promise<boolean> {
     }
 }
 
+/**
+ * Releases the file-based lock.
+ */
 async function releaseFileLock(): Promise<void> {
     try {
         await fs.unlink(LOCK_FILE);
@@ -43,6 +70,11 @@ async function releaseFileLock(): Promise<void> {
     }
 }
 
+/**
+ * Acquires a database-based lock to prevent concurrent worker executions.
+ * @returns {Promise<boolean>} True if lock acquired, false if already locked.
+ * @throws {Error} If database operation fails.
+ */
 async function acquireDatabaseLock(): Promise<boolean> {
     try {
         const lock = await dbService.getLock();
@@ -59,6 +91,9 @@ async function acquireDatabaseLock(): Promise<boolean> {
     }
 }
 
+/**
+ * Releases the database-based lock.
+ */
 async function releaseDatabaseLock(): Promise<void> {
     try {
         await dbService.setLock(false);
@@ -68,55 +103,75 @@ async function releaseDatabaseLock(): Promise<void> {
     }
 }
 
-// ----------------------------------------------------------------
-// Main Worker Function
-// ----------------------------------------------------------------
-
-export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic' }): Promise<void> {
-    const { lockType = 'file', scannerMode = 'periodic' } = options;
-
-    // 1. Initialize Database
-    try {
-        // Must connect DB first, regardless of lockType, as other services might need it (e.g., Alert storage)
-        await initializeClient();
-        logger.info('MySQL database initialized successfully');
-    } catch (err: any) {
-        logger.error('Failed to initialize MySQL database', { error: err });
-        throw new Error(`Database initialization failed: ${err.message}`);
-    }
-
-    // 2. Acquire Lock
+/**
+ * Initializes the worker and starts the market scanner and Telegram bot.
+ * @param options - Configuration options for lock type, scanner mode, and retries.
+ * @throws {Error} If initialization fails after maximum retries.
+ */
+export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic', maxRetries: MAX_RETRIES }): Promise<void> {
+    const { lockType = 'file', scannerMode = 'periodic', maxRetries = MAX_RETRIES } = options;
     let lockAcquired = false;
-    if (lockType === 'file') {
-        lockAcquired = await acquireFileLock();
-    } else {
-        lockAcquired = await acquireDatabaseLock();
+
+    // Initialize database with retries
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await initializeClient();
+            logger.info('MySQL database initialized successfully');
+            break;
+        } catch (err: any) {
+            logger.error(`Database initialization attempt ${attempt} failed`, { error: err });
+            if (attempt === maxRetries) {
+                throw new Error(`Database initialization failed after ${maxRetries} retries: ${err.message}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        }
     }
 
-    if (!lockAcquired) {
-        logger.error('Cannot start worker: another instance is running');
-        // If DB lock failed, the DB connection is still open and must be closed.
+    // Acquire lock
+    try {
+        lockAcquired = lockType === 'file' ? await acquireFileLock() : await acquireDatabaseLock();
+        if (!lockAcquired) {
+            logger.error('Cannot start worker: another instance is running');
+            if (lockType === 'database') {
+                await closeDb();
+                logger.info('Database connection closed');
+            }
+            process.exit(1);
+        }
+    } catch (err: any) {
+        logger.error('Lock acquisition failed', { error: err });
         if (lockType === 'database') {
             await closeDb();
-            logger.info('Database connection closed');
         }
-        process.exit(1);
+        throw err;
     }
 
-    // 3. Initialize Services and Run
     const exchange = new ExchangeService();
-    const strategy = new Strategy(3);
+    const mlService = new MLService();
+    const strategy = new Strategy(mlService, 3);
     const telegram = new TelegramService();
     let scanner: MarketScanner | null = null;
     let botController: TelegramBotController | null = null;
 
     try {
-        await exchange.initialize();
-        const supportedSymbols = Array.from(exchange.getSupportedSymbols());
-        logger.info('Exchange initialized', { symbols: supportedSymbols.length });
+        // Initialize ExchangeService with retries
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await exchange.initialize();
+                const supportedSymbols = Array.from(exchange.getSupportedSymbols());
+                logger.info('Exchange initialized', { mode: exchange.isLive ? 'live' : 'testnet', symbols: supportedSymbols.length });
+                break;
+            } catch (err: any) {
+                logger.error(`Exchange initialization attempt ${attempt} failed`, { error: err });
+                if (attempt === maxRetries) {
+                    throw new Error(`Exchange initialization failed after ${maxRetries} retries: ${err.message}`);
+                }
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+            }
+        }
 
         // Initialize MarketScanner
-        scanner = new MarketScanner(exchange, telegram, strategy, supportedSymbols, {
+        scanner = new MarketScanner(exchange, telegram, strategy, mlService, Array.from(exchange.getSupportedSymbols()), {
             mode: scannerMode,
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,
@@ -125,20 +180,66 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             retries: 1,
             heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
             requireAtrFeasibility: true,
-            // Use database for cooldown storage if we are using the DB lock, else use memory
             cooldownBackend: lockType === 'database' ? 'database' : 'memory',
         });
 
-        // Initialize TelegramBotController for user interaction
-        botController = new TelegramBotController(exchange);
-        logger.info('TelegramBotController initialized');
+        // Initialize TelegramBotController
+        try {
+            botController = new TelegramBotController(exchange, mlService);
+            logger.info('TelegramBotController initialized');
+        } catch (err: any) {
+            logger.error('Failed to initialize TelegramBotController', { error: err });
+            throw new Error(`TelegramBotController initialization failed: ${err.message}`);
+        }
 
-        /**
-         * Graceful shutdown function, ensuring all resources are properly released.
-         * This logic is critical and correctly stops services, releases locks, and closes the DB.
-         */
+        // Cleanup function for graceful shutdown
         const cleanup = async () => {
             logger.info('Shutting down worker');
+            try {
+                if (scanner) scanner.stop();
+                if (botController) botController.stop();
+                exchange.stopAll();
+
+                if (lockType === 'file') {
+                    await releaseFileLock();
+                } else {
+                    await releaseDatabaseLock();
+                    await closeDb();
+                    logger.info('Database connection closed');
+                }
+                // Log final heartbeat for performance monitoring
+                const cycleCount = await dbService.getHeartbeatCount();
+                logger.info('Worker shutdown complete', { finalCycleCount: cycleCount });
+                process.exit(0);
+            } catch (err: any) {
+                logger.error('Error during cleanup', { error: err });
+                process.exit(1);
+            }
+        };
+
+        // Register shutdown handlers for periodic mode
+        if (scannerMode === 'periodic') {
+            process.on('SIGTERM', cleanup);
+            process.on('SIGINT', cleanup);
+            logger.info('Registered SIGTERM/SIGINT handlers for graceful shutdown');
+        }
+
+        // Start scanner
+        try {
+            await scanner.start();
+            logger.info('MarketScanner started', { mode: scannerMode });
+        } catch (err: any) {
+            logger.error('Failed to start MarketScanner', { error: err });
+            throw new Error(`MarketScanner failed to start: ${err.message}`);
+        }
+
+        // For single mode, perform cleanup after scan
+        if (scannerMode === 'single') {
+            await cleanup();
+        }
+    } catch (err) {
+        logger.error('Worker failed, performing emergency cleanup', { error: err });
+        try {
             if (scanner) scanner.stop();
             if (botController) botController.stop();
             exchange.stopAll();
@@ -147,46 +248,12 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
                 await releaseFileLock();
             } else {
                 await releaseDatabaseLock();
-                // Database is only closed here because we are sure to release the lock first.
                 await closeDb();
                 logger.info('Database connection closed');
             }
-            process.exit(0);
-        };
-
-        // Register signal handlers for periodic server mode
-        if (scannerMode === 'periodic') {
-            process.on('SIGTERM', cleanup);
-            process.on('SIGINT', cleanup);
-            logger.info('Registered SIGTERM/SIGINT handlers for graceful shutdown.');
+        } catch (cleanupErr: any) {
+            logger.error('Emergency cleanup failed', { error: cleanupErr });
         }
-
-        // Start the scanner
-        await scanner.start();
-        logger.info('MarketScanner started');
-
-        // If single mode, wait for completion and cleanup
-        if (scannerMode === 'single') {
-            // MarketScanner's start() returns once the single scan is complete in this mode
-            await cleanup();
-        }
-    } catch (err) {
-        // 4. Error Handling & Cleanup
-        logger.error('Worker failed, performing emergency cleanup', { error: err });
-
-        // Stop all active components
-        if (scanner) scanner.stop();
-        if (botController) botController.stop();
-        exchange.stopAll();
-
-        // Release the lock and close DB before re-throwing the error
-        if (lockType === 'file') {
-            await releaseFileLock();
-        } else {
-            await releaseDatabaseLock();
-            await closeDb();
-            logger.info('Database connection closed');
-        }
-        throw err; // Re-throw the error to terminate the process cleanly and signal failure
+        throw err;
     }
 }
