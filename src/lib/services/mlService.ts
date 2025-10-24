@@ -14,7 +14,6 @@ import {
 } from '../indicators';
 import type { StrategyInput } from '../strategy';
 import { dbService } from '../db';
-import type { NewTrainingSample } from '../db/schema';
 
 /**
  * Logger instance for MLService operations.
