@@ -3,7 +3,7 @@
  * The `node-telegram-bot-api` package is used to send messages, photos, and documents to Telegram chats.
  * @see https://www.npmjs.com/package/node-telegram-bot-api
  */
-import TelegramBot from 'node-telegram-bot-api';
+import TelegramBot, { type SendMessageOptions } from 'node-telegram-bot-api';
 
 /**
  * Imports the application configuration, including Telegram-specific settings (bot token and chat IDs).
@@ -80,9 +80,9 @@ export class TelegramService {
      * await telegram.sendMessage('Price alert: BTC/USDT reached $50,000!');
      * ```
      */
-    async sendMessage(message: string): Promise<void> {
+    async sendMessage(message: string, option?: SendMessageOptions): Promise<void> {
         try {
-            await this.bot.sendMessage(this.chatId, message);
+            await this.bot.sendMessage(this.chatId, message, option);
             logger.info('Telegram message sent', { chatId: this.chatId, message });
         } catch (error) {
             logger.error('Failed to send Telegram message', { chatId: this.chatId, message, error });
