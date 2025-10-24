@@ -164,7 +164,7 @@ export class Strategy {
    */
   public generateSignal(input: StrategyInput): TradeSignal {
     const reasons: string[] = [];
-    const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget, trailingStopPercent } = input;
+    const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
 
     try {
       // Validate input data

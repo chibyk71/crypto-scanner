@@ -2,7 +2,6 @@
 
 import * as ti from 'technicalindicators';
 import type { StochasticOutput } from 'technicalindicators/declarations/momentum/Stochastic';
-import type { MACDOutput } from 'technicalindicators/declarations/moving_averages/MACD';
 import type { BollingerBandsOutput } from 'technicalindicators/declarations/volatility/BollingerBands';
 
 /**

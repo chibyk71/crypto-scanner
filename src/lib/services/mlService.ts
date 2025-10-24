@@ -14,8 +14,7 @@ import {
 } from '../indicators';
 import type { StrategyInput } from '../strategy';
 import { dbService } from '../db';
-import type { TrainingSample as DbTrainingSample, NewTrainingSample } from '../db/schema';
-import { sql, count, sum } from 'drizzle-orm';
+import type { NewTrainingSample } from '../db/schema';
 
 /**
  * Logger instance for MLService operations.
