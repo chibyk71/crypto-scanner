@@ -48,6 +48,7 @@ export class ExchangeService {
             logger.info('ExchangeService initialized in live mode');
         } else {
             this.exchange.options = { ...this.exchange.options, test: true };
+            this.exchange.setSandboxMode(true);
             if (!config.exchange.testnetApiKey || !config.exchange.testnetApiSecret) {
                 logger.error('Testnet mode requires EXCHANGE_TESTNET_API_KEY and EXCHANGE_TESTNET_API_SECRET');
                 throw new Error('Missing testnet API credentials');
@@ -75,7 +76,7 @@ export class ExchangeService {
         return new exchangeClass({
             enableRateLimit: true,
             timeout: 60000,
-            options: { defaultType: 'future' },
+            options: { defaultType: 'futures' },
         }) as Exchange;
     }
 
@@ -195,16 +196,15 @@ export class ExchangeService {
     }
 
     /**
-     * Fetches OHLCV data for a symbol and timeframe.
-     * - Supports pagination for large data requests and validates data integrity.
-     * - Uses cache to reduce API calls for frequently accessed timeframes.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @param timeframe - Timeframe (e.g., '1m', '1h').
-     * @param since - Optional start timestamp (Unix ms).
-     * @param until - Optional end timestamp (Unix ms).
-     * @returns {Promise<OhlcvData>} OHLCV data object.
-     * @throws {Error} If data fetching fails or validation fails.
-     */
+ * Fetches OHLCV data for a symbol and timeframe, limited by MAX_EXCHANGE_LIMIT.
+ * - Uses cache for recent data and validates data integrity.
+ * @param symbol - Trading symbol (e.g., 'BTC/USDT').
+ * @param timeframe - Timeframe (e.g., '1m', '1h').
+ * @param since - Optional start timestamp (Unix ms).
+ * @param until - Optional end timestamp (Unix ms).
+ * @returns {Promise<OhlcvData>} OHLCV data object.
+ * @throws {Error} If data fetching fails or validation fails.
+ */
     public async getOHLCV(symbol: string, timeframe: string, since?: number, until?: number): Promise<OhlcvData> {
         try {
             if (!await this.validateSymbol(symbol)) {
@@ -213,47 +213,36 @@ export class ExchangeService {
             }
 
             const cacheKey = `${symbol}:${timeframe}`;
+            // Only use cache if requesting the "default" data (no specific since/until)
             if (this.ohlcvCache[symbol]?.[timeframe] && !since && !until) {
                 logger.debug(`Returning cached OHLCV for ${cacheKey}`);
                 return this.toOhlcvData(this.ohlcvCache[symbol][timeframe]);
             }
 
             const fetchLimit = this.MAX_EXCHANGE_LIMIT;
-            let allCandlesMap = new Map<number, OHLCV>();
-            let currentSince = since;
+            const params = until ? { until } : {};
 
-            while (true) {
-                const params = until ? { until } : {};
-                const fetchedData = await this.withRetries(
-                    () => this.exchange.fetchOHLCV(symbol, timeframe, currentSince, fetchLimit, params),
-                    3
-                );
+            // --- Core Change: Single Fetch Call ---
+            const finalCandles = await this.withRetries(
+                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, params),
+                3
+            );
+            // --- End Core Change ---
 
-                for (const candle of fetchedData) {
-                    allCandlesMap.set(candle[0] as number, candle);
-                }
-
-                if (fetchedData.length === 0 || (until && fetchedData[fetchedData.length - 1][0]! >= until)) {
-                    break;
-                }
-
-                currentSince = fetchedData[fetchedData.length - 1][0] as number;
-                logger.debug(`Fetched ${fetchedData.length} candles for ${cacheKey}. Total collected: ${allCandlesMap.size}`);
-
-                if (fetchedData.length < fetchLimit) {
-                    logger.warn(`Exchange returned ${fetchedData.length} candles, less than ${fetchLimit}. Assuming end of data.`);
-                    break;
-                }
+            if (finalCandles.length === 0) {
+                logger.warn(`No candles returned for ${cacheKey}`);
+                return this.toOhlcvData([]); // Return empty data structure
             }
 
-            const finalCandles = Array.from(allCandlesMap.values()).sort((a, b) => (a[0] as number) - (b[0] as number));
+            // The data is already sorted by the exchange, but let's re-sort to be safe,
+            // although it's unnecessary if only one request is made.
+            finalCandles.sort((a, b) => (a[0] as number) - (b[0] as number));
 
-            if (finalCandles.length > 0) {
-                logger.info(`Final data range for ${cacheKey}: ${new Date(finalCandles[0][0] as number).toISOString()} to ${new Date(finalCandles[finalCandles.length - 1][0] as number).toISOString()}`);
-            }
+            logger.info(`Fetched ${finalCandles.length} candles for ${cacheKey}. Range: ${new Date(finalCandles[0][0] as number).toISOString()} to ${new Date(finalCandles.at(-1)![0] as number).toISOString()}`);
 
             const result = this.toOhlcvData(finalCandles);
 
+            // --- Data Integrity Validation (Remains the same) ---
             if (
                 result.timestamps.some(t => isNaN(t)) ||
                 result.highs.some(h => isNaN(h) || h <= 0) ||
@@ -266,15 +255,21 @@ export class ExchangeService {
             }
 
             for (let i = 1; i < result.timestamps.length; i++) {
-                if (result.timestamps[i] <= result.timestamps[i - 1]) {
-                    logger.error(`Timestamp order validation failed for ${cacheKey}: ${new Date(result.timestamps[i]).toISOString()} <= ${new Date(result.timestamps[i - 1]).toISOString()}`);
+                if (result.timestamps[i]! <= result.timestamps[i - 1]!) {
+                    logger.error(`Timestamp order validation failed for ${cacheKey}`);
                     throw new Error('Timestamps not in ascending order');
                 }
             }
+            // --- End Data Integrity Validation ---
 
-            if (!this.ohlcvCache[symbol]) this.ohlcvCache[symbol] = {};
-            this.ohlcvCache[symbol][timeframe] = finalCandles;
+            // Cache the result if no specific 'since' or 'until' was provided
+            if (!since && !until) {
+                if (!this.ohlcvCache[symbol]) this.ohlcvCache[symbol] = {};
+                this.ohlcvCache[symbol][timeframe] = finalCandles;
+            }
+
             return result;
+
         } catch (error: any) {
             logger.error(`Error fetching OHLCV for ${symbol}:${timeframe}`, { error: error.message });
             throw error;
