@@ -22,7 +22,7 @@ const ConfigSchema = z.object({
     /** API secret for live trading */
     EXCHANGE_API_SECRET: z.string().optional(),
     /** Enable testnet mode (true for testnet, false for live) */
-    EXCHANGE_TESTNET: z.boolean().default(false),
+    EXCHANGE_TESTNET: z.coerce.boolean().default(false),
     /** API key for testnet trading */
     EXCHANGE_TESTNET_API_KEY: z.string().optional(),
     /** API secret for testnet trading */
@@ -65,8 +65,8 @@ const ConfigSchema = z.object({
     MIN_SAMPLES_TO_TRAIN: z.coerce.number().default(100),
     /** Path to store the Random Forest model */
     MODEL_PATH: z.string().default('./rf_model.json'),
-    /** Risk percentage of account balance per trade (0.1% to 10%) */
-    POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(10).default(1),
+    /** Risk percentage of account balance per trade (0.1% to 50%) */
+    POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(50).default(1),
 });
 
 /**
