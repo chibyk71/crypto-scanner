@@ -34,7 +34,6 @@ import {
     type NewAlert,
     type TrainingSample,
     type NewTrainingSample,
-    type Trade,
     type NewTrade,
 } from './schema';
 
