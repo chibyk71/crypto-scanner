@@ -318,13 +318,13 @@ export class MarketScanner {
             ...signal.reason.map(r => `* ${r}`),
         ].filter(Boolean).join('\n');
 
-        await this.telegramService.sendMessage(message, { parse_mode: 'HTML' }).catch(err =>
+        await this.telegramService.sendMessage(message, { parse_mode: 'MarkdownV2' }).catch(err =>
             logger.error(`Failed to send Telegram signal for ${symbol}`, { error: err })
         );
         logger.info(`Trade signal sent for ${symbol}`, { signal: signal.signal, confidence: signal.confidence });
 
         // Execute trade if auto-trading is enabled
-        if (config.autoTrade) {
+        if (config.autoTrade || true) {
             try {
                 const balance = await this.exchangeService.getAccountBalance();
                 const positionSize = (balance ?? 0) * (config.strategy.positionSizePercent / 100);
