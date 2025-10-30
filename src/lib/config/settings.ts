@@ -1,3 +1,5 @@
+// src/lib/config/settings.ts
+
 import { config as dotenvConfig } from 'dotenv';
 import { z } from 'zod';
 
@@ -15,18 +17,14 @@ const ConfigSchema = z.object({
     LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
     /** MySQL database connection URL (e.g., mysql://user:pass@localhost:3306/dbname) */
     DATABASE_URL: z.string().url(),
+    /** Enable automatic trading */
+    AUTO_TRADE: z.coerce.boolean().default(false),
     /** Exchange name (e.g., 'bybit') */
-    EXCHANGE: z.string().default('bybit'),
+    EXCHANGE: z.string().default('gate'),
     /** API key for live trading */
     EXCHANGE_API_KEY: z.string().optional(),
     /** API secret for live trading */
     EXCHANGE_API_SECRET: z.string().optional(),
-    /** Enable testnet mode (true for testnet, false for live) */
-    EXCHANGE_TESTNET: z.coerce.boolean().default(false),
-    /** API key for testnet trading */
-    EXCHANGE_TESTNET_API_KEY: z.string().optional(),
-    /** API secret for testnet trading */
-    EXCHANGE_TESTNET_API_SECRET: z.string().optional(),
     /** Telegram bot token for notifications */
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     /** Telegram chat ID for sending alerts */
@@ -38,7 +36,7 @@ const ConfigSchema = z.object({
     /** Higher timeframe for analysis (e.g., '1h') */
     HTF_TIMEFRAME: z.string().default('1h'),
     /** Polling interval for market scans (milliseconds) */
-    POLL_INTERVAL: z.coerce.number().default(60000),
+    POLL_INTERVAL: z.coerce.number().default(300000),
     /** Heartbeat interval in scan cycles */
     HEARTBEAT_INTERVAL: z.coerce.number().default(60),
     /** Number of historical candles to fetch */
@@ -48,7 +46,7 @@ const ConfigSchema = z.object({
     /** ATR multiplier for stop-loss calculation */
     ATR_MULTIPLIER: z.coerce.number().default(1.5),
     /** Target risk-reward ratio for trades */
-    RISK_REWARD_TARGET: z.coerce.number().default(2),
+    RISK_REWARD_TARGET: z.coerce.number().default(3),
     /** Trailing stop percentage for risk management */
     TRAILING_STOP_PERCENT: z.coerce.number().default(0.5),
     /** Leverage to apply to trades */
@@ -81,16 +79,13 @@ const validatedConfig = ConfigSchema.parse(process.env);
  * @type {Config}
  */
 export const config = {
-    autoTrade: Boolean(validatedConfig.EXCHANGE_API_KEY && validatedConfig.EXCHANGE_API_SECRET),
+    autoTrade: Boolean(validatedConfig.EXCHANGE_API_KEY && validatedConfig.EXCHANGE_API_SECRET && validatedConfig.AUTO_TRADE),
     env: validatedConfig.ENV,
     log_level: validatedConfig.LOG_LEVEL,
     exchange: {
         name: validatedConfig.EXCHANGE,
         apiKey: validatedConfig.EXCHANGE_API_KEY,
         apiSecret: validatedConfig.EXCHANGE_API_SECRET,
-        testnet: validatedConfig.EXCHANGE_TESTNET,
-        testnetApiKey: validatedConfig.EXCHANGE_TESTNET_API_KEY,
-        testnetApiSecret: validatedConfig.EXCHANGE_TESTNET_API_SECRET,
     },
     telegram: {
         token: validatedConfig.TELEGRAM_BOT_TOKEN,
