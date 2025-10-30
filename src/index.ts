@@ -1,3 +1,5 @@
+// src/index.ts
+
 import { createLogger } from './lib/logger';
 import { startWorker } from './lib/worker';
 
