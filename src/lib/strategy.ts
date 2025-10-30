@@ -1,3 +1,5 @@
+// src/lib/strategy.ts
+
 import type { OhlcvData } from '../types';
 import {
     calculateEMA,
@@ -42,48 +44,48 @@ export interface StrategyInput {
 }
 
 
-    /**
-     * Interface for technical indicator results used in signal generation.
-     */
-    interface Indicators {
-        emaShort: number[];
-        htfEmaMid: number[];
-        vwma: number[];
-        vwap: number[];
-        rsi: number[];
-        macd: Array<{ MACD: number; signal: number; histogram: number }>;
-        stochastic: Array<{ k: number; d: number }>;
-        atr: number[];
-        obv: number[];
-        lastEmaShort: number;
-        lastHtfEmaMid: number;
-        lastVwma20: number;
-        lastVwap: number;
-        rsiNow: number;
-        macdNow: { MACD: number; signal: number; histogram: number } | undefined;
-        stochNow: { k: number; d: number };
-        lastObv: number;
-        lastAtr: number;
-    }
+/**
+ * Interface for technical indicator results used in signal generation.
+ */
+interface Indicators {
+    emaShort: number[];
+    htfEmaMid: number[];
+    vwma: number[];
+    vwap: number[];
+    rsi: number[];
+    macd: Array<{ MACD: number; signal: number; histogram: number }>;
+    stochastic: Array<{ k: number; d: number }>;
+    atr: number[];
+    obv: number[];
+    lastEmaShort: number;
+    lastHtfEmaMid: number;
+    lastVwma20: number;
+    lastVwap: number;
+    rsiNow: number;
+    macdNow: { MACD: number; signal: number; histogram: number } | undefined;
+    stochNow: { k: number; d: number };
+    lastObv: number;
+    lastAtr: number;
+}
 
-    /**
-     * Interface for trend and volume analysis results.
-     */
-    interface TrendAndVolume {
-        hasVolumeSurge: boolean;
-        vwmaFalling: boolean;
-        trendBias: 'bullish' | 'bearish';
-    }
+/**
+ * Interface for trend and volume analysis results.
+ */
+interface TrendAndVolume {
+    hasVolumeSurge: boolean;
+    vwmaFalling: boolean;
+    trendBias: 'bullish' | 'bearish';
+}
 
-    /**
-     * Interface for scores and ML results.
-     */
-    interface ScoresAndML {
-        buyScore: number;
-        sellScore: number;
-        features: number[];
-        mlConfidence: number;
-    }
+/**
+ * Interface for scores and ML results.
+ */
+interface ScoresAndML {
+    buyScore: number;
+    sellScore: number;
+    features: number[];
+    mlConfidence: number;
+}
 
 /**
  * Scoring constants for signal generation.
@@ -462,9 +464,18 @@ export class Strategy {
      * @returns Boolean indicating if the ATR is suitable for risk calculations.
      */
     private _isRiskEligible(price: number, lastAtr: number): boolean {
-        // ATR should be between 1% and 10% of price for reasonable volatility
+        // 1. Safety Check: Ensure ATR is positive before division.
+        if (lastAtr <= 0) {
+            return false;
+        }
+
+        // 2. Calculate the Ratio (Price is how many ATRs).
         const atrRatio = price / lastAtr;
-        return atrRatio >= 10 && atrRatio <= 100;
+
+        // 3. Filter: ATR must be between 1% (ratio >= 100) and 10% (ratio <= 10) of price.
+        // Price / ATR >= 10   -> ATR <= 10% of Price (Upper Volatility Limit)
+        // Price / ATR <= 100  -> ATR >= 1% of Price  (Lower Volatility Limit)
+        return atrRatio >= 10 && atrRatio <= 1000;
     }
 
     /**
