@@ -1,3 +1,5 @@
+// src/lib/services/exchange.ts
+
 import { config } from '../config/settings';
 import ccxt, { type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
 import { createLogger } from '../logger';
@@ -9,6 +11,11 @@ import type { OhlcvData } from '../../types';
  */
 const logger = createLogger('ExchangeService');
 
+interface CacheEntry {
+    data: OHLCV[];
+    timestamp: number;
+}
+
 /**
  * Manages interactions with the exchange (e.g., Bybit) using the CCXT library.
  * - Handles testnet/live mode switching, order placement, position management, and data fetching.
@@ -18,11 +25,11 @@ const logger = createLogger('ExchangeService');
 export class ExchangeService {
     private exchange: Exchange;
     private primaryOhlcvData: { [symbol: string]: OHLCV[] } = {};
-    private ohlcvCache: { [symbol: string]: { [timeframe: string]: OHLCV[] } } = {};
+    private ohlcvCache: { [symbol: string]: { [timeframe: string]: CacheEntry } } = {};
     private pollingIntervals: { [symbol: string]: NodeJS.Timeout } = {};
     private supportedSymbols: string[] = [];
     private readonly MAX_EXCHANGE_LIMIT = 1000;
-    public isLive: boolean;
+    private readonly CACHE_TTL_MS = 5 * 60 * 1000;
 
     /**
      * Initializes the exchange service.
@@ -34,28 +41,15 @@ export class ExchangeService {
      */
     constructor(name?: string) {
         const exchange = name ?? config.exchange.name;
-        this.isLive = !config.exchange.testnet;
-        logger.info('Initializing ExchangeService...', { exchange, liveMode: this.isLive });
+        logger.info('Initializing ExchangeService...', { exchange, liveMode: config.autoTrade });
 
         this.exchange = this.createExchange(exchange);
-        if (this.isLive) {
-            if (!config.exchange.apiKey || !config.exchange.apiSecret) {
-                logger.error('Live mode requires EXCHANGE_API_KEY and EXCHANGE_API_SECRET');
-                throw new Error('Missing live API credentials');
-            }
+
+        if (config.exchange.apiKey && config.exchange.apiSecret) {
             this.exchange.apiKey = config.exchange.apiKey;
             this.exchange.secret = config.exchange.apiSecret;
-            logger.info('ExchangeService initialized in live mode');
-        } else {
-            this.exchange.options = { ...this.exchange.options, test: true };
-            this.exchange.setSandboxMode(true);
-            if (!config.exchange.testnetApiKey || !config.exchange.testnetApiSecret) {
-                logger.error('Testnet mode requires EXCHANGE_TESTNET_API_KEY and EXCHANGE_TESTNET_API_SECRET');
-                throw new Error('Missing testnet API credentials');
-            }
-            this.exchange.apiKey = config.exchange.testnetApiKey;
-            this.exchange.secret = config.exchange.testnetApiSecret;
-            logger.info('ExchangeService initialized in testnet mode');
+
+            logger.info(`ExchangeService configured in ${config.autoTrade ? 'live' : 'testnet'} mode`, { exchange });
         }
     }
 
@@ -78,6 +72,10 @@ export class ExchangeService {
             timeout: 60000,
             options: { defaultType: 'futures' },
         }) as Exchange;
+    }
+
+    public isAutoTradeEnvSet(): boolean {
+        return config.autoTrade;
     }
 
     /**
@@ -111,47 +109,14 @@ export class ExchangeService {
      * @param symbol - Trading symbol (e.g., 'BTC/USDT').
      * @private
      */
-    private startPolling(symbol: string): void {
-        const maxRetries = 3;
-        let retryCount = 0;
+    private startPolling(): void {
+        const symbols = config.symbols;
         const timeframe = config.scanner.primaryTimeframe;
 
-        if (!this.supportedSymbols.includes(symbol)) {
-            logger.warn(`Symbol ${symbol} not supported, skipping polling`);
-            return;
-        }
-
-        if (this.pollingIntervals[symbol]) {
-            logger.debug(`Polling already active for ${symbol}`);
-            return;
-        }
-
-        const interval = setInterval(async () => {
-            try {
-                const newData = await this.withRetries(
-                    () => this.exchange.fetchOHLCV(symbol, timeframe, undefined, config.historyLength),
-                    3
-                );
-                this.primaryOhlcvData[symbol] = newData;
-                logger.info(`[${symbol}:${timeframe}] Updated OHLCV`, {
-                    latestClose: newData[newData.length - 1]?.[4] ?? 'N/A',
-                    candleCount: newData.length,
-                });
-                retryCount = 0;
-            } catch (error) {
-                retryCount++;
-                logger.error(`[${symbol}:${timeframe}] Error fetching OHLCV (attempt ${retryCount}/${maxRetries})`, {
-                    error: (error as Error).message,
-                });
-                if (retryCount >= maxRetries) {
-                    logger.error(`[${symbol}:${timeframe}] Max retries reached, stopping polling`);
-                    this.stopPolling(symbol);
-                }
-            }
-        }, config.scanner.scanIntervalMs);
-
-        this.pollingIntervals[symbol] = interval;
-        logger.info(`Started polling for ${symbol} on ${timeframe}`);
+        symbols.forEach(symbol => {
+            logger.info(`Started polling for ${symbol} on ${timeframe}`);
+            this.pollSymbol(symbol, timeframe);
+        });
     }
 
     /**
@@ -182,9 +147,9 @@ export class ExchangeService {
      * @throws {Error} If initialization fails (e.g., market loading error).
      */
     public async initialize(): Promise<void> {
-        await this.loadSupportedSymbols();
-        config.symbols.forEach(symbol => this.startPolling(symbol));
-        logger.info('ExchangeService fully initialized', { symbolCount: this.supportedSymbols.length });
+        logger.info('Initializing ExchangeService...', { exchange: 'gate', liveMode: config.autoTrade });
+        await this.loadMarkets();
+        this.startPolling();
     }
 
     /**
@@ -196,85 +161,170 @@ export class ExchangeService {
     }
 
     /**
- * Fetches OHLCV data for a symbol and timeframe, limited by MAX_EXCHANGE_LIMIT.
- * - Uses cache for recent data and validates data integrity.
- * @param symbol - Trading symbol (e.g., 'BTC/USDT').
- * @param timeframe - Timeframe (e.g., '1m', '1h').
- * @param since - Optional start timestamp (Unix ms).
- * @param until - Optional end timestamp (Unix ms).
- * @returns {Promise<OhlcvData>} OHLCV data object.
- * @throws {Error} If data fetching fails or validation fails.
+ * Fetches OHLCV (Open-High-Low-Close-Volume) data for a given symbol and timeframe.
+ * Prioritizes live polling data, then cache, and falls back to a fresh exchange fetch.
+ *
+ * @param symbol The trading pair (e.g., 'BTC/USDT').
+ * @param timeframe The candlestick interval (e.g., '1h', '1d').
+ * @param since Optional: Fetch candles from this Unix timestamp (ms). Disables simple caching.
+ * @param until Optional: Fetch candles up to this Unix timestamp (ms). Disables simple caching.
+ * @param forceRefresh Optional: If true, bypasses cache and live data checks.
+ * @returns A Promise that resolves to the processed OhlcvData object.
+ * @throws An error if the symbol is invalid, the data fetch fails, or data integrity checks fail.
  */
-    public async getOHLCV(symbol: string, timeframe: string, since?: number, until?: number): Promise<OhlcvData> {
+    public async getOHLCV(
+        symbol: string,
+        timeframe: string,
+        since?: number,
+        until?: number,
+        forceRefresh = false
+    ): Promise<OhlcvData> {
+        const cacheKey = `${symbol}:${timeframe}`;
+        const isHistoricalQuery = since || until; // Flag for queries that look for a specific range
+
         try {
-            if (!await this.validateSymbol(symbol)) {
+            // --- 1. Validate Symbol ---
+            if (!(await this.validateSymbol(symbol))) {
                 logger.error(`Invalid symbol: ${symbol}`);
                 throw new Error(`Symbol ${symbol} is not supported`);
             }
 
-            const cacheKey = `${symbol}:${timeframe}`;
-            // Only use cache if requesting the "default" data (no specific since/until)
-            if (this.ohlcvCache[symbol]?.[timeframe] && !since && !until) {
-                logger.debug(`Returning cached OHLCV for ${cacheKey}`);
-                return this.toOhlcvData(this.ohlcvCache[symbol][timeframe]);
+            const now = Date.now();
+
+            // --- 2. Live Data Check (Only for non-historical, non-forced-refresh queries) ---
+            if (!forceRefresh && !isHistoricalQuery && this.primaryOhlcvData[symbol]) {
+                const liveData = this.primaryOhlcvData[symbol];
+                // Check if the live-polled data meets the minimum history length
+                if (liveData.length >= config.historyLength) {
+                    logger.debug(`Using live polling data for ${cacheKey}`);
+                    return this.toOhlcvData(liveData);
+                }
             }
 
+            // --- 3. Cache Check (Only for non-historical, non-forced-refresh queries) ---
+            const cache = this.ohlcvCache[symbol]?.[timeframe];
+            const isCacheValid = cache && now - cache.timestamp < this.CACHE_TTL_MS;
+
+            if (!forceRefresh && !isHistoricalQuery && isCacheValid) {
+                logger.debug(`Returning valid cached OHLCV for ${cacheKey}`);
+                return this.toOhlcvData(cache.data);
+            }
+
+            // --- 4. Force Refresh: Clear Cache if requested ---
+            if (forceRefresh && cache) {
+                logger.debug(`Force refreshing and clearing OHLCV cache for ${cacheKey}`);
+                delete this.ohlcvCache[symbol][timeframe];
+            }
+
+            // --- 5. Fetch Data from Exchange ---
             const fetchLimit = this.MAX_EXCHANGE_LIMIT;
+            // The 'until' parameter is non-standard but supported by some CCXT-like exchanges;
+            // we pass it in 'params' if it exists.
             const params = until ? { until } : {};
 
-            // --- Core Change: Single Fetch Call ---
-            const finalCandles = await this.withRetries(
+            // Use withRetries wrapper for robustness against temporary network/exchange issues
+            const rawCandles = await this.withRetries(
                 () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, params),
-                3
+                3 // Retry up to 3 times
             );
-            // --- End Core Change ---
 
-            if (finalCandles.length === 0) {
-                logger.warn(`No candles returned for ${cacheKey}`);
-                return this.toOhlcvData([]); // Return empty data structure
+            // --- 6. Handle Empty Result ---
+            if (rawCandles.length === 0) {
+                logger.warn(`No candles returned for ${cacheKey} (since: ${since}, until: ${until})`);
+                return this.toOhlcvData([]);
             }
 
-            // The data is already sorted by the exchange, but let's re-sort to be safe,
-            // although it's unnecessary if only one request is made.
-            finalCandles.sort((a, b) => (a[0] as number) - (b[0] as number));
+            // Ensure data is sorted by timestamp (ascending) as required for processing
+            rawCandles.sort((a, b) => (a[0] as number) - (b[0] as number));
 
-            logger.info(`Fetched ${finalCandles.length} candles for ${cacheKey}. Range: ${new Date(finalCandles[0][0] as number).toISOString()} to ${new Date(finalCandles.at(-1)![0] as number).toISOString()}`);
+            logger.info(`Fetched ${rawCandles.length} candles for ${cacheKey}. ` +
+                `Range: ${new Date(rawCandles[0][0] as number).toISOString()} to ${new Date(rawCandles.at(-1)![0] as number).toISOString()}`);
 
-            const result = this.toOhlcvData(finalCandles);
+            const result = this.toOhlcvData(rawCandles);
 
-            // --- Data Integrity Validation (Remains the same) ---
-            if (
+            // --- 7. Data Integrity Validation ---
+            // Check for NaN, non-positive High/Low/Close, or negative Volume
+            const isDataInvalid =
                 result.timestamps.some(t => isNaN(t)) ||
                 result.highs.some(h => isNaN(h) || h <= 0) ||
                 result.lows.some(l => isNaN(l) || l <= 0) ||
                 result.closes.some(c => isNaN(c) || c <= 0) ||
-                result.volumes.some(v => isNaN(v) || v < 0)
-            ) {
-                logger.error(`Invalid OhlcvData for ${cacheKey}: Contains NaN or negative values`);
-                throw new Error('Invalid OhlcvData: Contains NaN or negative values');
+                result.volumes.some(v => isNaN(v) || v < 0);
+
+            if (isDataInvalid) {
+                logger.error(`Invalid OhlcvData for ${cacheKey}: Contains NaN, non-positive prices, or negative volume`);
+                throw new Error('Invalid OhlcvData: Contains NaN or problematic values');
             }
 
+            // Check for strictly ascending timestamp order
             for (let i = 1; i < result.timestamps.length; i++) {
                 if (result.timestamps[i]! <= result.timestamps[i - 1]!) {
-                    logger.error(`Timestamp order validation failed for ${cacheKey}`);
-                    throw new Error('Timestamps not in ascending order');
+                    logger.error(`Timestamp order validation failed for ${cacheKey}: Detected non-ascending timestamp at index ${i}`);
+                    throw new Error('Timestamps not in strictly ascending order');
                 }
             }
-            // --- End Data Integrity Validation ---
 
-            // Cache the result if no specific 'since' or 'until' was provided
-            if (!since && !until) {
+            // --- 8. Update Cache (Only for default, non-historical, non-forced-refresh queries) ---
+            if (!isHistoricalQuery && !forceRefresh) {
                 if (!this.ohlcvCache[symbol]) this.ohlcvCache[symbol] = {};
-                this.ohlcvCache[symbol][timeframe] = finalCandles;
+                this.ohlcvCache[symbol][timeframe] = {
+                    data: rawCandles,
+                    timestamp: now
+                };
+                logger.debug(`Cached new OHLCV data for ${cacheKey}`);
             }
 
             return result;
 
         } catch (error: any) {
-            logger.error(`Error fetching OHLCV for ${symbol}:${timeframe}`, { error: error.message });
+            // --- 9. Error Handling ---
+            logger.error(`Error fetching OHLCV for ${cacheKey}`, { error: error.message, stack: error.stack });
+            // Re-throw the error to be handled by the caller
             throw error;
         }
     }
+
+    private async loadMarkets(): Promise<void> {
+        try {
+            const markets = await this.exchange.loadMarkets();
+            this.supportedSymbols = Object.keys(markets).filter(m =>
+                config.symbols.includes(m) && m.endsWith('/USDT')
+            );
+            logger.info(`Successfully loaded ${this.supportedSymbols.length} whitelisted markets`, { symbols: this.supportedSymbols });
+        } catch (error) {
+            logger.error('Failed to load markets', { error });
+            throw error;
+        }
+    }
+
+    public getPrimaryOhlcvData(symbol: string): OHLCV[] | undefined {
+        return this.primaryOhlcvData[symbol];
+    }
+
+    private async pollSymbol(symbol: string, timeframe: string): Promise<void> {
+        const ms = ExchangeService.toTimeframeMs(timeframe);
+        const historyLength = config.historyLength; // ← Use config
+        const poll = async () => {
+            try {
+                const candles = await this.exchange.fetchOHLCV(symbol, timeframe, undefined, historyLength);
+
+                if (candles.length > 0) {
+                    this.primaryOhlcvData[symbol] = candles;
+                    const latest = candles.at(-1)!;
+                    logger.info(`[${symbol}:${timeframe}] Updated OHLCV`, {
+                        latestClose: latest[4],
+                        candleCount: candles.length,
+                    });
+                }
+            } catch (error) {
+                logger.error(`Polling failed for ${symbol}`, { error });
+            }
+        };
+
+        await poll();
+        setInterval(poll, ms);
+    }
+
 
     /**
      * Places a market order with optional stop-loss and take-profit.
@@ -289,6 +339,10 @@ export class ExchangeService {
      * @throws {Error} If order placement fails.
      */
     public async placeOrder(symbol: string, side: 'buy' | 'sell', amount: number, stopLoss?: number, takeProfit?: number, trailingStopDistance?: number): Promise<Order> {
+        if (!this.isAutoTradeEnvSet()) {
+            Promise.reject(new Error('Auto-trade environment is not set. Cannot place orders.'));
+        }
+
         try {
             if (!await this.validateSymbol(symbol)) {
                 logger.error(`Invalid symbol for order: ${symbol}`);
@@ -304,7 +358,7 @@ export class ExchangeService {
                 () => this.exchange.createMarketOrder(symbol, side, amount, undefined, params),
                 3
             );
-            logger.info(`Placed ${side} order for ${amount} ${symbol} in ${this.isLive ? 'live' : 'testnet'} mode`, {
+            logger.info(`Placed ${side} order for ${amount} ${symbol} in live mode`, {
                 stopLoss,
                 takeProfit,
                 trailingStopDistance,
@@ -371,6 +425,10 @@ export class ExchangeService {
  * @throws {Error} If fetching positions fails after retries or if the symbol is invalid.
  */
     public async getPositions(symbol: string): Promise<Position[]> {
+        if (!this.isAutoTradeEnvSet()) {
+            return Promise.reject(new Error('Auto-trade environment is not set. Cannot fetch positions.'));
+        }
+
         try {
             // Validate symbol before fetching positions
             if (!await this.validateSymbol(symbol)) {
@@ -389,8 +447,7 @@ export class ExchangeService {
             });
 
             logger.debug(`Fetched ${activePositions.length} open positions for ${symbol}`, {
-                positionCount: activePositions.length,
-                mode: this.isLive ? 'live' : 'testnet',
+                positionCount: activePositions.length
             });
 
             return activePositions;
@@ -425,10 +482,13 @@ export class ExchangeService {
      * @throws {Error} If balance fetching fails.
      */
     public async getAccountBalance(): Promise<Num> {
+        if (!this.isAutoTradeEnvSet()) {
+            return Promise.reject(new Error('Auto-trade environment is not set. Cannot fetch account balance.'));
+        }
         try {
             const balance = await this.withRetries(() => this.exchange.fetchBalance(), 3);
             const total = balance?.total.total || 0;
-            logger.info(`Fetched account balance: ${total} USDT in ${this.isLive ? 'live' : 'testnet'} mode`);
+            logger.info(`Fetched account balance: ${total} USDT`);
             return total;
         } catch (error) {
             logger.error('Failed to fetch account balance', { error });
@@ -443,22 +503,14 @@ export class ExchangeService {
      * @returns {OhlcvData} Formatted OHLCV data object.
      */
     public toOhlcvData(candles: OHLCV[]): OhlcvData {
-        const timestamps = candles.map(c => Number(c[0])).filter(v => !isNaN(v));
-        const opens = candles.map(c => Number(c[1])).filter(v => !isNaN(v));
-        const highs = candles.map(c => Number(c[2])).filter(v => !isNaN(v));
-        const lows = candles.map(c => Number(c[3])).filter(v => !isNaN(v));
-        const closes = candles.map(c => Number(c[4])).filter(v => !isNaN(v));
-        const volumes = candles.map(c => Number(c[5])).filter(v => !isNaN(v));
-        const length = Math.min(timestamps.length, opens.length, highs.length, lows.length, closes.length, volumes.length);
-
         return {
-            timestamps: timestamps.slice(-length),
-            opens: opens.slice(-length),
-            highs: highs.slice(-length),
-            lows: lows.slice(-length),
-            closes: closes.slice(-length),
-            volumes: volumes.slice(-length),
-            length,
+            timestamps: candles.map(c => c[0] as number),
+            opens: candles.map(c => c[1] as number),
+            highs: candles.map(c => c[2] as number),
+            lows: candles.map(c => c[3] as number),
+            closes: candles.map(c => c[4] as number),
+            volumes: candles.map(c => c[5] as number),
+            length: candles.length,
         };
     }
 
@@ -471,20 +523,16 @@ export class ExchangeService {
      * @throws {Error} If all retries fail.
      * @private
      */
-    private async withRetries<T>(fn: () => Promise<T>, retries: number = 3): Promise<T> {
-        let lastError: unknown;
-        for (let i = 0; i <= retries; i++) {
+    private async withRetries<T>(fn: () => Promise<T>, retries: number): Promise<T> {
+        for (let i = 0; i < retries; i++) {
             try {
                 return await fn();
             } catch (error) {
-                lastError = error;
-                const delay = 300 * Math.pow(2, i);
-                logger.warn(`Attempt ${i + 1} failed, retrying in ${delay}ms`, { error: (error as Error).message });
-                await new Promise(resolve => setTimeout(resolve, delay));
+                if (i === retries - 1) throw error;
+                await new Promise(r => setTimeout(r, 1000 * (i + 1)));
             }
         }
-        logger.error(`Failed after ${retries + 1} attempts`, { error: (lastError as Error).message });
-        throw lastError;
+        throw new Error('Unreachable');
     }
 
     /**
@@ -495,18 +543,13 @@ export class ExchangeService {
      * @throws {Error} If the timeframe unit is unsupported.
      */
     public static toTimeframeMs(timeframe: string): number {
-        const unit = timeframe.slice(-1);
-        const value = parseInt(timeframe.slice(0, -1), 10);
-        switch (unit) {
-            case 'm': return value * 60 * 1000;
-            case 'h': return value * 60 * 60 * 1000;
-            case 'd': return value * 24 * 60 * 60 * 1000;
-            case 'w': return value * 7 * 24 * 60 * 60 * 1000;
-            case 'M': return value * 30 * 24 * 60 * 60 * 1000;
-            default:
-                logger.error(`Unsupported timeframe unit: ${unit}`);
-                throw new Error(`Unsupported timeframe unit: ${unit}`);
-        }
+        const match = timeframe.match(/^(\d+)([mhd])$/);
+        if (!match) return 60000;
+        const [, value, unit] = match;
+        const v = parseInt(value);
+        return unit === 'm' ? v * 60 * 1000 :
+            unit === 'h' ? v * 60 * 60 * 1000 :
+                v * 24 * 60 * 60 * 1000;
     }
 
     /**
@@ -559,44 +602,5 @@ export class ExchangeService {
         const initialized = Object.keys(this.primaryOhlcvData).length > 0;
         logger.debug(`ExchangeService initialized: ${initialized}`);
         return initialized;
-    }
-
-    /**
-     * Switches between testnet and live mode.
-     * - Updates API credentials and exchange options dynamically.
-     * @param liveMode - True for live mode, false for testnet.
-     * @throws {Error} If required API credentials are missing for the selected mode.
-     */
-    public async switchMode(liveMode: boolean): Promise<void> {
-        if (liveMode === this.isLive) {
-            logger.info(`Already in ${liveMode ? 'live' : 'testnet'} mode, no changes needed`);
-            return;
-        }
-
-        this.isLive = liveMode;
-        this.stopAll(); // Stop existing polling
-        this.clearCache(); // Clear cached data
-
-        if (liveMode) {
-            if (!config.exchange.apiKey || !config.exchange.apiSecret) {
-                logger.error('Cannot switch to live mode: Missing EXCHANGE_API_KEY or EXCHANGE_API_SECRET');
-                throw new Error('Missing live API credentials');
-            }
-            this.exchange.apiKey = config.exchange.apiKey;
-            this.exchange.secret = config.exchange.apiSecret;
-            this.exchange.options = { ...this.exchange.options, test: false };
-            logger.info('Switched to live mode');
-        } else {
-            if (!config.exchange.testnetApiKey || !config.exchange.testnetApiSecret) {
-                logger.error('Cannot switch to testnet mode: Missing EXCHANGE_TESTNET_API_KEY or EXCHANGE_TESTNET_API_SECRET');
-                throw new Error('Missing testnet API credentials');
-            }
-            this.exchange.apiKey = config.exchange.testnetApiKey;
-            this.exchange.secret = config.exchange.testnetApiSecret;
-            this.exchange.options = { ...this.exchange.options, test: true };
-            logger.info('Switched to testnet mode');
-        }
-
-        await this.initialize(); // Re-initialize with new mode
     }
 }
