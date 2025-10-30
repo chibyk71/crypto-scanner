@@ -30,6 +30,23 @@ CREATE TABLE `session` (
 	CONSTRAINT `session_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
+CREATE TABLE `simulated_trades` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`signal_id` varchar(36) NOT NULL,
+	`symbol` varchar(50) NOT NULL,
+	`side` varchar(10) NOT NULL,
+	`entry_price` bigint NOT NULL,
+	`stop_loss` bigint,
+	`take_profit` bigint,
+	`trailing_dist` bigint,
+	`opened_at` bigint NOT NULL,
+	`closed_at` bigint,
+	`pnl` bigint,
+	`outcome` varchar(10),
+	CONSTRAINT `simulated_trades_id` PRIMARY KEY(`id`),
+	CONSTRAINT `simulated_trades_signal_id_unique` UNIQUE(`signal_id`)
+);
+--> statement-breakpoint
 CREATE TABLE `trades` (
 	`id` int AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(50) NOT NULL,
@@ -61,6 +78,9 @@ CREATE TABLE `user` (
 );
 --> statement-breakpoint
 ALTER TABLE `session` ADD CONSTRAINT `session_user_id_user_id_fk` FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX `idx_signal_id` ON `simulated_trades` (`signal_id`);--> statement-breakpoint
+CREATE INDEX `idx_sim_symbol` ON `simulated_trades` (`symbol`);--> statement-breakpoint
+CREATE INDEX `idx_sim_opened` ON `simulated_trades` (`opened_at`);--> statement-breakpoint
 CREATE INDEX `idx_symbol` ON `trades` (`symbol`);--> statement-breakpoint
 CREATE INDEX `idx_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
 CREATE INDEX `idx_symbol` ON `training_samples` (`symbol`);

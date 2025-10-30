@@ -10,7 +10,6 @@
     "keywords": [],
     "scripts": {
         "dev": "ts-node-dev --respawn --transpile-only -r dotenv src/index.ts",
-        "backtest": "ts-node-dev --respawn --transpile-only -r dotenv src/index.backtest.ts",
         "start": "node -r dotenv build/main/index.js",
         "build": "run-p build:*",
         "build:main": "tsc -p tsconfig.json",
@@ -50,6 +49,7 @@
         "node": ">=10"
     },
     "dependencies": {
+        "axios": "^1.12.2",
         "ccxt": "^4.5.1",
         "dotenv": "^17.2.1",
         "drizzle-orm": "^0.44.5",
