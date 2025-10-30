@@ -1,7 +1,8 @@
+// src/lib/worker.ts
+
 import { ExchangeService } from './services/exchange';
 import { Strategy } from './strategy';
 import { MarketScanner } from './scanner';
-import { TelegramService } from './services/telegram';
 import { dbService, initializeClient, closeDb } from './db';
 import { createLogger } from './logger';
 import * as fs from 'fs/promises';
@@ -149,17 +150,17 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
     const exchange = new ExchangeService();
     const mlService = new MLService();
     const strategy = new Strategy(mlService, 3);
-    const telegram = new TelegramService();
+    let telegram: TelegramBotController | null = null;
     let scanner: MarketScanner | null = null;
-    let botController: TelegramBotController | null = null;
+    let supportedSymbols: string[] = [];
 
     try {
         // Initialize ExchangeService with retries
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 await exchange.initialize();
-                const supportedSymbols = Array.from(exchange.getSupportedSymbols());
-                logger.info('Exchange initialized', { mode: exchange.isLive ? 'live' : 'testnet', symbols: supportedSymbols.length });
+                supportedSymbols = exchange.getSupportedSymbols();
+                logger.info('Exchange initialized', { mode: exchange.isAutoTradeEnvSet() ? 'live' : 'testnet', symbols: supportedSymbols.length });
                 break;
             } catch (err: any) {
                 logger.error(`Exchange initialization attempt ${attempt} failed`, { error: err });
@@ -170,8 +171,19 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             }
         }
 
+        // Initialize TelegramBotController
+        try {
+            if (config.env == "prod") {
+                telegram = new TelegramBotController(exchange, mlService);
+                logger.info('TelegramBotController initialized');
+            }
+        } catch (err: any) {
+            logger.error('Failed to initialize TelegramBotController', { error: err });
+            throw new Error(`TelegramBotController initialization failed: ${err.message}`);
+        }
+
         // Initialize MarketScanner
-        scanner = new MarketScanner(exchange, telegram, strategy, mlService, Array.from(exchange.getSupportedSymbols()), {
+        scanner = new MarketScanner(exchange, telegram, strategy, mlService, supportedSymbols, {
             mode: scannerMode,
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,
@@ -183,21 +195,12 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             cooldownBackend: lockType === 'database' ? 'database' : 'memory',
         });
 
-        // Initialize TelegramBotController
-        try {
-            botController = new TelegramBotController(exchange, mlService);
-            logger.info('TelegramBotController initialized');
-        } catch (err: any) {
-            logger.error('Failed to initialize TelegramBotController', { error: err });
-            throw new Error(`TelegramBotController initialization failed: ${err.message}`);
-        }
-
         // Cleanup function for graceful shutdown
         const cleanup = async () => {
             logger.info('Shutting down worker');
             try {
                 if (scanner) scanner.stop();
-                if (botController) botController.stop();
+                if (telegram) telegram.stop();
                 exchange.stopAll();
 
                 if (lockType === 'file') {
@@ -241,7 +244,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         logger.error('Worker failed, performing emergency cleanup', { error: err });
         try {
             if (scanner) scanner.stop();
-            if (botController) botController.stop();
+            if (telegram) telegram.stop();
             exchange.stopAll();
 
             if (lockType === 'file') {
