@@ -1,3 +1,5 @@
+// src/lib/services/telegramBotController.ts
+
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config/settings';
 import { dbService } from '../db';
@@ -111,7 +113,6 @@ export class TelegramBotController {
         this.bot.onText(/\/create_alert/, this.handleCreateAlertStart);
         this.bot.onText(/\/edit_alert/, this.handleEditAlertStart);
         this.bot.onText(/\/delete_alert/, this.handleDeleteAlertStart);
-        this.bot.onText(/\/mode/, this.handleModeSwitch);
         this.bot.onText(/\/ml_status/, this.handleMLStatus);
         this.bot.onText(/\/ml_pause/, this.handleMLPause);
         this.bot.onText(/\/ml_resume/, this.handleMLResume);
@@ -757,7 +758,6 @@ export class TelegramBotController {
                 `\n*Operational Status*: ${lockStatus ? '🔴 RUNNING (LOCKED)' : '🟢 IDLE (UNLOCKED)'}`,
                 `\n*Last Heartbeat*: ${heartbeat ? new Date(heartbeat).toLocaleString() : 'N/A'}`,
                 `\n*Exchange Connection*: ${this.exchange.isInitialized() ? '✅ Connected' : '❌ Disconnected'}`,
-                `\n*Trading Mode*: ${!config.exchange.testnet ? 'Live' : 'Testnet'}`,
                 `\n*Account Balance*: ${balance?.toFixed(2)} USDT`,
             ];
 
@@ -833,27 +833,6 @@ export class TelegramBotController {
         if (!this.isAuthorized(msg.chat.id)) return;
         this.updateUserState(msg.chat.id, { mode: 'delete', step: 'delete_alert', page: 0 });
         await this.sendDeleteAlertSelection(msg.chat.id, 0);
-    }
-
-    /**
-     * Handles the /mode command.
-     * - Toggles between testnet and live trading modes.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
-    private handleModeSwitch = async (msg: TelegramBot.Message): Promise<void> => {
-        if (!this.isAuthorized(msg.chat.id)) return;
-
-        try {
-            const newMode = !config.exchange.testnet;
-            await this.exchange.switchMode(newMode);
-            config.exchange.testnet = newMode; // Update config
-            await this.bot.sendMessage(msg.chat.id, `Trading mode switched to ${newMode ? 'Live' : 'Testnet'}.`);
-            logger.info(`Trading mode switched to ${newMode ? 'live' : 'testnet'}`, { user: msg.from?.username });
-        } catch (error) {
-            logger.error('Error switching trading mode', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to switch trading mode. Check API credentials.');
-        }
     }
 
     /**
@@ -1057,9 +1036,9 @@ export class TelegramBotController {
      * @param message - Message to send.
      * @throws {Error} If sending the message fails.
      */
-    public async sendMessage(message: string): Promise<void> {
+    public async sendMessage(message: string, options?: TelegramBot.SendMessageOptions): Promise<void> {
         try {
-            await this.bot.sendMessage(this.authorizedChatId, message, { parse_mode: 'Markdown' });
+            await this.bot.sendMessage(this.authorizedChatId, message, options);
             logger.info('Message sent to Telegram', { message: message.substring(0, 50) });
         } catch (error) {
             logger.error('Failed to send Telegram message', { error });
