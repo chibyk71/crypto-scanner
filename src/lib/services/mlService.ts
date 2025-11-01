@@ -83,11 +83,26 @@ export class MLService {
         try {
             const modelData = await fs.readFile(config.modelPath, 'utf8');
             const parsedModel = JSON.parse(modelData);
-            this.rfClassifier = RandomForestClassifier.load(parsedModel);
+            const loadedModel = RandomForestClassifier.load(parsedModel);
+
+            if (loadedModel && loadedModel.estimators) {
+                // Check if ALL estimators (trees) have a valid root property.
+                // This is a common point of failure for ml-cart internal structure.
+                const invalidEstimators = loadedModel.estimators.filter(e => !e.root || !e.root.numberSamples);
+
+                if (invalidEstimators.length > 0) {
+                    // Log a severe error and refuse to load the model
+                    logger.error('CRITICAL: Loaded Random Forest model is corrupt. Found missing tree structures.', { count: invalidEstimators.length });
+                    this.isModelLoaded = false;
+                    throw new Error('Corrupt model loaded.'); // Halt execution
+                }
+            }
+
+            this.rfClassifier = loadedModel;
             this.isModelLoaded = true;
             logger.info('Random Forest model loaded successfully');
         } catch (error) {
-            logger.warn('No saved model found or failed to load', { error });
+            logger.warn('No saved model found or failed to load', { error: (error as Error).stack });
             this.isModelLoaded = false;
         }
     }
@@ -104,7 +119,7 @@ export class MLService {
             await fs.writeFile(config.modelPath, modelJson);
             logger.info(`Model saved to ${config.modelPath}`);
         } catch (error) {
-            logger.error(`Failed to save model to ${config.modelPath}`, { error });
+            logger.error(`Failed to save model to ${config.modelPath}`, { error: (error as Error).stack });
             throw error;
         }
     }
@@ -167,15 +182,16 @@ export class MLService {
         }
 
         try {
-            await dbService.addTrainingSample({ symbol, features, label });
-            logger.debug(`Added training sample for ${symbol}: label=${label}`);
+            const mappedLabel = label === 1 ? 1 : 0;
+            await dbService.addTrainingSample({ symbol, features, label:mappedLabel });
+            logger.debug(`Added training sample for ${symbol}: original_label=${label}, mapped_label=${mappedLabel}`);
 
             const sampleCount = await dbService.getSampleCount();
             if (sampleCount >= config.minSamplesToTrain) {
                 await this.trainModel();
             }
         } catch (error) {
-            logger.error(`Failed to add training sample for ${symbol}`, { error });
+            logger.error(`Failed to add training sample for ${symbol}`, { error: (error as Error ).stack });
             throw error;
         }
     }
@@ -207,7 +223,7 @@ export class MLService {
             this.isModelLoaded = true;
             logger.info(`Model trained on ${samples.length} samples`);
         } catch (error) {
-            logger.error('Failed to train model', { error });
+            logger.error('Failed to train model', { error: (error as Error).stack });
             throw error;
         }
     }
@@ -222,7 +238,7 @@ export class MLService {
             await this.trainModel();
             logger.info('Forced model training completed');
         } catch (error) {
-            logger.error('Forced training failed', { error });
+            logger.error('Forced training failed', { error: (error as Error).stack });
             throw error;
         }
     }
@@ -261,7 +277,7 @@ export class MLService {
             logger.debug('Retrieved training status', { sampleCount });
             return status;
         } catch (error) {
-            logger.error('Failed to retrieve training status', { error });
+            logger.error('Failed to retrieve training status', { error: (error as Error).stack });
             return 'Error retrieving training status';
         }
     }
@@ -284,7 +300,7 @@ export class MLService {
             logger.debug('Retrieved sample summary', { symbols: summary.map(s => s.symbol) });
             return formatted;
         } catch (error) {
-            logger.error('Failed to retrieve sample summary', { error });
+            logger.error('Failed to retrieve sample summary', { error: (error as Error).stack });
             return 'Error retrieving sample summary';
         }
     }
@@ -316,7 +332,7 @@ export class MLService {
             logger.debug('Retrieved performance metrics', { totalTrades, winRate });
             return formatted;
         } catch (error) {
-            logger.error('Failed to retrieve performance metrics', { error });
+            logger.error('Failed to retrieve performance metrics', { error: (error as Error).stack });
             return 'Error retrieving performance metrics';
         }
     }
@@ -334,11 +350,13 @@ export class MLService {
             return 0;
         }
         try {
-            const probability = this.rfClassifier.predictProbability([features], expectedLabel)[0];
-            logger.debug(`Prediction made: probability=${probability} for label=${expectedLabel}`);
+            const mappedExpected = expectedLabel === 1 ? 1 : 0;
+            const probability = this.rfClassifier.predictProbability([features], mappedExpected)[0];
+            logger.debug(`Prediction made: probability=${probability} for original_label=${expectedLabel}, mapped_label=${mappedExpected}`);
             return probability;
         } catch (error) {
-            logger.error('Prediction failed', { error, features });
+            console.log(error)
+            logger.error('Prediction failed', { error: (error as Error).stack, features });
             return 0;
         }
     }

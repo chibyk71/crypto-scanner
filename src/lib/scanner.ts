@@ -443,7 +443,7 @@ logger.info(`Trade signal sent for ${symbol}`, { signal: signal.signal, confiden
 
             const features = this.mlService.extractFeatures(input);
             const { outcome, pnl } = await simulateTrade(this.exchangeService, symbol, signal, entryPrice);
-            const label = outcome === 'tp' ? 1 : -1;
+            const label = outcome === 'tp' ? 1 : 0;
 
             await this.mlService.addTrainingSample(symbol, features, label);
             logger.info(`ML sample added`, { symbol, side: signal.signal, outcome, pnl: pnl.toFixed(4), label });

@@ -11,3 +11,4 @@ yarn.lock
 .env
 local.db
 worker.lock
+rf_model.json

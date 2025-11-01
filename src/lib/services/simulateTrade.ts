@@ -10,6 +10,7 @@ const logger = createLogger('simulateTrade');
  * Simulates a trade from entry to exit using live primary OHLCV polling.
  * - Monitors price every 15 seconds
  * - Supports SL, TP, and trailing stop
+ * - Checks **high/low** of the newest candle to catch intra-candle hits
  * - Logs outcome to `simulated_trades` table
  * - Returns { outcome: 'tp' | 'sl' | 'timeout', pnl }
  */
@@ -52,19 +53,21 @@ export async function simulateTrade(
                 continue;
             }
 
-            const latestPrice = Number(raw[raw.length - 1][4]); // close price
-            // const currentTime = raw[raw.length - 1][0];
+            const latest = raw[raw.length - 1];
+            const closePrice = Number(latest[4]);   // close
+            const highPrice  = Number(latest[2]);   // high
+            const lowPrice   = Number(latest[3]);   // low
 
-            // Update trailing stop
+            // ---- 1. Update trailing stop using the **close** (keeps it responsive) ----
             if (signal.trailingStopDistance) {
-                if (isLong && latestPrice > highestPrice) {
-                    highestPrice = Number(latestPrice);
+                if (isLong && closePrice > highestPrice) {
+                    highestPrice = closePrice;
                     const newStop = highestPrice - signal.trailingStopDistance;
                     if (!currentStop || newStop > currentStop) {
                         currentStop = newStop;
                     }
-                } else if (!isLong && latestPrice < lowestPrice) {
-                    lowestPrice = latestPrice;
+                } else if (!isLong && closePrice < lowestPrice) {
+                    lowestPrice = closePrice;
                     const newStop = lowestPrice + signal.trailingStopDistance;
                     if (!currentStop || newStop < currentStop) {
                         currentStop = newStop;
@@ -72,32 +75,52 @@ export async function simulateTrade(
                 }
             }
 
-            // Check TP
+            // ---- 2. Determine the price we would have exited at in this candle ----
+            const exitPriceForCandle = isLong ? highPrice : lowPrice;
+
+            // ---- 3. Check TP ----------------------------------------------------
             if (signal.takeProfit) {
-                const tpHit = isLong ? latestPrice >= signal.takeProfit : latestPrice <= signal.takeProfit;
+                const tpHit = isLong
+                    ? exitPriceForCandle >= signal.takeProfit
+                    : exitPriceForCandle <= signal.takeProfit;
+
                 if (tpHit) {
                     const pnl = isLong
                         ? (signal.takeProfit - entryPrice) / entryPrice
                         : (entryPrice - signal.takeProfit) / entryPrice;
                     await dbService.closeSimulatedTrade(signalId, 'tp', Math.round(pnl * 1e8));
-                    logger.info(`Simulated trade HIT TP`, { symbol, pnl: pnl.toFixed(6), signalId });
+                    logger.info(`Simulated trade HIT TP (candle high/low)`, {
+                        symbol,
+                        pnl: pnl.toFixed(6),
+                        signalId,
+                        exitPrice: signal.takeProfit,
+                    });
                     return { outcome: 'tp', pnl };
                 }
             }
 
-            // Check SL
+            // ---- 4. Check SL (including trailing) --------------------------------
             if (currentStop) {
-                const slHit = isLong ? latestPrice <= currentStop : latestPrice >= currentStop;
+                const slHit = isLong
+                    ? exitPriceForCandle <= currentStop
+                    : exitPriceForCandle >= currentStop;
+
                 if (slHit) {
                     const pnl = isLong
                         ? (currentStop - entryPrice) / entryPrice
                         : (entryPrice - currentStop) / entryPrice;
                     await dbService.closeSimulatedTrade(signalId, 'sl', Math.round(pnl * 1e8));
-                    logger.info(`Simulated trade HIT SL`, { symbol, pnl: pnl.toFixed(6), signalId });
+                    logger.info(`Simulated trade HIT SL (candle high/low)`, {
+                        symbol,
+                        pnl: pnl.toFixed(6),
+                        signalId,
+                        exitPrice: currentStop,
+                    });
                     return { outcome: 'sl', pnl };
                 }
             }
 
+            // ---- 5. No hit – wait for next poll ---------------------------------
             await new Promise(r => setTimeout(r, pollIntervalMs));
         } catch (err) {
             logger.error(`Error in simulateTrade loop for ${symbol}`, { error: err });
@@ -105,7 +128,7 @@ export async function simulateTrade(
         }
     }
 
-    // Timeout: close at current price
+    // ---- Timeout: close at the last available close price --------------------
     const finalRaw = exchangeService.getPrimaryOhlcvData(symbol);
     const exitPrice = finalRaw?.[finalRaw.length - 1]?.[4] ?? entryPrice;
     const pnl = isLong
