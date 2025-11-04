@@ -197,7 +197,7 @@ export class ExchangeService {
                 // Check if the live-polled data meets the minimum history length
                 if (liveData.length >= config.historyLength) {
                     logger.debug(`Using live polling data for ${cacheKey}`);
-                    return this.toOhlcvData(liveData);
+                    return this.toOhlcvData(liveData, symbol);
                 }
             }
 
@@ -207,7 +207,7 @@ export class ExchangeService {
 
             if (!forceRefresh && !isHistoricalQuery && isCacheValid) {
                 logger.debug(`Returning valid cached OHLCV for ${cacheKey}`);
-                return this.toOhlcvData(cache.data);
+                return this.toOhlcvData(cache.data, symbol);
             }
 
             // --- 4. Force Refresh: Clear Cache if requested ---
@@ -240,7 +240,7 @@ export class ExchangeService {
             logger.info(`Fetched ${rawCandles.length} candles for ${cacheKey}. ` +
                 `Range: ${new Date(rawCandles[0][0] as number).toISOString()} to ${new Date(rawCandles.at(-1)![0] as number).toISOString()}`);
 
-            const result = this.toOhlcvData(rawCandles);
+            const result = this.toOhlcvData(rawCandles, symbol);
 
             // --- 7. Data Integrity Validation ---
             // Check for NaN, non-positive High/Low/Close, or negative Volume
@@ -502,8 +502,9 @@ export class ExchangeService {
      * @param candles - Array of OHLCV candles from CCXT.
      * @returns {OhlcvData} Formatted OHLCV data object.
      */
-    public toOhlcvData(candles: OHLCV[]): OhlcvData {
+    public toOhlcvData(candles: OHLCV[], symbol?: string): OhlcvData {
         return {
+            symbol: symbol || 'unknown',
             timestamps: candles.map(c => c[0] as number),
             opens: candles.map(c => c[1] as number),
             highs: candles.map(c => c[2] as number),
