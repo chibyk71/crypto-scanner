@@ -13,6 +13,8 @@ import {
     calculateOBV,
     calculateVWMA,
     calculateVWAP,
+    calculateMomentum,
+    detectEngulfing,
 } from '../indicators';
 import type { StrategyInput } from '../strategy';
 import { dbService } from '../db';
@@ -125,28 +127,52 @@ export class MLService {
     }
 
     /**
-     * Extracts features from market data for ML prediction.
-     * - Computes technical indicators (EMA, RSI, MACD, etc.) from primary and higher timeframe data.
-     * - Returns a feature vector for use in prediction or training.
-     * @param input - Strategy input containing primary and higher timeframe OHLCV data and current price.
-     * @returns {number[]} Array of feature values (e.g., EMA, RSI, MACD, etc.).
-     */
+ * Extracts features from market data for ML prediction.
+ * - Computes **all** technical indicators that are defined in `indicators.ts`.
+ * - Returns a feature vector for use in prediction or training.
+ * @param input - Strategy input containing primary and higher timeframe OHLCV data and current price.
+ * @returns {number[]} Array of feature values.
+ */
     public extractFeatures(input: StrategyInput): number[] {
         const { primaryData, htfData, price } = input;
         const features: number[] = [];
 
-        // Calculate technical indicators
+        // -----------------------------------------------------------------
+        // 1. Primary-timeframe (3-min) indicators – latest value only
+        // -----------------------------------------------------------------
         const emaShort = calculateEMA(primaryData.closes, this.emaShortPeriod);
         const rsi = calculateRSI(primaryData.closes, this.rsiPeriod);
         const macd = calculateMACD(primaryData.closes, this.macdFast, this.macdSlow, this.macdSignal);
-        const stochastic = calculateStochastic(primaryData.highs, primaryData.lows, primaryData.closes, this.stochPeriod, this.stochSignal);
+        const stochastic = calculateStochastic(
+            primaryData.highs,
+            primaryData.lows,
+            primaryData.closes,
+            this.stochPeriod,
+            this.stochSignal
+        );
         const atr = calculateATR(primaryData.highs, primaryData.lows, primaryData.closes, this.atrPeriod);
         const obv = calculateOBV(primaryData.closes, primaryData.volumes);
         const vwma = calculateVWMA(primaryData.closes, primaryData.volumes, this.vwmaPeriod);
-        const vwap = calculateVWAP(primaryData.highs, primaryData.lows, primaryData.closes, primaryData.volumes, this.vwapPeriod);
+        const vwap = calculateVWAP(
+            primaryData.highs,
+            primaryData.lows,
+            primaryData.closes,
+            primaryData.volumes,
+            this.vwapPeriod
+        );
         const htfEma = calculateEMA(htfData.closes, this.htfEmaMidPeriod);
 
-        // Push latest values to feature vector, defaulting to 0 if undefined
+        const momentum = calculateMomentum(primaryData.closes, 10);               // 10-period momentum
+        const engulfing = detectEngulfing(
+            primaryData.opens,
+            primaryData.highs,
+            primaryData.lows,
+            primaryData.closes
+        );
+
+        // -----------------------------------------------------------------
+        // 4. Push **latest** values (fallback to 0 for safety)
+        // -----------------------------------------------------------------
         features.push(
             emaShort.at(-1) ?? 0,
             rsi.at(-1) ?? 0,
@@ -159,10 +185,12 @@ export class MLService {
             vwma.at(-1) ?? 0,
             vwap.at(-1) ?? 0,
             htfEma.at(-1) ?? 0,
-            price
+            price,
+            momentum.at(-1) ?? 0,                                 // latest momentum
+            engulfing.at(-1) === 'bullish' ? 1 :
+                engulfing.at(-1) === 'bearish' ? -1 : 0,               // one-hot: 1 / -1 / 0
         );
 
-        logger.debug(`Extracted ${features.length} features for prediction`, { price });
         return features;
     }
 
@@ -183,7 +211,7 @@ export class MLService {
 
         try {
             const mappedLabel = label === 1 ? 1 : 0;
-            await dbService.addTrainingSample({ symbol, features, label:mappedLabel });
+            await dbService.addTrainingSample({ symbol, features, label: mappedLabel });
             logger.debug(`Added training sample for ${symbol}: original_label=${label}, mapped_label=${mappedLabel}`);
 
             const sampleCount = await dbService.getSampleCount();
@@ -191,7 +219,7 @@ export class MLService {
                 await this.trainModel();
             }
         } catch (error) {
-            logger.error(`Failed to add training sample for ${symbol}`, { error: (error as Error ).stack });
+            logger.error(`Failed to add training sample for ${symbol}`, { error: (error as Error).stack });
             throw error;
         }
     }
