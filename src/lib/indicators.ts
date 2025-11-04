@@ -1,6 +1,7 @@
 // src/lib/indicators.ts
 
 import * as ti from 'technicalindicators';
+import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX';
 import type { StochasticOutput } from 'technicalindicators/declarations/momentum/Stochastic';
 import type { BollingerBandsOutput } from 'technicalindicators/declarations/volatility/BollingerBands';
 
@@ -50,7 +51,7 @@ export function calculateMACD(
     fastPeriod: number = 5,
     slowPeriod: number = 13,
     signalPeriod: number = 8
-): {MACD: number, signal: number, histogram: number}[] {
+): { MACD: number, signal: number, histogram: number }[] {
     if (values.length < slowPeriod) return [];
     let result = ti.macd({ values, fastPeriod, slowPeriod, signalPeriod, SimpleMAOscillator: false, SimpleMASignal: false });
 
@@ -61,7 +62,7 @@ export function calculateMACD(
         histogram: macd.histogram ?? 0,
     }));
 
-    return result as {MACD: number, signal: number, histogram: number}[];
+    return result as { MACD: number, signal: number, histogram: number }[];
 }
 
 /**
@@ -159,6 +160,19 @@ export function calculateVWMA(closes: number[], volumes: number[], period: numbe
 }
 
 /**
+ * Calculates Average Directional Index (ADX).
+ * @param highs - Array of high prices.
+ * @param lows - Array of low prices.
+ * @param closes - Array of closing prices.
+ * @param period - ADX period (default: 14).
+ * @returns Array of ADXOutput objects.
+ */
+export function calculateADX(highs: number[], lows: number[], closes: number[], period: number = 14): ADXOutput[] {
+    if (highs.length < period || lows.length < period || closes.length < period) return [];
+    return ti.adx({ high: highs, low: lows, close: closes, period });
+}
+
+/**
  * Calculates Volume Weighted Average Price (VWAP).
  * @param highs - Array of high prices.
  * @param lows - Array of low prices.
@@ -173,4 +187,66 @@ export function calculateVWAP(highs: number[], lows: number[], closes: number[],
         throw new Error('Input arrays must have equal length');
     }
     return ti.vwap({ high: highs, low: lows, close: closes, volume: volumes });
+}
+
+/**
+ * NEW: Calculates Momentum (leading oscillator)
+ * Positive = upward momentum, Negative = downward
+ * @param closes - Closing prices
+ * @param period - Lookback period (default: 10 for scalping)
+ * @returns Momentum values (array length = closes.length - period + 1)
+ */
+export function calculateMomentum(closes: number[], period: number = 10): number[] {
+    if (closes.length < period) return [];
+    const momentum: number[] = [];
+    for (let i = period; i < closes.length; i++) {
+        momentum.push(closes[i] - closes[i - period]);
+    }
+    return momentum;
+}
+
+/**
+ * NEW: Detects Bullish/Bearish Engulfing candlestick patterns
+ * Returns array of 'bullish', 'bearish', or null for each candle (index-aligned from period 1)
+ * @param opens, highs, lows, closes - OHLC arrays
+ * @returns Array<string | null> e.g., [null, 'bullish', null, 'bearish']
+ */
+export function detectEngulfing(
+    opens: number[],
+    highs: number[],
+    lows: number[],
+    closes: number[]
+): ('bullish' | 'bearish' | null)[] {
+    if (opens.length < 2 || highs.length < 2 || lows.length < 2 || closes.length < 2) return [];
+    if ([opens, highs, lows, closes].some(arr => arr.length !== opens.length)) {
+        throw new Error('OHLC arrays must have equal length');
+    }
+
+    const patterns: ('bullish' | 'bearish' | null)[] = [null]; // Index 0 unused
+    for (let i = 1; i < opens.length; i++) {
+        const prevOpen = opens[i - 1];
+        const prevClose = closes[i - 1];
+        const currOpen = opens[i];
+        const currClose = closes[i];
+
+        const prevBody = Math.abs(prevClose - prevOpen);
+        const currBody = Math.abs(currClose - currOpen);
+
+        // Bullish Engulfing: Prior red candle fully engulfed by green
+        const bullish = prevClose < prevOpen && // Prior bearish
+            currClose > currOpen && // Current bullish
+            currOpen < prevClose && // Current opens below prior close
+            currClose > prevOpen && // Current closes above prior open
+            currBody > prevBody;    // Larger body
+
+        // Bearish Engulfing: Mirror
+        const bearish = prevClose > prevOpen &&
+            currClose < currOpen &&
+            currOpen > prevClose &&
+            currClose < prevOpen &&
+            currBody > prevBody;
+
+        patterns.push(bullish ? 'bullish' : bearish ? 'bearish' : null);
+    }
+    return patterns;
 }
