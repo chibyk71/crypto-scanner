@@ -35,7 +35,7 @@ export async function simulateTrade(
     let lowestPrice = entryPrice;  // for trailing stop (short)
     const timeoutMs = 60 * 60 * 1000; // 1 hour max
     const startTime = Date.now();
-    const pollIntervalMs = 15_000; // 15s
+    const pollIntervalMs = 180_000; // 3m
 
     logger.info(`Simulating ${signal.signal} trade`, {
         symbol,
