@@ -65,6 +65,7 @@ const ConfigSchema = z.object({
     MODEL_PATH: z.string().default('./rf_model.json'),
     /** Risk percentage of account balance per trade (0.1% to 50%) */
     POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(50).default(1),
+    MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(25_000),
 });
 
 /**
@@ -72,7 +73,7 @@ const ConfigSchema = z.object({
  * Populated from environment variables with defaults where applicable.
  * @type {z.infer<typeof ConfigSchema>}
  */
-const validatedConfig = ConfigSchema.parse(process.env);
+const validatedConfig: z.infer<typeof ConfigSchema> = ConfigSchema.parse(process.env);
 
 /**
  * Configuration object for the trading bot.
@@ -115,6 +116,7 @@ export const config = {
     minSamplesToTrain: validatedConfig.MIN_SAMPLES_TO_TRAIN,
     modelPath: validatedConfig.MODEL_PATH,
     positionSizePercent: validatedConfig.POSITION_SIZE_PERCENT,
+    minAvgVolumeUsdPerHour: validatedConfig.MIN_AVG_VOLUME_USD_PER_HOUR,
 };
 
 /**
