@@ -364,13 +364,13 @@ export class MarketScanner {
             `**${signal.signal.toUpperCase()} SIGNAL**`,
             `**Symbol:** ${escape(symbol)}`,
             `**Confidence:** ${signal.confidence.toFixed(0)}%`,
-            `**Price:** $${escape(currentPrice.toFixed(4))}`,
-            signal.stopLoss ? `**Stop Loss:** $${escape(signal.stopLoss.toFixed(4))}` : '',
+            `**Price:** $${escape(currentPrice.toFixed(8))}`,
+            signal.stopLoss ? `**Stop Loss:** $${escape(signal.stopLoss.toFixed(8))}` : '',
             signal.takeProfit
-                ? `**Take Profit:** $${escape(signal.takeProfit.toFixed(4))} \\(\\~${config.strategy.riskRewardTarget} R:R\\)`
+                ? `**Take Profit:** $${escape(signal.takeProfit.toFixed(8))} \\(\\~${config.strategy.riskRewardTarget} R:R\\)`
                 : '',
             signal.trailingStopDistance
-                ? `**Trailing Stop:** $${escape(signal.trailingStopDistance.toFixed(4))}`
+                ? `**Trailing Stop:** $${escape(signal.trailingStopDistance.toFixed(8))}`
                 : '',
             `**Reasons:**`,
             ...signal.reason.map(r => `• ${escape(r)}`),
@@ -449,7 +449,7 @@ export class MarketScanner {
 
             const features = this.mlService.extractFeatures(input);
             const { outcome, pnl } = await simulateTrade(this.exchangeService, symbol, signal, entryPrice);
-            const label = outcome === 'tp' ? 1 : 0;                                     // ← 1 = hit TP, 0 = hit SL
+            const label = signal.signal === 'sell' && outcome === 'tp' ? -1 : outcome === 'tp' ? 1 : 0;
 
             await this.mlService.addTrainingSample(symbol, features, label);
             logger.info(`ML sample added`, { symbol, side: signal.signal, outcome, pnl: pnl.toFixed(4), label });
