@@ -1,9 +1,16 @@
 // src/lib/services/mlService.ts
+// =============================================================================
+// ML SERVICE – 5-TIER RANDOM FOREST CLASSIFIER (FULLY TYPE-SAFE + PRODUCTION READY)
+// Integrated with simulateTrade.ts → uses real R-multiple outcomes
+// Supports: -2 (disaster), -1 (loss), 0 (neutral), +1 (good), +2 (monster win)
+// =============================================================================
 
 import * as fs from 'fs/promises';
 import { RandomForestClassifier } from 'ml-random-forest';
 import { createLogger } from '../logger';
 import { config } from '../config/settings';
+import { dbService } from '../db';
+import type { StrategyInput, SignalLabel } from '../../types'; // ← Critical: from single source of truth
 import {
     calculateEMA,
     calculateRSI,
@@ -15,9 +22,9 @@ import {
     calculateVWAP,
     calculateMomentum,
     detectEngulfing,
+    calculateBollingerBands,
+    calculateADX,
 } from '../indicators';
-import type { StrategyInput } from '../strategy';
-import { dbService } from '../db';
 
 /**
  * Logger instance for MLService operations.
@@ -26,288 +33,306 @@ import { dbService } from '../db';
 const logger = createLogger('MLService');
 
 /**
- * Interface for in-memory training samples.
- * - Mirrors the database `training_samples` table structure.
- */
-export interface TrainingSample {
-    features: number[];
-    label: number;
-}
-
-/**
- * Manages the machine learning model for trading signal prediction and training.
- * - Uses RandomForestClassifier for predicting trade outcomes.
- * - Stores training samples in the database (`training_samples` table) for online learning.
- * - Provides methods for training control, feature extraction, and performance metrics.
+ * MLService – The brain that learns from high-fidelity simulated outcomes
+ * Uses 5-tier labeling (-2 to +2) based on R-multiple from simulateTrade.ts
  */
 export class MLService {
-    private rfClassifier: RandomForestClassifier;
-    private isModelLoaded: boolean = false;
-    private isTrainingPaused: boolean = false;
-    private readonly rsiPeriod: number = 10;
-    private readonly macdFast: number = 5;
-    private readonly macdSlow: number = 13;
-    private readonly macdSignal: number = 8;
-    private readonly stochPeriod: number = 14;
-    private readonly stochSignal: number = 3;
-    private readonly atrPeriod: number = 12;
-    private readonly emaShortPeriod: number = 20;
-    private readonly vwmaPeriod: number = 20;
-    private readonly vwapPeriod: number = 20;
-    private readonly htfEmaMidPeriod: number = 50;
+    private classifier: RandomForestClassifier;
+    private isModelLoaded = false;
+    private isTrainingPaused = false;
 
-    /**
-     * Initializes the ML service.
-     * - Creates a new RandomForestClassifier with predefined hyperparameters.
-     * - Attempts to load an existing model from disk.
-     * - Note: Training data is now managed via the database, not file storage.
-     */
+    // All possible labels for multi-class prediction
+    private readonly ALL_LABELS: SignalLabel[] = [-2, -1, 0, 1, 2];
+
+    // Hyperparameters – balanced for crypto volatility
+    private readonly N_ESTIMATORS = 300;
+    private readonly MAX_DEPTH = 14;
+    private readonly MIN_SAMPLES_SPLIT = 4;
+    private readonly MAX_FEATURES = 0.85;
+
+    // Indicator periods – optimized for 3min primary + 1h HTF
+    private readonly RSI_PERIOD = 10;
+    private readonly MACD_FAST = 12;
+    private readonly MACD_SLOW = 26;
+    private readonly MACD_SIGNAL = 9;
+    private readonly STOCH_K = 14;
+    private readonly STOCH_D = 3;
+    private readonly ATR_PERIOD = 12;
+    private readonly EMA_SHORT = 20;
+    private readonly EMA_MID = 50;
+    private readonly VWMA_PERIOD = 20;
+    private readonly VWAP_PERIOD = 20;
+
     constructor() {
-        this.rfClassifier = new RandomForestClassifier({
-            nEstimators: 100,
+        this.classifier = new RandomForestClassifier({
+            nEstimators: this.N_ESTIMATORS,
             seed: 42,
-            treeOptions: { maxDepth: 10, minSamplesSplit: 5 },
-            maxFeatures: 0.8,
+            treeOptions: { maxDepth: this.MAX_DEPTH, minSamplesSplit: this.MIN_SAMPLES_SPLIT },
+            maxFeatures: this.MAX_FEATURES,
             replacement: true,
             useSampleBagging: true,
         });
+
         this.loadModel();
-        logger.info('MLService initialized');
+        logger.info('MLService initialized (5-tier labeling enabled)');
     }
 
-    /**
-     * Loads a saved Random Forest model from disk.
-     * - Attempts to read the model from `config.modelPath`.
-     * @private
-     * @throws {Error} If the model file is corrupted or unreadable.
-     */
+    // ===========================================================================
+    // MODEL PERSISTENCE – Safe load/save with corruption detection
+    // ===========================================================================
     private async loadModel(): Promise<void> {
         try {
-            const modelData = await fs.readFile(config.modelPath, 'utf8');
-            const parsedModel = JSON.parse(modelData);
-            const loadedModel = RandomForestClassifier.load(parsedModel);
+            const data = await fs.readFile(config.ml.modelPath, 'utf-8');
+            const parsed = JSON.parse(data);
+            const model = RandomForestClassifier.load(parsed);
 
-            if (loadedModel && loadedModel.estimators) {
-                // Check if ALL estimators (trees) have a valid root property.
-                // This is a common point of failure for ml-cart internal structure.
-                const invalidEstimators = loadedModel.estimators.filter(e => !e.root || !e.root.numberSamples);
-
-                if (invalidEstimators.length > 0) {
-                    // Log a severe error and refuse to load the model
-                    logger.error('CRITICAL: Loaded Random Forest model is corrupt. Found missing tree structures.', { count: invalidEstimators.length });
-                    this.isModelLoaded = false;
-                    throw new Error('Corrupt model loaded.'); // Halt execution
-                }
+            if (!model?.estimators?.length || model.estimators.some((t: any) => !t.root)) {
+                throw new Error('Invalid or corrupt model structure');
             }
 
-            this.rfClassifier = loadedModel;
+            this.classifier = model;
             this.isModelLoaded = true;
-            logger.info('Random Forest model loaded successfully');
-        } catch (error) {
-            logger.warn('No saved model found or failed to load', { error: (error as Error).stack });
+            logger.info('ML model loaded successfully', {
+                trees: model.estimators.length,
+                path: config.ml.modelPath,
+            });
+        } catch (err) {
+            logger.warn('No valid model found – starting fresh', {
+                error: err instanceof Error ? err.message : 'Unknown',
+            });
             this.isModelLoaded = false;
         }
     }
 
-    /**
-     * Saves the current Random Forest model to disk.
-     * - Writes the model to `config.modelPath` as JSON.
-     * @private
-     * @throws {Error} If writing to the file fails.
-     */
     private async saveModel(): Promise<void> {
         try {
-            const modelJson = JSON.stringify(this.rfClassifier);
-            await fs.writeFile(config.modelPath, modelJson);
-            logger.info(`Model saved to ${config.modelPath}`);
-        } catch (error) {
-            logger.error(`Failed to save model to ${config.modelPath}`, { error: (error as Error).stack });
-            throw error;
+            const json = JSON.stringify(this.classifier);
+            await fs.writeFile(config.ml.modelPath, json, 'utf-8');
+            logger.info('ML model saved', { path: config.ml.modelPath });
+        } catch (err) {
+            logger.error('Failed to save ML model', { error: err instanceof Error ? err.stack : err });
+            throw err;
         }
     }
 
-    /**
- * Extracts features from market data for ML prediction.
- * - Computes **all** technical indicators that are defined in `indicators.ts`.
- * - Returns a feature vector for use in prediction or training.
- * @param input - Strategy input containing primary and higher timeframe OHLCV data and current price.
- * @returns {number[]} Array of feature values.
- */
+    // ===========================================================================
+    // FEATURE EXTRACTION – High-signal, consistent with training data
+    // ===========================================================================
     public extractFeatures(input: StrategyInput): number[] {
         const { primaryData, htfData, price } = input;
-        const features: number[] = [];
+        const f: number[] = [];
 
-        // -----------------------------------------------------------------
-        // 1. Primary-timeframe (3-min) indicators – latest value only
-        // -----------------------------------------------------------------
-        const emaShort = calculateEMA(primaryData.closes, this.emaShortPeriod);
-        const rsi = calculateRSI(primaryData.closes, this.rsiPeriod);
-        const macd = calculateMACD(primaryData.closes, this.macdFast, this.macdSlow, this.macdSignal);
-        const stochastic = calculateStochastic(
-            primaryData.highs,
-            primaryData.lows,
-            primaryData.closes,
-            this.stochPeriod,
-            this.stochSignal
-        );
-        const atr = calculateATR(primaryData.highs, primaryData.lows, primaryData.closes, this.atrPeriod);
+        // Primary timeframe indicators
+        const emaShort = calculateEMA(primaryData.closes, this.EMA_SHORT);
+        const emaMid = calculateEMA(primaryData.closes, this.EMA_MID);
+        const rsi = calculateRSI(primaryData.closes, this.RSI_PERIOD);
+        const macd = calculateMACD(primaryData.closes, this.MACD_FAST, this.MACD_SLOW, this.MACD_SIGNAL);
+        const stoch = calculateStochastic(primaryData.highs, primaryData.lows, primaryData.closes, this.STOCH_K, this.STOCH_D);
+        const atr = calculateATR(primaryData.highs, primaryData.lows, primaryData.closes, this.ATR_PERIOD);
         const obv = calculateOBV(primaryData.closes, primaryData.volumes);
-        const vwma = calculateVWMA(primaryData.closes, primaryData.volumes, this.vwmaPeriod);
+        const vwma = calculateVWMA(primaryData.closes, primaryData.volumes, this.VWMA_PERIOD);
         const vwap = calculateVWAP(
             primaryData.highs,
             primaryData.lows,
             primaryData.closes,
             primaryData.volumes,
-            this.vwapPeriod
+            this.VWAP_PERIOD
         );
-        const htfEma = calculateEMA(htfData.closes, this.htfEmaMidPeriod);
+        const bb = calculateBollingerBands(primaryData.closes, 20, 2);
+        const momentum = calculateMomentum(primaryData.closes, 10);
+        const engulfing = detectEngulfing(primaryData.opens, primaryData.highs, primaryData.lows, primaryData.closes);
 
-        const momentum = calculateMomentum(primaryData.closes, 10);               // 10-period momentum
-        const engulfing = detectEngulfing(
-            primaryData.opens,
-            primaryData.highs,
-            primaryData.lows,
-            primaryData.closes
-        );
+        // HTF alignment
+        const htfEma = calculateEMA(htfData.closes, 50);
+        const htfRsi = calculateRSI(htfData.closes, 14);
+        const htfAdx = calculateADX(htfData.highs, htfData.lows, htfData.closes, 14);
 
-        // -----------------------------------------------------------------
-        // 4. Push **latest** values (fallback to 0 for safety)
-        // -----------------------------------------------------------------
-        features.push(
+        // Binary structural features
+        const priceAboveEmaShort = price > (emaShort.at(-1) ?? 0) ? 1 : 0;
+        const priceAboveEmaMid = price > (emaMid.at(-1) ?? 0) ? 1 : 0;
+        const priceAboveHtfEma = price > (htfEma.at(-1) ?? 0) ? 1 : 0;
+        const rsiOversold = (rsi.at(-1) ?? 50) < 30 ? 1 : 0;
+        const rsiOverbought = (rsi.at(-1) ?? 50) > 70 ? 1 : 0;
+        const macdBullish = (macd.at(-1)?.MACD ?? 0) > (macd.at(-1)?.signal ?? 0) ? 1 : 0;
+        const stochOversold = (stoch.at(-1)?.k ?? 50) < 20 ? 1 : 0;
+
+        // Push all features
+        f.push(
             emaShort.at(-1) ?? 0,
-            rsi.at(-1) ?? 0,
+            emaMid.at(-1) ?? 0,
+            rsi.at(-1) ?? 50,
             macd.at(-1)?.MACD ?? 0,
             macd.at(-1)?.signal ?? 0,
-            stochastic.at(-1)?.k ?? 0,
-            stochastic.at(-1)?.d ?? 0,
+            macd.at(-1)?.histogram ?? 0,
+            stoch.at(-1)?.k ?? 50,
+            stoch.at(-1)?.d ?? 50,
             atr.at(-1) ?? 0,
             obv.at(-1) ?? 0,
             vwma.at(-1) ?? 0,
-            vwap.at(-1) ?? 0,
             htfEma.at(-1) ?? 0,
+            htfRsi.at(-1) ?? 50,
             price,
-            momentum.at(-1) ?? 0,                                 // latest momentum
-            engulfing.at(-1) === 'bullish' ? 1 :
-                engulfing.at(-1) === 'bearish' ? -1 : 0,               // one-hot: 1 / -1 / 0
+            htfAdx.at(-1)?.adx ?? 0,
+            htfAdx.at(-1)?.pdi ?? 0,
+            htfAdx.at(-1)?.mdi ?? 0,
+            vwap.at(-1) ?? 0,
+            momentum.at(-1) ?? 0,
+            engulfing.at(-1) === 'bullish' ? 1 : engulfing.at(-1) === 'bearish' ? -1 : 0,
+            priceAboveEmaShort,
+            priceAboveEmaMid,
+            priceAboveHtfEma,
+            rsiOversold,
+            rsiOverbought,
+            macdBullish,
+            stochOversold,
+            bb.at(-1)?.upper ? (price - bb.at(-1)!.upper!) / (bb.at(-1)!.upper! - bb.at(-1)!.lower!) : 0.5
         );
 
-        return features;
+        return f;
     }
 
-    /**
-     * Adds a training sample to the database.
-     * - Stores the sample in the `training_samples` table with symbol, features, and label.
-     * - Triggers model retraining if the sample count meets or exceeds `minSamplesToTrain`.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @param features - Feature vector for the ML model.
-     * @param label - Trade outcome (1 for win, -1 for loss).
-     * @throws {Error} If database insertion fails.
-     */
-    public async addTrainingSample(symbol: string, features: number[], label: number): Promise<void> {
+    // ===========================================================================
+    // PREDICTION – Returns confidence in positive outcome (for long signals)
+    // ===========================================================================
+    public predict(features: number[]): { label: SignalLabel; confidence: number } {
+        if (!this.isModelLoaded || this.classifier.estimators?.length === 0) {
+            return { label: 0, confidence: 0 };
+        }
+
+        try {
+            // Get probabilities for all possible labels
+            const probabilities: Record<SignalLabel, number> = {
+                [-2]: 0,
+                [-1]: 0,
+                0: 0,
+                1: 0,
+                2: 0,
+            };
+            for (const label of this.ALL_LABELS) {
+                const probArray = this.classifier.predictProbability([features], label);
+                probabilities[label] = probArray[0]; // probArray is [[prob]], so [0][0]
+            }
+
+            const pNeg2 = probabilities[-2];
+            const pNeg1 = probabilities[-1];
+            const pZero = probabilities[0];
+            const pPos1 = probabilities[1];
+            const pPos2 = probabilities[2];
+
+            const positiveConfidence = pPos1 + pPos2;
+            const predictedLabel: SignalLabel = pPos2 > pPos1 ? 2 : pPos1 >= 0.35 ? 1 : 0;
+
+            logger.debug('ML Prediction', {
+                confidence: positiveConfidence.toFixed(4),
+                predictedLabel,
+                probs: { '-2': pNeg2.toFixed(3), '-1': pNeg1.toFixed(3), '0': pZero.toFixed(3), '1': pPos1.toFixed(3), '2': pPos2.toFixed(3) },
+            });
+
+            return { label: predictedLabel, confidence: positiveConfidence };
+        } catch (err) {
+            logger.error('ML prediction failed', { error: err instanceof Error ? err.message : err });
+            return { label: 0, confidence: 0 };
+        }
+    }
+
+    // ===========================================================================
+    // INGEST SIMULATED OUTCOME – Called from simulateTrade.ts
+    // ===========================================================================
+    public async ingestSimulatedOutcome(
+        symbol: string,
+        features: number[],
+        label: SignalLabel,
+        rMultiple: number,
+        pnlPercent: number
+    ): Promise<void> {
         if (this.isTrainingPaused) {
-            logger.info(`Training paused, skipping sample for ${symbol}`);
+            logger.info('Training paused – skipping sample', { symbol, label });
             return;
         }
 
         try {
-            const mappedLabel = label === 1 ? 1 : 0;
-            await dbService.addTrainingSample({ symbol, features, label: mappedLabel });
-            logger.debug(`Added training sample for ${symbol}: original_label=${label}, mapped_label=${mappedLabel}`);
+            await dbService.addTrainingSample({
+                symbol,
+                features,
+                label, // Now correctly stores -2 to +2
+            });
 
-            const sampleCount = await dbService.getSampleCount();
-            if (sampleCount >= config.minSamplesToTrain) {
-                await this.trainModel();
+            logger.info('New training sample ingested', {
+                symbol,
+                label,
+                rMultiple: rMultiple.toFixed(2),
+                pnl: `${(pnlPercent * 100).toFixed(2)}%`,
+                features: features.length,
+            });
+
+            const count = await dbService.getSampleCount();
+            if (count >= config.ml.minSamplesToTrain && count % 20 === 0) {
+                await this.retrain();
             }
-        } catch (error) {
-            logger.error(`Failed to add training sample for ${symbol}`, { error: (error as Error).stack });
-            throw error;
+        } catch (err) {
+            logger.error('Failed to ingest training sample', { error: err instanceof Error ? err.stack : err });
         }
     }
 
-    /**
-     * Trains the Random Forest model using all samples from the database.
-     * - Retrieves samples from the `training_samples` table and trains the model.
-     * - Saves the updated model to disk if training is successful.
-     * @private
-     * @throws {Error} If training or model saving fails.
-     */
-    private async trainModel(): Promise<void> {
-        if (this.isTrainingPaused) {
-            logger.info('Training paused, skipping model training');
-            return;
-        }
+    // ===========================================================================
+    // RETRAIN MODEL
+    // ===========================================================================
+    private async retrain(): Promise<void> {
+        if (this.isTrainingPaused) return;
 
         try {
             const samples = await dbService.getTrainingSamples();
-            if (samples.length < config.minSamplesToTrain) {
-                logger.warn(`Insufficient samples (${samples.length}/${config.minSamplesToTrain}) to train model`);
+            if (samples.length < config.ml.minSamplesToTrain) {
+                logger.warn(`Not enough samples to retrain (${samples.length})`);
                 return;
             }
 
-            const features = samples.map(s => s.features);
-            const labels = samples.map(s => s.label);
-            this.rfClassifier.train(features, labels);
+            const X = samples.map(s => s.features);
+            const y = samples.map(s => s.label); // Now multi-class: -2 to +2
+
+            logger.info(`Retraining ML model on ${samples.length} samples...`);
+            this.classifier.train(X, y);
             await this.saveModel();
             this.isModelLoaded = true;
-            logger.info(`Model trained on ${samples.length} samples`);
-        } catch (error) {
-            logger.error('Failed to train model', { error: (error as Error).stack });
-            throw error;
+
+            const dist = await dbService.getLabelDistribution();
+            logger.info('Model retrained & saved', {
+                samples: samples.length,
+                distribution: dist.map(d => `${d.label}:${d.count}`).join(', '),
+            });
+        } catch (err) {
+            logger.error('Retraining failed', { error: err instanceof Error ? err.stack : err });
         }
     }
 
-    /**
-     * Forces immediate model training, bypassing sample count checks.
-     * - Useful for manual retraining via Telegram commands.
-     * @throws {Error} If training or model saving fails.
-     */
-    public async forceTrain(): Promise<void> {
-        try {
-            await this.trainModel();
-            logger.info('Forced model training completed');
-        } catch (error) {
-            logger.error('Forced training failed', { error: (error as Error).stack });
-            throw error;
-        }
-    }
-
-    /**
-     * Pauses ML model training.
-     * - Prevents new samples from triggering retraining.
-     */
-    public pauseTraining(): void {
+    // ===========================================================================
+    // CONTROL & STATUS
+    // ===========================================================================
+    public pauseTraining() {
         this.isTrainingPaused = true;
-        logger.info('ML training paused');
+        logger.warn('ML training PAUSED');
     }
 
-    /**
-     * Resumes ML model training.
-     * - Allows new samples to trigger retraining if conditions are met.
-     */
-    public resumeTraining(): void {
+    public resumeTraining() {
         this.isTrainingPaused = false;
-        logger.info('ML training resumed');
+        logger.info('ML training RESUMED');
     }
 
-    /**
-     * Retrieves the current training status.
-     * - Includes sample count, model status, and training pause state.
-     * @returns {Promise<string>} Formatted status message.
-     */
-    public async getTrainingStatus(): Promise<string> {
-        try {
-            const sampleCount = await dbService.getSampleCount();
-            const status = [
-                `Training samples: ${sampleCount}/${config.minSamplesToTrain}`,
-                `Model trained: ${this.isModelLoaded ? 'Yes' : 'No'}`,
-                `Training paused: ${this.isTrainingPaused ? 'Yes' : 'No'}`,
-            ].join('\n');
-            logger.debug('Retrieved training status', { sampleCount });
-            return status;
-        } catch (error) {
-            logger.error('Failed to retrieve training status', { error: (error as Error).stack });
-            return 'Error retrieving training status';
-        }
+    public async forceRetrain(): Promise<void> {
+        logger.info('Force retrain triggered');
+        await this.retrain();
+    }
+
+    public async getStatus(): Promise<string> {
+        const count = await dbService.getSampleCount();
+        const dist = await dbService.getLabelDistribution();
+        return [
+            `ML Model Status`,
+            `├─ Loaded: ${this.isModelLoaded ? 'YES' : 'NO'} (${this.classifier.estimators?.length} trees)`,
+            `├─ Training Paused: ${this.isTrainingPaused ? 'YES' : 'NO'}`,
+            `├─ Total Samples: ${count}`,
+            `└─ Label Distribution: ${dist.map(d => `${d.label}(${d.count})`).join(', ')}`,
+        ].join('\n');
     }
 
     /**
@@ -332,7 +357,7 @@ export class MLService {
             return 'Error retrieving sample summary';
         }
     }
-
+    
     /**
      * Retrieves performance metrics for trading outcomes.
      * - Includes total trades, overall win rate, and symbol-specific metrics.
@@ -365,36 +390,11 @@ export class MLService {
         }
     }
 
-    /**
-     * Predicts the probability of a positive outcome for a given label.
-     * - Returns 0 if the model is not trained.
-     * @param features - Feature vector for prediction.
-     * @param expectedLabel - Expected label (1 for buy, -1 for sell).
-     * @returns {number} Probability of the expected label (0 to 1).
-     */
-    public predict(features: number[], expectedLabel: number): number {
-        if (!this.isModelLoaded) {
-            logger.warn('Prediction attempted but model is not trained');
-            return 0;
-        }
-        try {
-            const mappedExpected = expectedLabel === 1 ? 1 : 0;
-            const probability = this.rfClassifier.predictProbability([features], mappedExpected)[0];
-            logger.debug(`Prediction made: probability=${probability} for original_label=${expectedLabel}, mapped_label=${mappedExpected}`);
-            return probability;
-        } catch (error) {
-            console.log(error)
-            logger.error('Prediction failed', { error: (error as Error).stack, features });
-            return 0;
-        }
-    }
 
-    /**
-     * Checks if the model is trained and ready for predictions.
-     * @returns {boolean} True if the model is trained, false otherwise.
-     */
-    public isModelTrained(): boolean {
-        logger.debug(`Model trained status: ${this.isModelLoaded}`);
-        return this.isModelLoaded;
+    public isReady(): boolean {
+        return this.isModelLoaded && (this.classifier.estimators?.length ?? 0) > 0;
     }
 }
+
+// Export singleton for easy import
+export const mlService = new MLService();
