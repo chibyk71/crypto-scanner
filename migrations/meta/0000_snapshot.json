@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "9f7ff104-2c0b-4f7a-b693-da690c7ac9a4",
+  "id": "c6557a08-8e31-4b8b-83a3-06608f62c2aa",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -61,7 +61,7 @@
         },
         "last_alert_at": {
           "name": "last_alert_at",
-          "type": "int",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false,
@@ -81,6 +81,51 @@
       "uniqueConstraints": {},
       "checkConstraint": {}
     },
+    "cool_down": {
+      "name": "cool_down",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "varchar(15)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_trade_at": {
+          "name": "last_trade_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "cool_down_id": {
+          "name": "cool_down_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "cool_down_symbol_unique": {
+          "name": "cool_down_symbol_unique",
+          "columns": [
+            "symbol"
+          ]
+        }
+      },
+      "checkConstraint": {}
+    },
     "heartbeat": {
       "name": "heartbeat",
       "columns": {
@@ -91,16 +136,16 @@
           "notNull": true,
           "autoincrement": false
         },
-        "cycleCount": {
-          "name": "cycleCount",
+        "cycle_count": {
+          "name": "cycle_count",
           "type": "int",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "lastHeartbeatAt": {
-          "name": "lastHeartbeatAt",
+        "last_heartbeat_at": {
+          "name": "last_heartbeat_at",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true,
@@ -135,7 +180,7 @@
           "name": "is_locked",
           "type": "boolean",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "autoincrement": false,
           "default": false
         }
@@ -250,16 +295,16 @@
           "notNull": false,
           "autoincrement": false
         },
-        "take_profit": {
-          "name": "take_profit",
+        "trailing_dist": {
+          "name": "trailing_dist",
           "type": "bigint",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         },
-        "trailing_dist": {
-          "name": "trailing_dist",
-          "type": "bigint",
+        "tp_levels": {
+          "name": "tp_levels",
+          "type": "json",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -278,24 +323,52 @@
           "notNull": false,
           "autoincrement": false
         },
+        "outcome": {
+          "name": "outcome",
+          "type": "varchar(15)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "pnl": {
           "name": "pnl",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "r_multiple": {
+          "name": "r_multiple",
           "type": "bigint",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         },
-        "outcome": {
-          "name": "outcome",
-          "type": "varchar(10)",
+        "label": {
+          "name": "label",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "mfe": {
+          "name": "mfe",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "mae": {
+          "name": "mae",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         }
       },
       "indexes": {
-        "idx_signal_id": {
-          "name": "idx_signal_id",
+        "idx_sim_signal_id": {
+          "name": "idx_sim_signal_id",
           "columns": [
             "signal_id"
           ],
@@ -312,6 +385,27 @@
           "name": "idx_sim_opened",
           "columns": [
             "opened_at"
+          ],
+          "isUnique": false
+        },
+        "idx_sim_outcome": {
+          "name": "idx_sim_outcome",
+          "columns": [
+            "outcome"
+          ],
+          "isUnique": false
+        },
+        "idx_sim_label": {
+          "name": "idx_sim_label",
+          "columns": [
+            "label"
+          ],
+          "isUnique": false
+        },
+        "idx_sim_closed": {
+          "name": "idx_sim_closed",
+          "columns": [
+            "closed_at"
           ],
           "isUnique": false
         }
@@ -396,15 +490,15 @@
         }
       },
       "indexes": {
-        "idx_symbol": {
-          "name": "idx_symbol",
+        "idx_trades_symbol": {
+          "name": "idx_trades_symbol",
           "columns": [
             "symbol"
           ],
           "isUnique": false
         },
-        "idx_timestamp": {
-          "name": "idx_timestamp",
+        "idx_trades_timestamp": {
+          "name": "idx_trades_timestamp",
           "columns": [
             "timestamp"
           ],
@@ -464,10 +558,24 @@
         }
       },
       "indexes": {
-        "idx_symbol": {
-          "name": "idx_symbol",
+        "idx_training_symbol": {
+          "name": "idx_training_symbol",
           "columns": [
             "symbol"
+          ],
+          "isUnique": false
+        },
+        "idx_training_label": {
+          "name": "idx_training_label",
+          "columns": [
+            "label"
+          ],
+          "isUnique": false
+        },
+        "idx_training_created": {
+          "name": "idx_training_created",
+          "columns": [
+            "created_at"
           ],
           "isUnique": false
         }

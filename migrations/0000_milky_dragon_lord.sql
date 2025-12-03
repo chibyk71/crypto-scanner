@@ -6,20 +6,28 @@ CREATE TABLE `alert` (
 	`status` varchar(20) NOT NULL DEFAULT 'active',
 	`created_at` timestamp DEFAULT (now()),
 	`note` varchar(255),
-	`last_alert_at` int DEFAULT 0,
+	`last_alert_at` bigint DEFAULT 0,
 	CONSTRAINT `alert_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `cool_down` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`symbol` varchar(15),
+	`last_trade_at` bigint NOT NULL,
+	CONSTRAINT `cool_down_id` PRIMARY KEY(`id`),
+	CONSTRAINT `cool_down_symbol_unique` UNIQUE(`symbol`)
 );
 --> statement-breakpoint
 CREATE TABLE `heartbeat` (
 	`id` int NOT NULL,
-	`cycleCount` int NOT NULL DEFAULT 0,
-	`lastHeartbeatAt` bigint NOT NULL DEFAULT 0,
+	`cycle_count` int NOT NULL DEFAULT 0,
+	`last_heartbeat_at` bigint NOT NULL DEFAULT 0,
 	CONSTRAINT `heartbeat_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
 CREATE TABLE `locks` (
 	`id` int NOT NULL,
-	`is_locked` boolean DEFAULT false,
+	`is_locked` boolean NOT NULL DEFAULT false,
 	CONSTRAINT `locks_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
@@ -37,12 +45,16 @@ CREATE TABLE `simulated_trades` (
 	`side` varchar(10) NOT NULL,
 	`entry_price` bigint NOT NULL,
 	`stop_loss` bigint,
-	`take_profit` bigint,
 	`trailing_dist` bigint,
+	`tp_levels` json,
 	`opened_at` bigint NOT NULL,
 	`closed_at` bigint,
-	`pnl` bigint,
-	`outcome` varchar(10),
+	`outcome` varchar(15),
+	`pnl` bigint NOT NULL,
+	`r_multiple` bigint,
+	`label` int,
+	`mfe` bigint,
+	`mae` bigint,
 	CONSTRAINT `simulated_trades_id` PRIMARY KEY(`id`),
 	CONSTRAINT `simulated_trades_signal_id_unique` UNIQUE(`signal_id`)
 );
@@ -78,9 +90,14 @@ CREATE TABLE `user` (
 );
 --> statement-breakpoint
 ALTER TABLE `session` ADD CONSTRAINT `session_user_id_user_id_fk` FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX `idx_signal_id` ON `simulated_trades` (`signal_id`);--> statement-breakpoint
+CREATE INDEX `idx_sim_signal_id` ON `simulated_trades` (`signal_id`);--> statement-breakpoint
 CREATE INDEX `idx_sim_symbol` ON `simulated_trades` (`symbol`);--> statement-breakpoint
 CREATE INDEX `idx_sim_opened` ON `simulated_trades` (`opened_at`);--> statement-breakpoint
-CREATE INDEX `idx_symbol` ON `trades` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
-CREATE INDEX `idx_symbol` ON `training_samples` (`symbol`);
+CREATE INDEX `idx_sim_outcome` ON `simulated_trades` (`outcome`);--> statement-breakpoint
+CREATE INDEX `idx_sim_label` ON `simulated_trades` (`label`);--> statement-breakpoint
+CREATE INDEX `idx_sim_closed` ON `simulated_trades` (`closed_at`);--> statement-breakpoint
+CREATE INDEX `idx_trades_symbol` ON `trades` (`symbol`);--> statement-breakpoint
+CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
+CREATE INDEX `idx_training_symbol` ON `training_samples` (`symbol`);--> statement-breakpoint
+CREATE INDEX `idx_training_label` ON `training_samples` (`label`);--> statement-breakpoint
+CREATE INDEX `idx_training_created` ON `training_samples` (`created_at`);
