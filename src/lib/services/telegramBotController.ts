@@ -441,12 +441,12 @@ export class TelegramBotController {
     private async sendConditionsMenu(chatId: number, data: AlertState['data']): Promise<void> {
         const conditionsText = data.conditions.length
             ? data.conditions
-                  .map(c => {
-                      const period = c.period ? `(${c.period})` : '';
-                      const target = Array.isArray(c.target) ? c.target.join('-') : c.target;
-                      return `  - ${c.indicator.toUpperCase()}${period} ${c.operator} ${target || '(No Target)'}`;
-                  })
-                  .join('\n')
+                .map(c => {
+                    const period = c.period ? `(${c.period})` : '';
+                    const target = Array.isArray(c.target) ? c.target.join('-') : c.target;
+                    return `  - ${c.indicator.toUpperCase()}${period} ${c.operator} ${target || '(No Target)'}`;
+                })
+                .join('\n')
             : 'None';
 
         const message = `*Current Alert Settings:*\n*Symbol*: ${data.symbol} (${data.timeframe})\n\n*Conditions:*\n\`\`\`\n${conditionsText}\n\`\`\`\n\n*Actions:*`;
@@ -845,7 +845,7 @@ export class TelegramBotController {
         if (!this.isAuthorized(msg.chat.id)) return;
 
         try {
-            const status = await this.mlService.getTrainingStatus();
+            const status = await this.mlService.getStatus();
             await this.bot.sendMessage(msg.chat.id, `**ML Training Status** 🤖\n\n${status}`, { parse_mode: 'Markdown' });
         } catch (error) {
             logger.error('Error fetching ML training status', { error });
@@ -901,7 +901,7 @@ export class TelegramBotController {
         if (!this.isAuthorized(msg.chat.id)) return;
 
         try {
-            await this.mlService.forceTrain();
+            await this.mlService.forceRetrain();
             await this.bot.sendMessage(msg.chat.id, 'ML model training forced successfully.');
             logger.info('Forced ML model training', { user: msg.from?.username });
         } catch (error) {
