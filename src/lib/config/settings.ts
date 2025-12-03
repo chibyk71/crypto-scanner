@@ -1,125 +1,215 @@
 // src/lib/config/settings.ts
+// =============================================================================
+// CENTRAL CONFIGURATION – SINGLE SOURCE OF TRUTH
+// Uses Zod + dotenv for bulletproof validation & defaults
+// All modules import from here → no scattered env vars
+// Fully supports:
+//   • 5-tier ML labeling
+//   • Partial take-profits & trailing stops
+//   • High-precision simulation
+//   • Live vs testnet mode
+//   • Per-environment tuning
+// =============================================================================
 
 import { config as dotenvConfig } from 'dotenv';
 import { z } from 'zod';
 
+// Load .env early
 dotenvConfig();
 
 /**
- * Schema for validating environment variables using Zod.
- * Ensures all required configuration parameters are correctly typed and provides defaults.
- * @typedef {Object} ConfigSchema
+ * Zod schema – validates every config value at startup
+ * Throws clear error if anything is missing or wrong
  */
 const ConfigSchema = z.object({
-    /** Environment mode: 'dev', 'prod', or 'test' */
-    ENV: z.enum(['dev', 'prod', 'test']).default('dev'),
-    /** Logging verbosity level */
-    LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
-    /** MySQL database connection URL (e.g., mysql://user:pass@localhost:3306/dbname) */
+    // ──────────────────────────────────────────────────────────────
+    // Core Environment
+    // ──────────────────────────────────────────────────────────────
+    ENV: z.enum(['dev', 'test', 'prod']).default('dev'),
+    LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+
+    // ──────────────────────────────────────────────────────────────
+    // Database
+    // ──────────────────────────────────────────────────────────────
     DATABASE_URL: z.string().url(),
-    /** Enable automatic trading */
-    AUTO_TRADE: z.coerce.boolean().default(false),
-    /** Exchange name (e.g., 'bybit') */
-    EXCHANGE: z.string().default('gate'),
-    /** API key for live trading */
+
+    // ──────────────────────────────────────────────────────────────
+    // Exchange & Trading Mode
+    // ──────────────────────────────────────────────────────────────
+    AUTO_TRADE: z.coerce.boolean().default(false),                    // Master kill switch
+    EXCHANGE: z.enum(['bybit', 'gate', 'binance']).default('bybit'),
     EXCHANGE_API_KEY: z.string().optional(),
-    /** API secret for live trading */
     EXCHANGE_API_SECRET: z.string().optional(),
-    /** Telegram bot token for notifications */
+
+    // ──────────────────────────────────────────────────────────────
+    // Telegram Notifications
+    // ──────────────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: z.string().optional(),
-    /** Telegram chat ID for sending alerts */
     TELEGRAM_CHAT_ID: z.string().optional(),
-    /** Comma-separated list of trading symbols (e.g., 'BTC/USDT,ETH/USDT') */
-    SYMBOLS: z.string().transform(str => str.split(',').map(s => s.trim())).optional().default(['BTC/USDT', 'ETH/USDT']),
-    /** Primary timeframe for market scanning (e.g., '3m') */
-    TIMEFRAME: z.string().default('3m'),
-    /** Higher timeframe for analysis (e.g., '1h') */
-    HTF_TIMEFRAME: z.string().default('1h'),
-    /** Polling interval for market scans (milliseconds) */
-    POLL_INTERVAL: z.coerce.number().default(300000),
-    /** Heartbeat interval in scan cycles */
-    HEARTBEAT_INTERVAL: z.coerce.number().default(60),
-    /** Number of historical candles to fetch */
-    HISTORY_LENGTH: z.coerce.number().default(200),
-    /** Scanner mode: 'single' or 'periodic' */
-    SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
-    /** ATR multiplier for stop-loss calculation */
-    ATR_MULTIPLIER: z.coerce.number().default(1.5),
-    /** Target risk-reward ratio for trades */
-    RISK_REWARD_TARGET: z.coerce.number().default(3),
-    /** Trailing stop percentage for risk management */
-    TRAILING_STOP_PERCENT: z.coerce.number().default(0.5),
-    /** Leverage to apply to trades */
-    LEVERAGE: z.coerce.number().default(1),
-    /** Lock mechanism: 'file' or 'database' */
+
+    // ──────────────────────────────────────────────────────────────
+    // Symbols & Timeframes
+    // ──────────────────────────────────────────────────────────────
+    SYMBOLS: z.string().default('BTC/USDT,ETH/USDT').transform(str => str.split(',').map(s => s.trim())),
+    TIMEFRAME: z.string().default('3m'),           // Primary scanner timeframe
+    HTF_TIMEFRAME: z.string().default('1h'),       // Higher timeframe filter
+
+    // ──────────────────────────────────────────────────────────────
+    // Scanner Behavior
+    // ──────────────────────────────────────────────────────────────
+    SCAN_INTERVAL_MS: z.coerce.number().default(60_000),     // How often to run full scan
+    HEARTBEAT_INTERVAL: z.coerce.number().default(30),       // Telegram heartbeat every N cycles
+    HISTORY_LENGTH: z.coerce.number().min(100).default(300), // Candles to keep in memory
+
+    // ──────────────────────────────────────────────────────────────
+    // Risk Management & Position Sizing
+    // ──────────────────────────────────────────────────────────────
+    ATR_MULTIPLIER: z.coerce.number().default(1.5),          // Stop-loss distance
+    RISK_REWARD_TARGET: z.coerce.number().default(3.0),      // Target R:R (e.g., 3 = 3:1)
+    TRAILING_STOP_PERCENT: z.coerce.number().default(0.6),   // Trailing activation % of move
+    POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(10).default(1.0), // % of balance per trade
+    LEVERAGE: z.coerce.number().default(5),
+
+    // ──────────────────────────────────────────────────────────────
+    // 5-Tier ML Labeling Thresholds (R-multiple based)
+    // ──────────────────────────────────────────────────────────────
+    ML_LABEL_STRONG_WIN: z.coerce.number().default(3.0),     // R ≥ 3.0 → label +2
+    ML_LABEL_GOOD_WIN: z.coerce.number().default(1.5),       // R ≥ 1.5 → label +1
+    ML_LABEL_BREAK_EVEN: z.coerce.number().default(-0.5),    // R ≥ -0.5 → label 0
+    ML_LABEL_SMALL_LOSS: z.coerce.number().default(-1.5),    // R ≥ -1.5 → label -1
+    // Below -1.5 → label -2 (strong loss)
+
+    // ──────────────────────────────────────────────────────────────
+    // Simulation Engine
+    // ──────────────────────────────────────────────────────────────
+    SIMULATION_TIMEOUT_MINUTES: z.coerce.number().default(60),      // Max hold time
+    SIMULATION_POLL_INTERVAL_MS: z.coerce.number().default(15_000), // 15s precision
+    SIMULATION_DEFAULT_RISK_PCT: z.coerce.number().default(1.5),    // Fallback risk if no SL
+
+    // ──────────────────────────────────────────────────────────────
+    // Partial Take-Profit Configuration
+    // ──────────────────────────────────────────────────────────────
+    PARTIAL_TP_LEVELS: z.string().default('1.5:0.4,3.0:0.3,6.0:0.3').transform(str => {
+        // Format: "1.5:0.4,3.0:0.3,5.0:0.3" → [{price: 1.5R, weight: 0.4}, ...]
+        return str.split(',').map(part => {
+            const [rStr, weightStr] = part.split(':');
+            return {
+                rMultiple: parseFloat(rStr),
+                weight: parseFloat(weightStr),
+            };
+        });
+    }), // Default: 40% at 1.5R, 30% at 3R, 30% at 6R
+
+    // ──────────────────────────────────────────────────────────────
+    // ML Training
+    // ──────────────────────────────────────────────────────────────
+    MIN_SAMPLES_TO_TRAIN: z.coerce.number().default(150),
+    MODEL_PATH: z.string().default('./models/rf_model.json'),
+    TRAINING_MODE: z.coerce.boolean().default(true),
+
+    // ──────────────────────────────────────────────────────────────
+    // Confidence & Filters
+    // ──────────────────────────────────────────────────────────────
+    CONFIDENCE_THRESHOLD: z.coerce.number().min(30).max(95).default(68),
+    MIN_ADX_TREND: z.coerce.number().default(20),
+    MIN_BB_BANDWIDTH_PCT: z.coerce.number().default(0.5), // Avoid flat markets
+    MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(50_000),
+
+    // ──────────────────────────────────────────────────────────────
+    // Worker & Locking
+    // ──────────────────────────────────────────────────────────────
     LOCK_TYPE: z.enum(['file', 'database']).default('database'),
-    /** Port for the API server */
-    API_PORT: z.coerce.number().default(3000),
-    /** Enable ML model training */
-    TRAINING_MODE: z.coerce.boolean().default(false),
-    /** Path to store training data (deprecated, prefer database) */
-    TRAINING_DATA_PATH: z.string().default('./training_data.json'),
-    /** Minimum number of samples required to train ML model */
-    MIN_SAMPLES_TO_TRAIN: z.coerce.number().default(100),
-    /** Path to store the Random Forest model */
-    MODEL_PATH: z.string().default('./rf_model.json'),
-    /** Risk percentage of account balance per trade (0.1% to 50%) */
-    POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(50).default(1),
-    MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(25_000),
+    SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
 });
 
 /**
- * Parsed and validated configuration object.
- * Populated from environment variables with defaults where applicable.
- * @type {z.infer<typeof ConfigSchema>}
+ * Parse & validate – will throw clear error on startup if config is wrong
  */
-const validatedConfig: z.infer<typeof ConfigSchema> = ConfigSchema.parse(process.env);
+const rawConfig = ConfigSchema.parse(process.env);
 
 /**
- * Configuration object for the trading bot.
- * @type {Config}
+ * Final exported config – typed, validated, and enriched
  */
 export const config = {
-    autoTrade: Boolean(validatedConfig.EXCHANGE_API_KEY && validatedConfig.EXCHANGE_API_SECRET && validatedConfig.AUTO_TRADE),
-    env: validatedConfig.ENV,
-    log_level: validatedConfig.LOG_LEVEL,
+    // Core
+    env: rawConfig.ENV,
+    log_level: rawConfig.LOG_LEVEL,
+
+    // Exchange
+    autoTrade: Boolean(
+        rawConfig.AUTO_TRADE &&
+        rawConfig.EXCHANGE_API_KEY &&
+        rawConfig.EXCHANGE_API_SECRET
+    ),
     exchange: {
-        name: validatedConfig.EXCHANGE,
-        apiKey: validatedConfig.EXCHANGE_API_KEY,
-        apiSecret: validatedConfig.EXCHANGE_API_SECRET,
+        name: rawConfig.EXCHANGE,
+        apiKey: rawConfig.EXCHANGE_API_KEY,
+        apiSecret: rawConfig.EXCHANGE_API_SECRET,
     },
+
+    // Telegram
     telegram: {
-        token: validatedConfig.TELEGRAM_BOT_TOKEN,
-        chatId: validatedConfig.TELEGRAM_CHAT_ID,
+        token: rawConfig.TELEGRAM_BOT_TOKEN,
+        chatId: rawConfig.TELEGRAM_CHAT_ID,
     },
-    database_url: validatedConfig.DATABASE_URL,
-    symbols: validatedConfig.SYMBOLS,
-    leverage: validatedConfig.LEVERAGE,
-    historyLength: validatedConfig.HISTORY_LENGTH,
-    lockType: validatedConfig.LOCK_TYPE,
-    scannerMode: validatedConfig.SCANNER_MODE,
-    apiPort: validatedConfig.API_PORT,
+
+    // Symbols & Timeframes
+    symbols: rawConfig.SYMBOLS,
     scanner: {
-        primaryTimeframe: validatedConfig.TIMEFRAME,
-        htfTimeframe: validatedConfig.HTF_TIMEFRAME,
-        scanIntervalMs: validatedConfig.POLL_INTERVAL,
-        heartBeatInterval: validatedConfig.HEARTBEAT_INTERVAL,
+        primaryTimeframe: rawConfig.TIMEFRAME,
+        htfTimeframe: rawConfig.HTF_TIMEFRAME,
+        scanIntervalMs: rawConfig.SCAN_INTERVAL_MS,
+        heartBeatInterval: rawConfig.HEARTBEAT_INTERVAL,
     },
+
+    // Risk & Position
     strategy: {
-        atrMultiplier: validatedConfig.ATR_MULTIPLIER,
-        riskRewardTarget: validatedConfig.RISK_REWARD_TARGET,
-        trailingStopPercent: validatedConfig.TRAILING_STOP_PERCENT,
-        positionSizePercent: validatedConfig.POSITION_SIZE_PERCENT,
+        atrMultiplier: rawConfig.ATR_MULTIPLIER,
+        riskRewardTarget: rawConfig.RISK_REWARD_TARGET,
+        trailingStopPercent: rawConfig.TRAILING_STOP_PERCENT,
+        positionSizePercent: rawConfig.POSITION_SIZE_PERCENT,
+        leverage: rawConfig.LEVERAGE,
+        confidenceThreshold: rawConfig.CONFIDENCE_THRESHOLD,
+        minAdxTrend: rawConfig.MIN_ADX_TREND,
+        minBbBandwidthPct: rawConfig.MIN_BB_BANDWIDTH_PCT,
+        minAvgVolumeUsdPerHour: rawConfig.MIN_AVG_VOLUME_USD_PER_HOUR,
     },
-    trainingMode: validatedConfig.TRAINING_MODE,
-    trainingDataPath: validatedConfig.TRAINING_DATA_PATH,
-    minSamplesToTrain: validatedConfig.MIN_SAMPLES_TO_TRAIN,
-    modelPath: validatedConfig.MODEL_PATH,
-    positionSizePercent: validatedConfig.POSITION_SIZE_PERCENT,
-    minAvgVolumeUsdPerHour: validatedConfig.MIN_AVG_VOLUME_USD_PER_HOUR,
+
+    // 5-Tier ML Labeling
+    ml: {
+        labelThresholds: {
+            strongWin: rawConfig.ML_LABEL_STRONG_WIN,
+            goodWin: rawConfig.ML_LABEL_GOOD_WIN,
+            breakEven: rawConfig.ML_LABEL_BREAK_EVEN,
+            smallLoss: rawConfig.ML_LABEL_SMALL_LOSS,
+        },
+        minSamplesToTrain: rawConfig.MIN_SAMPLES_TO_TRAIN,
+        modelPath: rawConfig.MODEL_PATH,
+        trainingEnabled: rawConfig.TRAINING_MODE,
+    },
+
+    // Simulation
+    simulation: {
+        timeoutMinutes: rawConfig.SIMULATION_TIMEOUT_MINUTES,
+        pollIntervalMs: rawConfig.SIMULATION_POLL_INTERVAL_MS,
+        defaultRiskPct: rawConfig.SIMULATION_DEFAULT_RISK_PCT,
+        partialTpLevels: rawConfig.PARTIAL_TP_LEVELS,
+    },
+
+    // Worker
+    worker: {
+        lockType: rawConfig.LOCK_TYPE,
+        scannerMode: rawConfig.SCANNER_MODE,
+    },
+
+    // DB
+    databaseUrl: rawConfig.DATABASE_URL,
+
+    // History
+    historyLength: rawConfig.HISTORY_LENGTH,
 };
 
 /**
- * Type definition for the configuration object.
+ * Type export – use this everywhere for type safety
  */
 export type Config = typeof config;
