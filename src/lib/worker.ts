@@ -183,7 +183,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         }
 
         // Initialize MarketScanner
-        scanner = new MarketScanner(exchange, telegram, strategy, mlService, supportedSymbols, {
+        scanner = new MarketScanner(exchange, telegram, strategy, supportedSymbols, {
             mode: scannerMode,
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,
@@ -211,8 +211,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
                     logger.info('Database connection closed');
                 }
                 // Log final heartbeat for performance monitoring
-                const cycleCount = await dbService.getHeartbeatCount();
-                logger.info('Worker shutdown complete', { finalCycleCount: cycleCount });
+                logger.info('Worker shutdown complete');
                 process.exit(0);
             } catch (err: any) {
                 logger.error('Error during cleanup', { error: err });
