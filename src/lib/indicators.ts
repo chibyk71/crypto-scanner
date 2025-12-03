@@ -15,9 +15,9 @@ import type { BollingerBandsOutput } from 'technicalindicators/declarations/vola
 // -----------------------------------------------------------------------------
 // 1. HELPER: Safe array slice for indicators that drop early values
 // -----------------------------------------------------------------------------
-function trimToLength<T>(arr: T[], targetLength: number): T[] {
-    return arr.length >= targetLength ? arr.slice(-targetLength) : arr;
-}
+// function trimToLength<T>(arr: T[], targetLength: number): T[] {
+//     return arr.length >= targetLength ? arr.slice(-targetLength) : arr;
+// }
 
 // -----------------------------------------------------------------------------
 // 2. BASIC MOVING AVERAGES
@@ -85,7 +85,6 @@ export function calculateStochastic(
     lows: number[],
     closes: number[],
     kPeriod = 14,
-    kSmooth = 3,
     dPeriod = 3
 ): StochasticOutput[] {
     if (highs.length < kPeriod || lows.length < kPeriod || closes.length < kPeriod) return [];
@@ -99,6 +98,7 @@ export function calculateStochastic(
         close: closes,
         period: kPeriod,
         signalPeriod: dPeriod,
+
     });
 }
 

@@ -110,7 +110,7 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Confidence & Filters
     // ──────────────────────────────────────────────────────────────
-    CONFIDENCE_THRESHOLD: z.coerce.number().min(30).max(95).default(68),
+    CONFIDENCE_THRESHOLD: z.coerce.number().min(50).max(95).default(68),
     MIN_ADX_TREND: z.coerce.number().default(20),
     MIN_BB_BANDWIDTH_PCT: z.coerce.number().default(0.5), // Avoid flat markets
     MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(50_000),

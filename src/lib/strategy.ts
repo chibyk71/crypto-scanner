@@ -123,7 +123,7 @@ const DEFAULT_COOLDOWN_MINUTES = 10;          // ← Don't spam signals – wait
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.15;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.75;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 8;
 
 const MIN_BB_BANDWIDTH_PCT = 1.0;             // ← Minimum Bollinger Band width percentage to avoid flat markets

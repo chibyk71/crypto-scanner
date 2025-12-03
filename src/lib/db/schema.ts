@@ -1,5 +1,5 @@
 // src/lib/db/schema.ts
-import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, } from 'drizzle-orm/mysql-core';
+import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, } from 'drizzle-orm/mysql-core';
 import type { Condition } from '../../types';
 
 /**
@@ -98,8 +98,8 @@ export const trades = mysqlTable(
         id: int('id').primaryKey().autoincrement(),
         symbol: varchar('symbol', { length: 50 }).notNull(),
         side: varchar('side', { length: 10 }).notNull(), // 'buy' | 'sell'
-        amount: bigint('amount', { mode: 'number' }).notNull(), // raw quantity × 1e8 (for precision)
-        price: bigint('price', { mode: 'number' }).notNull(),   // price × 1e8
+        amount: float('amount').notNull(), // raw quantity × 1e8 (for precision)
+        price: float('price').notNull(),   // price × 1e8
         timestamp: bigint('timestamp', { mode: 'number' }).notNull(),
         mode: varchar('mode', { length: 10 }).notNull(), // 'live' | 'paper'
         orderId: varchar('order_id', { length: 50 }).notNull(),
@@ -135,11 +135,11 @@ export const simulatedTrades = mysqlTable(
         side: varchar('side', { length: 10 }).notNull(), // 'buy' | 'sell'
 
         // Entry
-        entryPrice: bigint('entry_price', { mode: 'number' }).notNull(), // × 1e8
+        entryPrice: float('entry_price').notNull(), // × 1e8
 
         // Risk Management
-        stopLoss: bigint('stop_loss', { mode: 'number' }),           // fixed SL × 1e8
-        trailingDist: bigint('trailing_dist', { mode: 'number' }),   // trailing distance × 1e8
+        stopLoss: float('stop_loss'),           // fixed SL × 1e8
+        trailingDist: float('trailing_dist'),   // trailing distance × 1e8
 
         // Multiple Take-Profit Levels (partial fills)
         // Example: [{ price: 65000, weight: 0.5 }, { price: 68000, weight: 0.5 }]

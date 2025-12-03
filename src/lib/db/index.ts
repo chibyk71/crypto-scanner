@@ -397,7 +397,7 @@ class DatabaseService {
             signalId,
             symbol: trade.symbol,
             side: trade.side,
-            entryPrice: (Number(trade.entryPrice) / 1e8).toFixed(6),
+            entryPrice: (Number(trade.entryPrice)).toFixed(8),
             hasTpLevels: !!trade.tpLevels,
             hasTrailing: !!trade.trailingDist,
         });
