@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------
 
 import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX'; // ← Type for the ADX indicator output
-import type { OhlcvData } from '../types';                                           // ← Custom type that holds OHLCV arrays for a symbol
+import type { OhlcvData, SignalLabel, TradeSignal } from '../types';                                           // ← Custom type that holds OHLCV arrays for a symbol
 import {
     calculateEMA,
     calculateRSI,
@@ -22,24 +22,9 @@ import {
 import { createLogger } from './logger';                                             // ← Simple winston/pino wrapper used everywhere
 import { MLService } from './services/mlService';                                    // ← Wrapper around a trained ML model (predicts buy/sell probability)
 import { config } from './config/settings';
+import type { MACDOutput } from 'technicalindicators/declarations/moving_averages/MACD';
 
 const logger = createLogger('Strategy');                                          // ← Dedicated logger for this module
-
-// ---------------------------------------------------------------
-// INTERFACES: Define input/output shapes
-// ---------------------------------------------------------------
-export interface TradeSignal {                                                    // ← What the engine finally returns to the caller
-    symbol: string;                                                               // ← e.g. "BTCUSDT"
-    signal: 'buy' | 'sell' | 'hold';                                              // ← Final decision
-    confidence: number;                                                           // ← 0-100, derived from score + ML
-    reason: string[];                                                             // ← Human-readable list of why we decided
-    stopLoss?: number;                                                            // ← ATR-based stop price
-    takeProfit?: number;                                                          // ← Risk:Reward target price
-    trailingStopDistance?: number;                                                // ← How far the trailing stop follows price
-    positionSizeMultiplier?: number;                                              // ← Scale position size by confidence (0-1)
-    mlConfidence?: number;                                                        // ← Raw ML probability (optional if model not trained)
-    features: number[];                                                           // ← Numeric vector fed to the ML model (for training later)
-}
 
 export interface StrategyInput {                                                  // ← Everything the engine needs from the outside
     symbol: string;
@@ -58,7 +43,7 @@ interface Indicators {                                                          
     vwma: number[];                                                               // ← Full VWMA-20 series on 3m
     vwap: number[];                                                               // ← Full VWAP series (same look-back as VWMA)
     rsi: number[];                                                                // ← Full RSI series
-    macd: Array<{ MACD: number; signal: number; histogram: number }>;            // ← Full MACD object series
+    macd: Array<MACDOutput>;            // ← Full MACD object series
     stochastic: Array<{ k: number; d: number }>;                                  // ← Full Stochastic series
     atr: number[];                                                                // ← Full ATR series
     obv: number[];                                                                // ← Full On-Balance Volume series
@@ -67,7 +52,7 @@ interface Indicators {                                                          
     lastVwma20: number;                                                           // ← Most recent VWMA-20
     lastVwap: number;                                                             // ← Most recent VWAP
     rsiNow: number;                                                               // ← Current RSI
-    macdNow: { MACD: number; signal: number; histogram: number } | undefined;    // ← Current MACD (may be undefined on first bars)
+    macdNow: MACDOutput | undefined;    // ← Current MACD (may be undefined on first bars)
     stochNow: { k: number; d: number };                                           // ← Current Stochastic %K & %D
     lastObv: number;                                                              // ← Current OBV
     lastAtr: number;                                                              // ← Current ATR (used for stop-loss)
@@ -97,7 +82,7 @@ interface ScoresAndML {                                                         
 // ---------------------------------------------------------------
 // SCORING CONSTANTS: Points system for signal strength (balanced for realism)
 // ---------------------------------------------------------------
-const CONFIDENCE_THRESHOLD = 75;              // ← Minimum raw score to even consider a trade (lowered for more opportunities)
+const CONFIDENCE_THRESHOLD = config.strategy.confidenceThreshold;              // ← Minimum raw score to even consider a trade (lowered for more opportunities)
 const SCORE_MARGIN_REQUIRED = 50;             // ← Buy must beat Sell by at least this many points (dynamic in code)
 
 const EMA_ALIGNMENT_POINTS = 20;              // ← Price > EMA20 > HTF-EMA50 = strong alignment
@@ -135,10 +120,10 @@ const MAX_ATR_MULTIPLIER = 5;
 
 const DEFAULT_COOLDOWN_MINUTES = 10;          // ← Don't spam signals – wait at least 10 min
 
-const MIN_AVG_VOLUME_USD_PER_HOUR = config.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
+const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.75;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.15;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 8;
 
 const MIN_BB_BANDWIDTH_PCT = 1.0;             // ← Minimum Bollinger Band width percentage to avoid flat markets
@@ -215,7 +200,7 @@ export class Strategy {
         const lastBandwidth = lastBb.middle > 0 ? ((lastBb.upper - lastBb.lower) / lastBb.middle) * 100 : 0;
 
         // ---- MACD can produce NaN on the very first bars – fallback to previous bar ----
-        if (macdNow && (isNaN(macdNow.MACD) || isNaN(macdNow.signal) || isNaN(macdNow.histogram))) {
+        if (macdNow && ([macdNow.MACD, macdNow.signal, macdNow.histogram].some(v => Number.isNaN(Number(v))))) {
             logger.warn('NaN detected in MACD, falling back to previous value');
             macdNow = macd[macd.length - 2] ?? { MACD: 0, signal: 0, histogram: 0 };
         }
@@ -398,8 +383,13 @@ export class Strategy {
 
         // -------------------- MACD (tiered) --------------------
         if (indicators.macdNow) {
-            const macdCrossUp = indicators.macdNow.MACD > indicators.macdNow.signal;
-            const histPositive = indicators.macdNow.histogram > 0;
+            // Ensure MACD fields are numeric (some indicator implementations may return undefined)
+            const macdVal = Number(indicators.macdNow.MACD ?? 0);
+            const macdSignalVal = Number(indicators.macdNow.signal ?? 0);
+            const macdHistVal = Number(indicators.macdNow.histogram ?? 0);
+
+            const macdCrossUp = macdVal > macdSignalVal;
+            const histPositive = macdHistVal > 0;
             if (macdCrossUp && histPositive) {
                 buyScore += MACD_POINTS;
                 reasons.push('Strong Bullish MACD: Crossover + Positive Histogram');
@@ -408,8 +398,8 @@ export class Strategy {
                 reasons.push('Weak Bullish MACD: Crossover but Histogram not positive');
             }
 
-            const macdCrossDown = indicators.macdNow.MACD < indicators.macdNow.signal;
-            const histNegative = indicators.macdNow.histogram < 0;
+            const macdCrossDown = macdVal < macdSignalVal;
+            const histNegative = macdHistVal < 0;
             if (macdCrossDown && histNegative) {
                 sellScore += MACD_POINTS;
                 reasons.push('Strong Bearish MACD: Crossover + Negative Histogram');
@@ -419,10 +409,10 @@ export class Strategy {
             }
 
             // -------------------- MACD ZERO LINE --------------------
-            if (indicators.macdNow.MACD > 0) {
+            if (macdVal > 0) {
                 buyScore += MACD_ZERO_POINTS;
                 reasons.push('Bullish MACD above zero line');
-            } else if (indicators.macdNow.MACD < 0) {
+            } else if (macdVal < 0) {
                 sellScore += MACD_ZERO_POINTS;
                 reasons.push('Bearish MACD below zero line');
             }
@@ -489,41 +479,49 @@ export class Strategy {
             sellScore += ENGULFING_POINTS;
             reasons.push('Bearish Engulfing candle confirmed with volume surge');
         }
-
-        // -------------------- ML FEATURE VECTOR --------------------
+        // -------------------- ML PREDICTION – 5-TIER MODEL INTEGRATION (FINAL & CORRECT) --------------------
         const features = this.mlService.extractFeatures(input);
 
-        // -------------------- ML PREDICTION (add as bonus points) --------------------
-        let mlConfidence = 0;
-        let buyProb = 0;
-        let sellProb = 0;
-        if (this.mlService.isModelTrained()) {
-            buyProb = this.mlService.predict(features, 1);   // 1 = buy label
-            sellProb = this.mlService.predict(features, -1); // -1 = sell label
-            mlConfidence = Math.max(buyProb, sellProb);           // Highest probability wins
-        } else {               // Penalise untrained model
-            reasons.push('ML untrained: Confidence discounted');
-        }
+        let mlWinConfidence = 0;        // Probability of good/great trade (label 1 or 2)
+        let mlLossConfidence = 0;       // Approximate probability of loss (label -1 or -2)
+        let predictedLabel: SignalLabel = 0;
 
-        let mlBonus = 0;
-        if (buyProb > sellProb) {
-            mlBonus = buyProb * ML_BONUS_MAX;
-            buyScore += mlBonus;
-            reasons.unshift(`ML Buy Prob: ${buyProb.toFixed(2)} (+${mlBonus.toFixed(0)} points)`);
+        if (this.mlService.isReady()) {
+            const prediction = this.mlService.predict(features);  // Only 1 argument!
+
+            predictedLabel = prediction.label;        // -2, -1, 0, 1, or 2
+            mlWinConfidence = prediction.confidence;  // P(label >= 1) — already calculated in MLService
+            mlLossConfidence = 1 - mlWinConfidence;    // Rough proxy for bearish confidence
+
+            // Add bonus points based on prediction strength
+            if (predictedLabel >= 1) {
+                const bonus = mlWinConfidence * ML_BONUS_MAX;
+                buyScore += bonus;
+                reasons.unshift(`ML PREDICTS WIN (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`);
+            } else if (predictedLabel <= -1) {
+                const bonus = mlLossConfidence * ML_BONUS_MAX * 0.9; // Slightly less aggressive on shorts
+                sellScore += bonus;
+                reasons.unshift(`ML PREDICTS LOSS (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlLossConfidence * 100).toFixed(1)}%)`);
+            } else {
+                reasons.push(`ML neutral (label 0) → no bonus`);
+            }
+
+            logger.debug('ML Prediction Applied', {
+                symbol: input.symbol,
+                predictedLabel,
+                winConf: (mlWinConfidence * 100).toFixed(1) + '%',
+                lossConf: (mlLossConfidence * 100).toFixed(1) + '%',
+                buyScore: buyScore.toFixed(1),
+                sellScore: sellScore.toFixed(1),
+            });
         } else {
-            mlBonus = sellProb * ML_BONUS_MAX;
-            sellScore += mlBonus;
-            reasons.unshift(`ML Sell Prob: ${sellProb.toFixed(2)} (+${mlBonus.toFixed(0)} points)`);
+            reasons.push('ML model not ready → no prediction bonus');
+            // Optional: small discount on all technical scores
+            buyScore *= ML_CONFIDENCE_DISCOUNT;
+            sellScore *= ML_CONFIDENCE_DISCOUNT;
         }
 
-        if (!this.mlService.isModelTrained()) {
-            // Discount bonus if untrained
-            const discount = ML_CONFIDENCE_DISCOUNT;
-            buyScore -= (buyProb > sellProb ? mlBonus * (1 - discount) : 0);
-            sellScore -= (sellProb > buyProb ? mlBonus * (1 - discount) : 0);
-        }
-
-        return { buyScore, sellScore, features, mlConfidence };
+        return { buyScore, sellScore, features, mlConfidence: mlWinConfidence };
     }
 
     // ---------------------------------------------------------------
@@ -556,8 +554,7 @@ export class Strategy {
         }
 
         // ---- Dynamic score margin (easier for high scores) ----
-        const maxSideScore = Math.max(buyScore, sellScore);
-        const dynamicMargin = Math.max(SCORE_MARGIN_REQUIRED, 60 - maxSideScore * 0.3);
+        const dynamicMargin = Math.min(SCORE_MARGIN_REQUIRED, CONFIDENCE_THRESHOLD * 0.29);
 
         // ---- BUY PATH ----
         let signal: TradeSignal['signal'] = 'hold';
@@ -820,7 +817,7 @@ export class Strategy {
                 takeProfit: risk.takeProfit,
                 trailingStopDistance: risk.trailingStopDistance,
                 positionSizeMultiplier: risk.positionSizeMultiplier,
-                mlConfidence: this.mlService.isModelTrained() ? mlConfidence : undefined,
+                mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
                 features,
             };
         } catch (err) {
