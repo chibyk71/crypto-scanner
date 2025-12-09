@@ -19,11 +19,12 @@ const logger = createLogger('index');
 
 async function main() {
     try {
-        await startWorker({ lockType, scannerMode });
+        const closeAndCleanUp = await startWorker({ lockType, scannerMode });
+        return closeAndCleanUp;
     } catch (err: any) {
         logger.error('Worker encountered a fatal error', { error: err.message, stack: err.stack });
         process.exit(1);
     }
 }
 
-main();
+export const closeAndCleanUp = main();

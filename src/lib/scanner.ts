@@ -325,7 +325,7 @@ export class MarketScanner {
         // 3. Cooldown (database-backed = most reliable)
         const now = Date.now();
         if (this.opts.cooldownBackend === 'database') {
-            const { lastTradeAt } = await dbService.getCoolDown(symbol); 
+            const { lastTradeAt } = await dbService.getCoolDown(symbol);
 
             if ((now - lastTradeAt) < this.opts.cooldownMs) {
                 return;
@@ -359,11 +359,11 @@ export class MarketScanner {
         const lines = [
             `**${signal.signal.toUpperCase()} SIGNAL**`,
             `**Symbol:** ${escape(symbol)}`,
-            `**Price:** $${price.toFixed(8)}`,
-            signal.confidence ? `**Confidence:** ${signal.confidence.toFixed(0)}%` : '',
-            signal.stopLoss ? `**SL:** $${signal.stopLoss.toFixed(8)}` : '',
-            signal.takeProfit ? `**TP:** $${signal.takeProfit.toFixed(8)} (≈${config.strategy.riskRewardTarget}R)` : '',
-            signal.trailingStopDistance ? `**Trail:** $${signal.trailingStopDistance.toFixed(8)}` : '',
+            `**Price:** $${escape(price.toFixed(8))}`,
+            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
+            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
+            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} (≈${escape(config.strategy.riskRewardTarget+'')}R)` : '',
+            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
             `**Reasons:**`,
             ...signal.reason.map(r => `• ${escape(r)}`),
         ].filter(Boolean);

@@ -104,12 +104,13 @@ async function releaseDatabaseLock(): Promise<void> {
     }
 }
 
+
 /**
  * Initializes the worker and starts the market scanner and Telegram bot.
  * @param options - Configuration options for lock type, scanner mode, and retries.
  * @throws {Error} If initialization fails after maximum retries.
  */
-export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic', maxRetries: MAX_RETRIES }): Promise<void> {
+export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic', maxRetries: MAX_RETRIES }):  Promise<() => Promise<never>> {
     const { lockType = 'file', scannerMode = 'periodic', maxRetries = MAX_RETRIES } = options;
     let lockAcquired = false;
 
@@ -239,6 +240,8 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         if (scannerMode === 'single') {
             await cleanup();
         }
+
+        return cleanup;
     } catch (err) {
         logger.error('Worker failed, performing emergency cleanup', { error: err });
         try {

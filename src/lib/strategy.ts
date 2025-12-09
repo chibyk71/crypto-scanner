@@ -4,7 +4,7 @@
 // Goal: 0.5-1.5% per trade, avoid false signals, respect trend
 // ---------------------------------------------------------------
 
-import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX'; // ← Type for the ADX indicator output
+import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX';
 import type { OhlcvData, SignalLabel, TradeSignal } from '../types';                                           // ← Custom type that holds OHLCV arrays for a symbol
 import {
     calculateEMA,
@@ -124,13 +124,13 @@ const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // 
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
 const MIN_ATR_PCT = 0.75;                      // ← Realistic volatility range for crypto scalping
-const MAX_ATR_PCT = 8;
+const MAX_ATR_PCT = 20;
 
-const MIN_BB_BANDWIDTH_PCT = 1.0;             // ← Minimum Bollinger Band width percentage to avoid flat markets
+const MIN_BB_BANDWIDTH_PCT = 0.5;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
 const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative volume check
 
-const MIN_DI_DIFF = 3;                       // ← Minimum difference between +DI and -DI for trend dominance
+const MIN_DI_DIFF = 4;                       // ← Minimum difference between +DI and -DI for trend dominance
 
 // ---------------------------------------------------------------
 // STRATEGY CLASS: Core logic

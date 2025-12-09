@@ -7,6 +7,7 @@ import { createLogger } from '../logger';
 import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
 import { Condition } from '../../types';
+import { closeAndCleanUp } from '../..';
 
 const logger = createLogger('TelegramBot');
 
@@ -121,6 +122,7 @@ export class TelegramBotController {
         this.bot.onText(/\/ml_performance/, this.handleMLPerformance);
         this.bot.onText(/\/positions/, this.handlePositions);
         this.bot.onText(/\/trades/, this.handleTrades);
+        this.bot.onText(/\/stopbot/, this.handleStopBot);
 
         this.bot.on('message', this.handleMessage);
         this.bot.on('callback_query', this.handleCallbackQuery);
@@ -208,6 +210,39 @@ export class TelegramBotController {
             } catch (error) {
                 await this.bot.sendMessage(chatId, 'Invalid input. Please enter a number, range (min-max, e.g., 20-80), or indicator (e.g., ema_200).');
             }
+        }
+    }
+
+    /**
+ * Handles the /stopbot command.
+ * Stops the Telegram bot, clears all user states, and optionally releases DB lock.
+ * Only works in production (when bot is actually running via worker).
+ * @param msg - Incoming Telegram message.
+ * @private
+ */
+    private handleStopBot = async (msg: TelegramBot.Message): Promise<void> => {
+        const chatId = msg.chat.id;
+        if (!this.isAuthorized(chatId)) return;
+
+        logger.warn('Stopbot command received', { user: msg.from?.username || msg.from?.id });
+
+        try {
+            // 1. Stop polling immediately
+            // closeAndCleanUp is a Promise that resolves to the actual cleanup function; await it first, then call it.
+            const cleanupFn = await closeAndCleanUp;
+            if (typeof cleanupFn === 'function') {
+                await cleanupFn();
+            } else {
+                logger.warn('closeAndCleanUp did not return a callable cleanup function');
+            }
+
+            // 3. Clear all user states from memory
+            const clearedCount = this.userStates.size;
+            this.userStates.clear();
+            logger.info(`Cleared ${clearedCount} user states from memory`);
+        } catch (error) {
+            logger.error('Unexpected error in /stopbot handler', { error });
+            await this.bot.sendMessage(chatId, 'Error during shutdown. Check logs.');
         }
     }
 
@@ -722,6 +757,7 @@ export class TelegramBotController {
             '• `/start` - Display this help message.\n' +
             '• `/help` - Display this help message.\n' +
             '• `/status` - Check worker health, lock status, and exchange connection.\n' +
+            '• `/stopbot` - Emergency stop: stops bot polling, clears memory, releases DB lock (use before restarting worker)\n' +
             '• `/alerts` - List all active custom alerts with pagination.\n' +
             '• `/create_alert` - Create a new custom alert with step-by-step configuration.\n' +
             '• `/edit_alert` - Edit an existing alert (symbol, timeframe, conditions).\n' +
