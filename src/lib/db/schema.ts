@@ -1,6 +1,7 @@
 // src/lib/db/schema.ts
-import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, } from 'drizzle-orm/mysql-core';
+import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float } from 'drizzle-orm/mysql-core';
 import type { Condition } from '../../types';
+import type { SimulationHistoryEntry } from '../../types/signalHistory';
 
 /**
  * =============================================================================
@@ -28,61 +29,140 @@ export const session = mysqlTable('session', {
 /**
  * =============================================================================
  * ALERT SYSTEM
- *  Alert table for storing user-defined trading alerts.=============================================================================
+ * =============================================================================
+ *
+ * Custom user-defined alerts allow traders to be notified when specific market
+ * conditions are met on a chosen symbol and timeframe.
+ *
+ * Features:
+ *   • Flexible JSON conditions (multiple AND logic)
+ *   • Cooldown via lastAlertAt to prevent spam
+ *   • Status tracking (active/triggered/canceled)
+ *   • Optional note for user reference
+ *
+ * Used by:
+ *   • TelegramBotController – create/edit/delete via commands
+ *   • MarketScanner – evaluates conditions every cycle
+ *   • AlertEvaluatorService – actual condition checking
  */
 export const alert = mysqlTable('alert', {
+    /** Auto-incrementing primary key */
     id: int('id').primaryKey().autoincrement(),
+
+    /** Trading pair (e.g., 'BTC/USDT') – required */
     symbol: varchar('symbol', { length: 50 }).notNull(),
+
+    /** Array of conditions in JSON format – parsed to Condition[] in TypeScript */
     conditions: json('conditions').$type<Condition[]>().notNull(),
+
+    /** Timeframe for evaluation (e.g., '1h', '15m') – defaults to 1h */
     timeframe: varchar('timeframe', { length: 10 }).notNull().default('1h'),
-    status: varchar('status', { length: 20 }).notNull().default('active'), // active, triggered, canceled
+
+    /** Current status – 'active' = monitored, 'triggered'/'canceled' = inactive */
+    status: varchar('status', { length: 20 }).notNull().default('active'),
+
+    /** When the alert was created */
     createdAt: timestamp('created_at').defaultNow(),
+
+    /** Optional free-text note from the user (e.g., "Watch for breakout") */
     note: varchar('note', { length: 255 }),
-    lastAlertAt: bigint('last_alert_at', { mode: 'number' }).default(0), // epoch ms
+
+    /** Unix millisecond timestamp of last trigger – used for cooldown/throttling */
+    lastAlertAt: bigint('last_alert_at', { mode: 'number' }).default(0),
 });
 
 /**
  * =============================================================================
  * BOT CONTROL TABLES
  * =============================================================================
+ *
+ * These singleton tables prevent multiple bot instances from running simultaneously
+ * and track scan cycle progress.
  */
 
 /**
- * Locks table for preventing concurrent bot executions.
+ * Singleton lock table – ensures only one bot instance runs at a time
+ *
+ * Design:
+ *   • Fixed id = 1 (singleton row)
+ *   • isLocked = true → another instance holds the lock
+ *   • Worker checks this on startup and sets to true when running
+ *   • Graceful shutdown sets to false
  */
 export const locks = mysqlTable('locks', {
-    id: int('id').primaryKey(), // singleton row, id = 1
+    /** Fixed primary key – only one row ever exists */
+    id: int('id').primaryKey(),
+
+    /** Lock state – true = bot running, false = idle */
     isLocked: boolean('is_locked').notNull().default(false),
 });
 
 /**
- * Heartbeat table for tracking bot scan cycles.
+ * Heartbeat table – tracks scan cycles and last activity
+ *
+ * Purpose:
+ *   • Monitor bot health and uptime
+ *   • Send periodic heartbeat messages via Telegram
+ *   • Detect stalled/crashed workers
+ *
+ * Fields:
+ *   • cycleCount – total completed scan cycles
+ *   • lastHeartbeatAt – timestamp of most recent cycle
  */
 export const heartbeat = mysqlTable('heartbeat', {
-    id: int('id').primaryKey(), // singleton row, id = 1
+    /** Fixed primary key – singleton row */
+    id: int('id').primaryKey(),
+
+    /** Running count of completed full market scan cycles */
     cycleCount: int('cycle_count').notNull().default(0),
+
+    /** Unix millisecond timestamp of last completed cycle */
     lastHeartbeatAt: bigint('last_heartbeat_at', { mode: 'number' }).notNull().default(0),
 });
 
 /**
  * =============================================================================
  * ML TRAINING SAMPLES
- * Stores feature vectors + final 5-tier label (-2 to +2)
- * Used directly for Random Forest / XGBoost training
  * =============================================================================
+ *
+ * Stores feature vectors and final 5-tier labels (-2 to +2) from simulated trades.
+ * This is the primary dataset used to train the Random Forest model.
+ *
+ * Key features:
+ *   • features: JSON array of normalized numbers (parsed to number[] in TS)
+ *   • label: -2 (big loss) → +2 (strong win) based on R-multiple
+ *   • Indexes on symbol, label, and createdAt for fast analytics and retraining
+ *
+ * Used by:
+ *   • MLService – training, prediction, and performance reporting
+ *   • DatabaseService – ingestion after every simulation
  */
 export const trainingSamples = mysqlTable(
     'training_samples',
     {
+        /** Auto-incrementing primary key */
         id: int('id').primaryKey().autoincrement(),
+
+        /** Trading symbol the sample came from – for per-symbol analysis */
         symbol: varchar('symbol', { length: 50 }).notNull(),
-        features: json('features').$type<number[]>().notNull(), // normalized float array
-        label: int('label').notNull(), // -2 = big loss, -1 = loss, 0 = neutral, 1 = win, 2 = strong win
+
+        /** Normalized feature vector – stored as JSON, parsed to number[] */
+        features: json('features').$type<number[]>().notNull(),
+
+        /** Final 5-tier outcome label (-2 to +2) */
+        label: int('label').notNull(),
+
+        /** When the sample was created (simulation close time) */
         createdAt: timestamp('created_at').defaultNow(),
     },
     (table) => ({
+        /** Index for per-symbol performance queries */
         symbolIdx: index('idx_training_symbol').on(table.symbol),
+
+        /** Index for label distribution queries */
         labelIdx: index('idx_training_label').on(table.label),
+
+        /** Index for chronological retrieval */
         createdAtIdx: index('idx_training_created').on(table.createdAt),
     })
 );
@@ -91,17 +171,41 @@ export const trainingSamples = mysqlTable(
  * =============================================================================
  * EXECUTED TRADES (LIVE OR PAPER)
  * =============================================================================
+ *
+ * Permanent log of all real executed trades (live or paper/testnet mode).
+ *
+ * Purpose:
+ *   • Audit trail
+ *   • Performance tracking
+ *   • Future tax/export needs
+ *
+ * All monetary values stored with high precision (×1e8 internally)
+ *
+ * Used by:
+ *   • AutoTradeService – after placing live orders
+ *   • TelegramBot – /trades command
  */
 export const trades = mysqlTable(
     'trades',
     {
         id: int('id').primaryKey().autoincrement(),
+
         symbol: varchar('symbol', { length: 50 }).notNull(),
         side: varchar('side', { length: 10 }).notNull(), // 'buy' | 'sell'
-        amount: float('amount').notNull(), // raw quantity × 1e8 (for precision)
-        price: float('price').notNull(),   // price × 1e8
+
+        /** Quantity ×1e8 for precision (avoids floating point issues) */
+        amount: float('amount').notNull(),
+
+        /** Entry price ×1e8 */
+        price: float('price').notNull(),
+
+        /** Unix millisecond timestamp */
         timestamp: bigint('timestamp', { mode: 'number' }).notNull(),
-        mode: varchar('mode', { length: 10 }).notNull(), // 'live' | 'paper'
+
+        /** 'live' or 'paper' – distinguishes real vs test trades */
+        mode: varchar('mode', { length: 10 }).notNull(),
+
+        /** Exchange order ID for reconciliation */
         orderId: varchar('order_id', { length: 50 }).notNull(),
     },
     (table) => ({
@@ -113,55 +217,64 @@ export const trades = mysqlTable(
 /**
  * =============================================================================
  * SIMULATED TRADES – CORE OF ML LABELING ENGINE
- *
- * This table stores every simulated trade outcome with:
- * • Partial take-profits (multiple levels)
- * • Trailing stop support
- * • Max Favorable/Adverse Excursion (MFE/MAE)
- * • R-multiple & final 5-tier label
- *
- * All monetary values stored as integers × 1e8 (8 decimals) → no floating point errors
  * =============================================================================
+ *
+ * Records every simulated trade with full outcome details.
+ * This is the source of truth for ML training labels and excursion metrics.
+ *
+ * High-precision storage:
+ *   • All prices/distances: ×1e8
+ *   • MFE/MAE: ×1e4 (percentage of entry price)
+ *   • PnL: ×1e8
+ *   • R-multiple: ×1e4
+ *
+ * Supports:
+ *   • Partial take-profits (multiple levels)
+ *   • Trailing stops
+ *   • Timeout exits
+ *   • Max Favorable/Adverse Excursion tracking
  */
 export const simulatedTrades = mysqlTable(
     'simulated_trades',
     {
         id: int('id').primaryKey().autoincrement(),
 
-        // Unique identifier for in-memory tracking
-        signalId: varchar('signal_id', { length: 36 }).notNull().unique(), // UUID v4
+        /** UUID linking open → close operations */
+        signalId: varchar('signal_id', { length: 36 }).notNull().unique(),
 
         symbol: varchar('symbol', { length: 50 }).notNull(),
         side: varchar('side', { length: 10 }).notNull(), // 'buy' | 'sell'
 
-        // Entry
-        entryPrice: float('entry_price').notNull(), // × 1e8
+        /** Entry price ×1e8 */
+        entryPrice: float('entry_price').notNull(),
 
-        // Risk Management
-        stopLoss: float('stop_loss'),           // fixed SL × 1e8
-        trailingDist: float('trailing_dist'),   // trailing distance × 1e8
+        stopLoss: float('stop_loss'),                    // Fixed SL ×1e8
+        trailingDist: float('trailing_dist'),            // Trailing distance ×1e8
 
-        // Multiple Take-Profit Levels (partial fills)
-        // Example: [{ price: 65000, weight: 0.5 }, { price: 68000, weight: 0.5 }]
+        /** Partial TP levels – array of { price ×1e8, weight } */
         tpLevels: json('tp_levels').$type<{ price: number; weight: number }[]>(),
 
-        // Timestamps
         openedAt: bigint('opened_at', { mode: 'number' }).notNull(),
         closedAt: bigint('closed_at', { mode: 'number' }),
 
-        // Outcome
-        outcome: varchar('outcome', { length: 15 }), // 'tp' | 'partial_tp' | 'sl' | 'timeout'
+        outcome: varchar('outcome', { length: 15 }),     // 'tp', 'partial_tp', 'sl', 'timeout'
 
-        // Results
-        pnl: bigint('pnl', { mode: 'number' }).notNull(),                 // realized PnL × 1e8 (e.g. 0.0567 → 5670000)
-        rMultiple: bigint('r_multiple', { mode: 'number' }),              // × 1e4 (e.g. 2.374 → 23740)
+        /** Realized PnL ×1e8 */
+        pnl: bigint('pnl', { mode: 'number' }).notNull(),
 
-        // ML Label: stored directly → no recompute needed during training
-        label: int('label'), // -2 | -1 | 0 | 1 | 2
+        /** R-multiple ×1e4 */
+        rMultiple: bigint('r_multiple', { mode: 'number' }),
 
-        // Excursion Metrics (extremely powerful features for ML)
-        maxFavorableExcursion: bigint('mfe', { mode: 'number' }), // best unrealion price movement × 1e8
-        maxAdverseExcursion: bigint('mae', { mode: 'number' }),   // worst price movement × 1e8
+        /** Final 5-tier label for ML */
+        label: int('label'),
+
+        /** Max Favorable Excursion as % ×1e4 */
+        maxFavorableExcursion: bigint('mfe', { mode: 'number' }),
+
+        /** Max Adverse Excursion as % ×1e4 */
+        maxAdverseExcursion: bigint('mae', { mode: 'number' }),
+
+        durationMs: bigint('duration_ms', { mode: 'number' }).default(0),
     },
     (table) => ({
         signalIdIdx: index('idx_sim_signal_id').on(table.signalId),
@@ -170,19 +283,108 @@ export const simulatedTrades = mysqlTable(
         outcomeIdx: index('idx_sim_outcome').on(table.outcome),
         labelIdx: index('idx_sim_label').on(table.label),
         closedAtIdx: index('idx_sim_closed').on(table.closedAt),
+        durationIdx: index('idx_sim_duration').on(table.durationMs),
     })
 );
 
+/**
+ * =============================================================================
+ * COOLDOWN TABLE – PER-SYMBOL THROTTLING
+ * =============================================================================
+ *
+ * Prevents signal/trade spam on the same symbol.
+ * One row per symbol with last action timestamp.
+ *
+ * Used by:
+ *   • MarketScanner – cooldown between signals
+ *   • Custom alerts – throttle notifications
+ */
 export const coolDownTable = mysqlTable('cool_down', {
     id: int('id').primaryKey().autoincrement(),
-    symbol: varchar('symbol', {length: 15}).unique(),
-    lastTradeAt: bigint('last_trade_at', {mode: 'number'}).notNull(),
-})
+
+    /** Unique per symbol – ensures only one row exists */
+    symbol: varchar('symbol', { length: 15 }).unique(),
+
+    /** Last trade or alert timestamp (Unix ms) */
+    lastTradeAt: bigint('last_trade_at', { mode: 'number' }).notNull(),
+});
+
+/**
+ * =============================================================================
+ * SYMBOL HISTORY – DENORMALIZED FAST-LOOKUP TABLE
+ * =============================================================================
+ *
+ * Purpose:
+ *   • Provides **instant access** to per-symbol performance and excursion stats
+ *   • Eliminates expensive real-time calculations during every scan
+ *   • Powers:
+ *       - Strategy: dynamic SL/TP and confidence adjustments
+ *       - AutoTradeService: risk filtering (high MAE skip)
+ *       - Telegram: /excursions command and signal alerts
+ *       - Future dashboard or analytics
+ *
+ * Why denormalized?
+ *   • Updated only when a simulation closes (very low write frequency)
+ *   • Read thousands of times per scan cycle → must be lightning-fast
+ *   • Single-row per symbol = O(1) lookup
+ *
+ * Key fields explained:
+ *   • historyJson: last 10 simulations (for detailed history view)
+ *   • avgR: average R-multiple (risk-adjusted return)
+ *   • winRate: % of profitable simulations
+ *   • reverseCount: how many recent wins went opposite to current signal
+ *   • avgMae / avgMfe / avgExcursionRatio: excursion metrics for adaptive trading
+ */
+export const symbolHistory = mysqlTable('symbol_history', {
+    /** Primary key and unique identifier – one row per trading pair */
+    symbol: varchar('symbol', { length: 50 }).primaryKey(), // e.g., 'BTC/USDT'
+
+    /** JSON array of the 10 most recent SimulationHistoryEntry objects (newest first) */
+    historyJson: json('history_json').$type<SimulationHistoryEntry[]>().notNull().default([]),
+
+    /** Average R-multiple across all simulations for this symbol */
+    avgR: float('avg_r').notNull().default(0.0),
+
+    /** Win rate percentage (label >= 1) – 0.75 = 75% winning simulations */
+    winRate: float('win_rate').notNull().default(0.0),
+
+    /** Number of recent simulations that went opposite to the latest signal direction */
+    reverseCount: int('reverse_count').notNull().default(0),
+
+    /** Average Max Adverse Excursion – normalized as % of entry price */
+    avgMae: float('avg_mae').notNull().default(0.0),  // e.g., 1.85% average drawdown
+
+    /** Average Max Favorable Excursion – normalized as % of entry price */
+    avgMfe: float('avg_mfe').notNull().default(0.0),  // e.g., 4.32% average best unrealized profit
+
+    /** MFE / MAE ratio – key indicator of reward-to-risk efficiency */
+    avgExcursionRatio: float('avg_excursion_ratio').notNull().default(0.0), // e.g., 2.33
+
+    /** Timestamp of last update – automatically set on insert/update */
+    updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
+}, (table) => ({
+    /** Index on symbol – automatically created by primary key, kept for clarity */
+    symbolIdx: index('idx_symbol_history_symbol').on(table.symbol),
+
+    /** Composite index on MAE and MFE for fast filtering of risky/rewarding symbols */
+    excursionIdx: index('idx_symbol_history_excursions').on(table.avgMae, table.avgMfe),
+}));
 
 /**
  * =============================================================================
  * TYPE INFERENCE (TypeScript magic)
  * =============================================================================
+ *
+ * Drizzle automatically generates TypeScript types from table definitions.
+ * These types are used throughout the app for:
+ *   • Type-safe database queries
+ *   • Insert/update operations
+ *   • API responses and internal data flow
+ *
+ * Benefits:
+ *   • No manual type duplication
+ *   • Instant refactor safety
+ *   • Full IDE autocomplete and error checking
  */
 export type Session = typeof session.$inferSelect;
 export type User = typeof user.$inferSelect;
@@ -194,7 +396,7 @@ export type Lock = typeof locks.$inferSelect;
 export type Heartbeat = typeof heartbeat.$inferSelect;
 
 export type CoolDown = typeof coolDownTable.$inferSelect;
-export  type NewCoolDown = typeof coolDownTable.$inferInsert;
+export type NewCoolDown = typeof coolDownTable.$inferInsert;
 
 export type TrainingSample = typeof trainingSamples.$inferSelect;
 export type NewTrainingSample = typeof trainingSamples.$inferInsert;
@@ -202,7 +404,13 @@ export type NewTrainingSample = typeof trainingSamples.$inferInsert;
 export type Trade = typeof trades.$inferSelect;
 export type NewTrade = typeof trades.$inferInsert;
 
+/** Full symbol history row with parsed JSON */
+export type SymbolHistory = typeof symbolHistory.$inferSelect;
+/** Data shape for inserting/updating symbol history */
+export type NewSymbolHistory = typeof symbolHistory.$inferInsert;
+
 export type SimulatedTrade = typeof simulatedTrades.$inferSelect;
+/** Data for starting a new simulation (excludes auto-generated fields) */
 export type NewSimulatedTrade = Omit<
     typeof simulatedTrades.$inferInsert,
     'signalId' | 'openedAt' | 'closedAt' | 'outcome' | 'pnl' | 'rMultiple' | 'label' | 'maxFavorableExcursion' | 'maxAdverseExcursion'

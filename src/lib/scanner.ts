@@ -1,32 +1,53 @@
 // src/lib/scanner.ts
 // =============================================================================
-// MARKET SCANNER – CORE ENGINE
-// Scans all symbols → generates signals → simulates outcomes → trains ML model
-// Fully compatible with your new 5-tier labeling (-2 to +2) and new DB schema
+// MARKET SCANNER – CORE ENGINE OF THE ENTIRE TRADING BOT
+//
+// Purpose:
+//   • Orchestrates the full trading pipeline on every scan cycle
+//   • Fetches market data → generates signals → simulates outcomes → trains ML
+//   • Sends Telegram alerts and executes live trades via AutoTradeService
+//   • Evaluates custom user alerts
+//   • Runs either periodically (production) or once (testing/debugging)
+//
+// Key Features:
+//   • Highly concurrent symbol processing with jitter to avoid rate limits
+//   • Smart HTF (higher timeframe) caching to reduce API calls
+//   • Robust cooldown and deduplication to prevent spam
+//   • Integrated excursion insights in Telegram alerts
+//   • Fire-and-forget simulation and live trading
+//   • Comprehensive error handling and retry logic
+//   • Heartbeat monitoring for operational visibility
 // =============================================================================
 
 import { ExchangeService } from './services/exchange';
 import { dbService } from './db';
 import { Strategy } from './strategy';
+import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
 import { createLogger } from './logger';
 import { config } from './config/settings';
 import type { OhlcvData, SignalLabel, TradeSignal } from '../types';
 import { AlertEvaluatorService } from './services/alertEvaluator';
-import { mlService } from './services/mlService';                    // ← Singleton MLService
+import { mlService } from './services/mlService';
 import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
+import { getExcursionAdvice } from './utils/excursionUtils';           // ← For enriched Telegram alerts
 
 const logger = createLogger('MarketScanner');
 
+/** Supported running modes */
 type ScannerMode = 'single' | 'periodic';
+
+/** Cooldown storage backend – database is more reliable across restarts */
 type CooldownBackend = 'database' | 'memory';
 
+/** Cached higher-timeframe data to avoid redundant API calls */
 interface CachedHtf {
     data: OhlcvData;
-    lastCloseTime: number;      // Timestamp of last closed HTF candle
-    lastFetchTime: number;  // When we last fetched from API
+    lastCloseTime: number;      // Timestamp when last HTF candle closed
+    lastFetchTime: number;      // When we last fetched fresh data
 }
 
+/** Configuration options for scanner behavior */
 type ScannerOptions = {
     mode?: ScannerMode;
     intervalMs?: number;
@@ -40,39 +61,46 @@ type ScannerOptions = {
 };
 
 /**
- * Main scanner class — heart of the entire trading system
+ * MarketScanner – The beating heart of the bot
+ *
  * Responsibilities:
- *  • Fetch fresh market data (primary + HTF)
- *  • Generate signals using Strategy
- *  • Filter signals (R:R, cooldown, deduplication)
- *  • Send Telegram alerts
- *  • Simulate every signal → get real PnL & R-multiple
- *  • Feed outcome into MLService for continuous training
+ *   • Coordinate all symbols in parallel
+ *   • Manage scan lifecycle (periodic or single-run)
+ *   • Handle signal deduplication and cooldown
+ *   • Trigger simulations, ML training, alerts, and live trading
+ *   • Provide operational monitoring (heartbeat)
  */
 export class MarketScanner {
-    private running = false;
-    private isScanning = false;
+    // Runtime state flags
+    private running = false;           // Is the scanner active?
+    private isScanning = false;        // Is a scan cycle currently in progress?
     private scanTimer: NodeJS.Timeout | null = null;
-    private scanCount = 0;
+    private scanCount = 0;             // Local counter when not using DB heartbeat
 
-    // Cooldown & deduplication tracking
-    private lastAlertAt: Record<string, number> = {};           // memory backend only
+    // Deduplication and cooldown tracking
+    private lastAlertAt: Record<string, number> = {};           // Memory backend only
     private lastSignal: Record<string, { signal: TradeSignal; price: number }> = {};
 
-    // Higher Timeframe cache – avoid fetching 1h data every 3 minutes
+    // Higher-timeframe cache – reduces API load dramatically
     private htfCache: Record<string, CachedHtf> = {};
 
+    // Evaluates custom user-defined alerts
     private alertEvaluator = new AlertEvaluatorService();
 
+    // Final resolved configuration with defaults applied
     private readonly opts: Required<ScannerOptions>;
 
+    // Dedicated service for safe, excursion-aware live trading
+    private readonly autoTradeService: AutoTradeService;
+
     /**
-     * Initializes the MarketScanner with dependencies and configuration.
-     * @param exchangeService - Service for fetching market data and executing trades.
-     * @param telegramService - Service for sending Telegram notifications.
-     * @param strategy - Strategy instance for generating trade signals.
-     * @param symbols - Array of symbols to scan (e.g., ['BTC/USDT', 'ETH/USDT']).
-     * @param opts - Scanner configuration options.
+     * Initializes the MarketScanner with all required dependencies.
+     *
+     * @param exchangeService - Handles market data and order execution
+     * @param telegramService - Optional: for sending alerts and status updates
+     * @param strategy - Core signal generation logic
+     * @param symbols - List of trading pairs to monitor
+     * @param opts - Optional overrides for scanner behavior
      */
     constructor(
         private readonly exchangeService: ExchangeService,
@@ -85,14 +113,17 @@ export class MarketScanner {
             mode: 'periodic',
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 4,
-            cooldownMs: 8 * 60_1000,           // 8 minutes between signals per symbol
+            cooldownMs: 5 * 60_1000,
             jitterMs: 300,
-            retries: 2,
+            retries: 3,
             heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
             requireAtrFeasibility: true,
             cooldownBackend: 'database',
             ...opts,
         };
+
+        // ← Initialize AutoTradeService with exchange and db
+        this.autoTradeService = new AutoTradeService(this.exchangeService);
 
         logger.info(`MarketScanner initialized for ${symbols.length} symbols`, {
             mode: this.opts.mode,
@@ -101,54 +132,105 @@ export class MarketScanner {
         });
     }
 
-    // ===========================================================================
-    // PUBLIC CONTROL METHODS
-    // ===========================================================================
+    // =========================================================================
+    // PUBLIC CONTROL: Start the scanner (periodic or single-run mode)
+    // =========================================================================
     /**
-     * Starts the scanner in single or periodic mode.
-     * - Periodic mode runs scans at regular intervals.
-     * - Single mode runs one scan and stops.
-     * @throws {Error} If scanner is already running.
+     * Starts the MarketScanner in the configured mode.
+     *
+     * Called from:
+     *   • Main application entry point (worker startup)
+     *   • Manual restart commands
+     *
+     * Behavior:
+     *   • Prevents duplicate starts
+     *   • Clears OHLCV cache for fresh data
+     *   • Periodic mode: runs immediately + sets interval timer
+     *   • Single mode: runs once and stops
+     *
+     * Important:
+     *   • First scan runs synchronously (await) to catch startup errors early
      */
     public async start(): Promise<void> {
+        // Prevent starting multiple instances
         if (this.running) {
             logger.warn('Scanner already running');
             return;
         }
         this.running = true;
 
+        // Clear any cached candle data – ensures fresh market view on (re)start
         this.exchangeService.clearCache();
         logger.info('OHLCV cache cleared on start');
 
         if (this.opts.mode === 'periodic') {
-            await this.scanAllSymbols(); // immediate first scan
+            // Run first scan immediately (synchronous) for fast feedback
+            await this.scanAllSymbols();
+
+            // Schedule recurring scans
             this.scanTimer = setInterval(() => void this.scanAllSymbols(), this.opts.intervalMs);
             logger.info(`Periodic scanning started every ${this.opts.intervalMs / 1000}s`);
         } else {
+            // Single-run mode (useful for testing or one-off scans)
             await this.scanAllSymbols();
             this.running = false;
         }
     }
 
+    // =========================================================================
+    // PUBLIC CONTROL: Stop the scanner gracefully
+    // =========================================================================
+    /**
+     * Stops the scanner and cleans up resources.
+     *
+     * Called from:
+     *   • Graceful shutdown handlers (SIGTERM, /stopbot command)
+     *   • End of single-run mode
+     *
+     * Behavior:
+     *   • Clears interval timer
+     *   • Sets running flag to false
+     *   • Safe even if timer doesn't exist
+     */
     public stop(): void {
         this.running = false;
+
+        // Clear recurring scan timer if active
         if (this.scanTimer) {
             clearInterval(this.scanTimer);
             this.scanTimer = null;
         }
+
         logger.info('MarketScanner stopped');
     }
 
-    // ===========================================================================
-    // MAIN SCAN CYCLE
-    // ===========================================================================
+    // =========================================================================
+    // MAIN SCAN CYCLE: Process all symbols in parallel
+    // =========================================================================
+    /**
+     * Executes a full market scan cycle across all configured symbols.
+     *
+     * Responsibilities:
+     *   • Prevent overlapping scans
+     *   • Track cycle count (via DB heartbeat or local counter)
+     *   • Launch concurrent workers for speed
+     *   • Evaluate custom alerts after data refresh
+     *   • Send periodic heartbeat messages
+     *   • Comprehensive error handling with Telegram notification
+     *
+     * @private – called by timer or start()
+     */
     private async scanAllSymbols(): Promise<void> {
+        // Prevent concurrent scans (race condition protection)
         if (this.isScanning) {
             logger.warn('Previous scan still running – skipping');
             return;
         }
         this.isScanning = true;
+
         const start = Date.now();
+
+        // Get current cycle number – DB for persistence, local for testing
         const cycle = this.opts.cooldownBackend === 'database'
             ? await dbService.incrementHeartbeatCount()
             : ++this.scanCount;
@@ -156,17 +238,18 @@ export class MarketScanner {
         logger.info(`Scan cycle #${cycle} started`, { symbols: this.symbols.length });
 
         try {
-            // Process all symbols in parallel with limited concurrency
+            // Create work queue and launch concurrent workers
             const queue = [...this.symbols];
-            const workers = Array.from({ length: Math.min(this.opts.concurrency, queue.length) }, () =>
-                this.processWorker(queue)
+            const workers = Array.from(
+                { length: Math.min(this.opts.concurrency, queue.length) },
+                () => this.processWorker(queue)
             );
             await Promise.all(workers);
 
-            // Check custom user alerts after all data is fresh
+            // Evaluate user-defined custom alerts with fresh data
             await this.checkCustomAlerts();
 
-            // Send heartbeat every N cycles
+            // Periodic heartbeat for monitoring (every N cycles)
             if (cycle % this.opts.heartbeatCycles === 0) {
                 const duration = Date.now() - start;
                 const msg = `Heartbeat: Scan #${cycle} completed in ${duration}ms | ${this.symbols.length} symbols`;
@@ -174,55 +257,83 @@ export class MarketScanner {
                 logger.info(msg);
             }
         } catch (err) {
+            // Critical error – entire cycle failed
             logger.error('Scan cycle crashed', { error: err });
             await this.telegramService?.sendMessage(`Scan failed: ${(err as Error).message}`);
         } finally {
+            // Always reset flag – prevents permanent lock on crash
             this.isScanning = false;
             logger.info(`Scan cycle #${cycle} finished in ${Date.now() - start}ms`);
         }
     }
 
+    // =========================================================================
+    // WORKER POOL: Process symbols concurrently from shared queue
+    // =========================================================================
     /**
-     * Processes the symbol queue for concurrent scanning.
-     * - Applies jitter to prevent API rate limit issues.
-     * @param queue - Array of symbols to process.
+     * Worker function that pulls symbols from queue and processes them.
+     *
+     * Design:
+     *   • Multiple workers run in parallel (controlled by concurrency option)
+     *   • Shared queue ensures even distribution
+     *   • Jitter delay spreads API requests to avoid rate limits
+     *   • Wrapped in retry logic for resilience
+     *
+     * @param queue - Shared array of remaining symbols
      * @private
      */
     private async processWorker(queue: string[]): Promise<void> {
+        // Continue until queue is empty
         while (queue.length) {
             const symbol = queue.shift();
             if (!symbol) break;
-            // Random delay between 0 and jitterMs to spread API calls
+
+            // Random jitter to avoid thundering herd on exchange API
             if (this.opts.jitterMs > 0) {
                 await new Promise(r => setTimeout(r, Math.random() * this.opts.jitterMs));
             }
+
+            // Process with retry wrapper for transient errors
             await this.withRetries(() => this.processSymbol(symbol), this.opts.retries);
         }
     }
 
-    // ===========================================================================
-    // PROCESS SINGLE SYMBOL
-    // ===========================================================================
+    // =========================================================================
+    // PER-SYMBOL PROCESSING: Core logic for one trading pair
+    // =========================================================================
     /**
-     * Processes a single symbol, generating and acting on trade signals.
-     * - Fetches OHLCV data, generates signals, and executes trades if applicable.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @private
+     * Processes a single symbol from end to end:
+     *   • Fetch primary + HTF data
+     *   • Generate signal via Strategy
+     *   • If valid signal → handle alert/simulation/trading
+     *
+     * Called from:
+     *   • processWorker() – concurrent workers
+     *
+     * Error handling:
+     *   • Wrapped in try/catch → individual symbol failure doesn't crash entire scan
+     *   • Logs error and continues with other symbols
      */
     private async processSymbol(symbol: string): Promise<void> {
         try {
-            // 1. Get primary timeframe data (e.g. 3m)
+            // Fetch fast timeframe data (e.g., 3m) – required for signals
             const primaryData = await this.getPrimaryData(symbol);
-            if (!primaryData || primaryData.closes.length < config.historyLength) return;
+            if (!primaryData || primaryData.closes.length < config.historyLength) {
+                // Not enough candles yet – skip silently
+                return;
+            }
 
-            // 2. Get higher timeframe data (e.g. 1h) – smart caching
+            // Fetch higher timeframe data (e.g., 1h) – used for trend filtering
             const htfData = await this.getHtfData(symbol);
-            if (!htfData || htfData.closes.length < config.historyLength) return;
+            if (!htfData || htfData.closes.length < config.historyLength) {
+                return;
+            }
 
+            // Current market price = last close of primary timeframe
             const currentPrice = primaryData.closes.at(-1)!;
 
-            // 3. Generate signal
-            const signal = this.strategy.generateSignal({
+            // Generate signal using full context
+            const signal = await this.strategy.generateSignal({
                 symbol,
                 primaryData,
                 htfData,
@@ -232,68 +343,113 @@ export class MarketScanner {
                 trailingStopPercent: config.strategy.trailingStopPercent,
             });
 
+            // Only proceed if strategy returned a buy/sell (not hold)
             if (signal.signal !== 'hold') {
                 await this.handleTradeSignal(symbol, signal, currentPrice, primaryData, htfData);
             }
         } catch (err) {
+            // Individual symbol failure – log but continue scanning others
             logger.error(`Failed processing ${symbol}`, { error: err });
         }
     }
 
+    // =========================================================================
+    // DATA FETCHING: Primary timeframe (fast) OHLCV
+    // =========================================================================
+    /**
+     * Gets primary timeframe data with preference for in-memory live cache.
+     *
+     * Priority:
+     *   1. Use live in-memory cache if sufficient length
+     *   2. Fallback to fresh API fetch
+     *
+     * @param symbol - Trading pair
+     * @returns OhlcvData or null if insufficient
+     */
     private async getPrimaryData(symbol: string): Promise<OhlcvData | null> {
+        // Try fast path: live cache (updated in real-time by exchange service)
         const live = this.exchangeService.getPrimaryOhlcvData(symbol);
         if (live && live.length >= config.historyLength) {
+            // Slice to required length and convert format
             return this.exchangeService.toOhlcvData(live.slice(-config.historyLength), symbol);
         }
-        // Fallback to API fetch
+
+        // Slow path: fetch fresh from exchange API
         return await this.exchangeService.getOHLCV(
             symbol,
             config.scanner.primaryTimeframe,
             undefined,
             undefined,
-            true
+            true  // Force fresh fetch
         );
     }
 
+    // =========================================================================
+    // DATA FETCHING: Higher timeframe (HTF) with smart caching
+    // =========================================================================
+    /**
+     * Gets HTF data with aggressive caching to minimize API calls.
+     *
+     * Caching logic:
+     *   • Refresh when new HTF candle closes
+     *   • Refresh if >5 minutes old (stale safety)
+     *   • Stores last close time and fetch time
+     *
+     * Dramatically reduces load on exchange API
+     *
+     * @param symbol - Trading pair
+     * @returns OhlcvData or null
+     */
     private async getHtfData(symbol: string): Promise<OhlcvData | null> {
         const tf = config.scanner.htfTimeframe;
-        const ms = ExchangeService.toTimeframeMs(tf);
+        const ms = ExchangeService.toTimeframeMs(tf);           // e.g., 1h = 3600000 ms
         const now = Date.now();
-        const currentCandleStart = Math.floor(now / ms) * ms;
+        const currentCandleStart = Math.floor(now / ms) * ms;    // Start of current HTF candle
 
         const cached = this.htfCache[symbol];
+
+        // Refresh conditions:
+        //   • No cache yet
+        //   • New HTF candle has closed
+        //   • Cache older than 5 minutes (safety)
         const shouldRefresh =
             !cached ||
             cached.lastCloseTime < currentCandleStart ||
             now - cached.lastFetchTime > 5 * 60_1000;
 
         if (shouldRefresh) {
+            // Fetch fresh HTF data
             const data = await this.exchangeService.getOHLCV(symbol, tf, undefined, undefined, true);
             if (data && data.closes.length >= config.historyLength) {
+                // Update cache with new data and timestamps
                 this.htfCache[symbol] = {
                     data,
-                    lastCloseTime: data.timestamps.at(-1)!,
+                    lastCloseTime: data.timestamps.at(-1)!,  // Most recent closed candle
                     lastFetchTime: now,
                 };
                 logger.debug(`HTF refreshed: ${symbol} ${tf}`);
             }
             return data ?? null;
         }
+
+        // Return cached data (fast path)
         return cached.data;
     }
 
-    // ===========================================================================
-    // HANDLE SIGNAL → NOTIFY + SIMULATE + TRAIN
-    // ===========================================================================
+    // =========================================================================
+    // SIGNAL HANDLING: Full pipeline after valid signal
+    // =========================================================================
     /**
-         * Processes a trade signal, executing trades and collecting training data.
-         * - Validates signal feasibility, applies cooldown, and executes trades in testnet/live mode.
-         * - Logs trades to the database and collects ML training samples.
-         * @param symbol - Trading symbol.
-         * @param signal - Trade signal with confidence, stop loss, take profit, etc.
-         * @param currentPrice - Current market price.
-         * @private
-         */
+     * Handles everything after a buy/sell signal is generated:
+     *   • Deduplication (same signal/price/SL)
+     *   • R:R feasibility check
+     *   • Cooldown enforcement
+     *   • Telegram alert with excursion insight
+     *   • Background simulation + ML training
+     *   • Live trading via AutoTradeService
+     *
+     * @private – central coordination point
+     */
     private async handleTradeSignal(
         symbol: string,
         signal: TradeSignal,
@@ -301,7 +457,7 @@ export class MarketScanner {
         primaryData: OhlcvData,
         htf: OhlcvData
     ): Promise<void> {
-        // 1. Deduplication
+        // Deduplication – ignore exact repeat signals
         const last = this.lastSignal[symbol];
         if (
             last &&
@@ -309,10 +465,10 @@ export class MarketScanner {
             Math.abs(last.price - price) < 1e-6 &&
             Math.abs((last.signal.stopLoss ?? 0) - (signal.stopLoss ?? 0)) < 1e-6
         ) {
-            return; // exact same signal
+            return;
         }
 
-        // 2. R:R feasibility check
+        // Optional R:R sanity check
         if (this.opts.requireAtrFeasibility && signal.stopLoss && signal.takeProfit) {
             const risk = signal.signal === 'buy' ? price - signal.stopLoss : signal.stopLoss - price;
             const reward = signal.signal === 'buy' ? signal.takeProfit - price : price - signal.takeProfit;
@@ -322,153 +478,109 @@ export class MarketScanner {
             }
         }
 
-        // 3. Cooldown (database-backed = most reliable)
         const now = Date.now();
+
+        // Cooldown enforcement (prevent spam)
         if (this.opts.cooldownBackend === 'database') {
             const { lastTradeAt } = await dbService.getCoolDown(symbol);
-
-            if ((now - lastTradeAt) < this.opts.cooldownMs) {
-                return;
-            }
-            // Update all matching alerts
+            if ((now - lastTradeAt) < this.opts.cooldownMs) return;
             await dbService.upsertCoolDown(symbol, now);
         } else {
             if (now - (this.lastAlertAt[symbol] ?? 0) < this.opts.cooldownMs) return;
             this.lastAlertAt[symbol] = now;
         }
 
-        // 4. Send Telegram alert
-        await this.sendTelegramSignal(symbol, signal, price);
+        // Fetch excursion advice for richer alert
+        const excursions = await dbService.getSymbolExcursions(symbol);
+        let excursionText = 'No excursion history';
+        if (excursions && excursions.avgMae > 0) {
+            const { advice } = getExcursionAdvice(excursions.avgMfe, excursions.avgMae);
+            excursionText = `Excursion: ${advice}`;
+        }
 
-        // 5. Remember for deduplication
+        // Send Telegram alert with excursion context
+        await this.sendTelegramSignal(symbol, signal, price, excursionText);
+
+        // Remember signal for deduplication
         this.lastSignal[symbol] = { signal, price };
 
-        // 6. Simulate trade in background → get real outcome for ML training
+        // Background simulation for ML training (fire-and-forget)
         if (config.ml.trainingEnabled) {
             void this.simulateAndTrain(symbol, signal, price, primaryData, htf);
         }
 
-        // === LIVE TRADING (if enabled) ===
+        // Live trading – delegate to dedicated service (fire-and-forget)
         if (config.autoTrade) {
-            void this.executeLiveTrade(symbol, signal, price, now);              // ← Fire-and-forget
+            void this.autoTradeService.execute(signal);
         }
     }
 
-    private async sendTelegramSignal(symbol: string, signal: TradeSignal, price: number): Promise<void> {
+    // =========================================================================
+    // TELEGRAM NOTIFICATIONS: Send formatted signal alert
+    // =========================================================================
+    /**
+     * Sends a richly formatted Telegram alert for a generated trade signal.
+     *
+     * Called from:
+     *   • handleTradeSignal() – after all filters pass
+     *
+     * Features:
+     *   • MarkdownV2 formatting with proper escaping
+     *   • Includes excursion insight for better decision context
+     *   • Shows confidence, SL/TP/trailing, and all reasons
+     *   • Filters out empty lines for clean output
+     *
+     * @param symbol - Trading pair
+     * @param signal - Full TradeSignal from Strategy
+     * @param price - Current market price
+     * @param excursionText - Human-readable excursion advice
+     */
+    private async sendTelegramSignal(
+        symbol: string,
+        signal: TradeSignal,
+        price: number,
+        excursionText: string
+    ): Promise<void> {
+        // Escape special MarkdownV2 characters to prevent formatting errors
         const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+
+        // Build alert lines dynamically
         const lines = [
-            `**${signal.signal.toUpperCase()} SIGNAL**`,
+            `**${signal.signal.toUpperCase()} SIGNAL**`,           // Bold headline
             `**Symbol:** ${escape(symbol)}`,
             `**Price:** $${escape(price.toFixed(8))}`,
             signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
             signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
-            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} (≈${escape(config.strategy.riskRewardTarget+'')}R)` : '',
+            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
             signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
+            excursionText,                                          // Excursion insight (new feature)
             `**Reasons:**`,
-            ...signal.reason.map(r => `• ${escape(r)}`),
-        ].filter(Boolean);
+            ...signal.reason.map(r => `• ${escape(r)}`),            // Bullet list of trigger reasons
+        ].filter(Boolean);  // Remove empty strings (e.g., missing confidence)
 
+        // Send via injected Telegram service (null-safe)
         await this.telegramService?.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
     }
 
-
+    // =========================================================================
+    // SIMULATION + ML TRAINING: Background processing after signal
+    // =========================================================================
     /**
- * Executes a live trade based on a signal
- * - Calculates position size from account balance
- * - Places market order with SL/TP/trailing
- * - Logs to DB
- * - Fires and forgets (non-blocking)
- */
-    private async executeLiveTrade(
-        symbol: string,
-        signal: TradeSignal,
-        currentPrice: number,
-        timestamp: number = Date.now()
-    ): Promise<void> {
-        if (!config.autoTrade) return;
-
-        try {
-            // 1. Get current account balance (USDT equity)
-            const balance = await this.exchangeService.getAccountBalance();
-            if (!balance || balance <= 0) {
-                logger.warn('Insufficient balance or failed fetch', { symbol, balance });
-                return;
-            }
-
-            // 2. Calculate position size: % of total balance
-            const riskAmountUsd = balance * (config.strategy.positionSizePercent / 100);
-            const positionSizeBase = riskAmountUsd / currentPrice;
-
-            // 3. Safety cap: never risk more than 10% on one trade
-            const maxRiskUsd = balance * 0.10;
-            const finalSize = Math.min(positionSizeBase, maxRiskUsd / currentPrice);
-
-            if (finalSize < 0.0001) {
-                logger.warn('Position size too small, skipping', { symbol, finalSize });
-                return;
-            }
-
-            const side: 'buy' | 'sell' = signal.signal === 'buy' ? 'buy' : 'sell';
-
-            logger.info('EXECUTING LIVE TRADE', {
-                symbol,
-                side: side.toUpperCase(),
-                size: finalSize.toFixed(6),
-                usdValue: (finalSize * currentPrice).toFixed(2),
-                price: currentPrice.toFixed(8),
-                leverage: config.strategy.leverage,
-            });
-
-            // 4. Place the actual order
-            const order = await this.exchangeService.placeOrder(
-                symbol,
-                side,
-                finalSize,
-                signal.stopLoss ?? undefined,
-                signal.takeProfit ?? undefined,
-                signal.trailingStopDistance ?? undefined
-            );
-
-            // 5. Log to database
-            await dbService.logTrade({
-                symbol,
-                side,
-                amount: finalSize,
-                price: currentPrice,
-                timestamp,
-                mode: 'live',
-                orderId: order.id ?? 'unknown',
-            });
-
-            // 6. Notify Telegram
-            await this.telegramService?.sendMessage(
-                `*LIVE TRADE EXECUTED*\n` +
-                `• Symbol: ${symbol}\n` +
-                `• Side: ${side.toUpperCase()}\n` +
-                `• Size: ${finalSize.toFixed(6)}\n` +
-                `• Entry: $${currentPrice.toFixed(8)}\n` +
-                `• SL: $${(signal.stopLoss || 0).toFixed(8)}\n` +
-                `• TP: $${(signal.takeProfit || 0).toFixed(8)}`,
-                { parse_mode: 'Markdown' }
-            );
-
-            logger.info('Live trade placed successfully', { symbol, orderId: order.id });
-
-            // 7. Optional: monitor outcome for ML (fire-and-forget)
-            if (config.ml.trainingEnabled) {
-                void this.monitorLiveTradeOutcome(symbol, signal, finalSize, timestamp);
-            }
-
-        } catch (err) {
-            const msg = `LIVE TRADE FAILED: ${symbol} ${(err as Error).message}`;
-            logger.error(msg, { error: err });
-            await this.telegramService?.sendMessage(`Trade execution failed: ${msg}`).catch(() => { });
-        }
-    }
-
-    // ===========================================================================
-    // SIMULATE TRADE → FEED INTO ML (5-TIER LABELING)
-    // ===========================================================================
+     * Runs simulation and feeds outcome into ML training (fire-and-forget).
+     *
+     * Called from:
+     *   • handleTradeSignal() – when ML training is enabled
+     *
+     * Why fire-and-forget (void)?
+     *   • Simulation can take minutes → must not block scanner
+     *   • Multiple simulations can run in parallel safely
+     *
+     * Process:
+     *   • Extract features at signal time
+     *   • Run full simulation
+     *   • Convert outcome to 5-tier label
+     *   • Ingest into MLService
+     */
     private async simulateAndTrain(
         symbol: string,
         signal: TradeSignal,
@@ -477,7 +589,8 @@ export class MarketScanner {
         htfData: OhlcvData
     ): Promise<void> {
         try {
-            const features = mlService.extractFeatures({
+            // Extract features exactly as they were at signal generation time
+            const features = await mlService.extractFeatures({
                 symbol,
                 primaryData,
                 htfData,
@@ -487,13 +600,13 @@ export class MarketScanner {
                 trailingStopPercent: config.strategy.trailingStopPercent,
             });
 
-            // Run full simulation (handles SL, TP, trailing, partials, timeout)
+            // Run high-fidelity simulation
             const result = await simulateTrade(this.exchangeService, symbol, signal, entryPrice);
 
-            // Convert outcome into proper 5-tier label
+            // Convert simulation outcome to ML label
             const label = this.calculateLabel(signal.signal, result.outcome, result.rMultiple);
 
-            // Feed into ML system with full context
+            // Feed into continuous learning system
             await mlService.ingestSimulatedOutcome(
                 symbol,
                 features,
@@ -502,6 +615,7 @@ export class MarketScanner {
                 result.pnl
             );
 
+            // Log success for monitoring data growth
             logger.info('ML sample ingested from simulation', {
                 symbol,
                 side: signal.signal,
@@ -511,107 +625,83 @@ export class MarketScanner {
                 label,
             });
         } catch (err) {
+            // Simulation or ingestion failure – log but don't crash scanner
             logger.error('Simulation → ML failed', { symbol, error: err });
         }
     }
 
+    // =========================================================================
+    // LABEL CALCULATION: Convert simulation outcome to 5-tier label
+    // =========================================================================
     /**
-     * Monitors a trade's outcome for ML training.
-     * - Tracks position until closed or timeout, then logs training sample.
-     * @param symbol - Trading symbol.
-     * @param signal - Trade signal used to open the trade.
-     * @param amount - Trade amount (in base asset).
-     * @param startTime - Timestamp when the trade was opened.
-     * @private
+     * Maps simulation result to discrete ML label (-2 to +2).
+     *
+     * Used by:
+     *   • simulateAndTrain() – to label new samples
+     *
+     * Logic mirrors strategy thresholds:
+     *   • SL hit with big loss → -2/-1
+     *   • TP hit with strong/good gain → +2/+1
+     *   • Timeout or small moves → 0
+     *
+     * @param side - buy/sell/hold
+     * @param outcome - 'tp', 'sl', 'timeout', etc.
+     * @param r - Achieved R-multiple
+     * @returns SignalLabel for ML training
      */
-    private async monitorLiveTradeOutcome(
-        symbol: string,
-        signal: TradeSignal,
-        amount: number,
-        entryTime: number
-    ): Promise<void> {
-        const timeoutMs = 4 * 60 * 60 * 1000; // 4 hours max
-        const pollInterval = 60_000;         // Check every minute
-
-        try {
-            while (Date.now() - entryTime < timeoutMs) {
-                const positions = await this.exchangeService.getPositions(symbol);
-                const position = positions.find((p: any) =>
-                    p.symbol === symbol && p.side === (signal.signal === 'buy' ? 'long' : 'short')
-                );
-
-                if (!position || position.contracts === 0) {
-                    // Position closed → fetch closed trades
-                    const closed = await this.exchangeService.getClosedTrades(symbol, entryTime);
-                    const match = closed.find((t: any) =>
-                        Math.abs(t.amount - amount) < amount * 0.1 &&
-                        t.timestamp >= entryTime
-                    );
-
-                    const realizedPnl = match?.amount ?? 0;
-                    const pnlPercent = realizedPnl / (amount * (match?.price ?? 0)) * 100;
-
-                    const label = realizedPnl > 0
-                        ? (pnlPercent >= 3 ? 2 : 1)
-                        : (pnlPercent <= -3 ? -2 : -1);
-
-                    logger.info('Live trade closed → ML sample', {
-                        symbol,
-                        pnlPercent: pnlPercent.toFixed(2),
-                        label,
-                    });
-
-                    // Optional: re-extract features at close time and ingest
-                    // await mlService.ingestLiveOutcome(...)
-
-                    return;
-                }
-
-                await new Promise(r => setTimeout(r, pollInterval));
-            }
-
-            // Timeout: force close
-            const sideToClose = signal.signal === 'buy' ? 'sell' : 'buy';
-            await this.exchangeService.placeOrder(symbol, sideToClose, amount);
-            logger.warn('Live trade timed out → forced close', { symbol });
-        } catch (err) {
-            logger.error('Failed monitoring live trade', { symbol, error: err });
-        }
-    }
-
-
-    /** Convert simulation result into -2 to +2 label */
     private calculateLabel(side: 'buy' | 'sell' | 'hold', outcome: string, r: number): SignalLabel {
         if (side === 'hold') return 0;
+
         if (outcome.includes('sl')) {
-            return r <= -1.5 ? -2 : -1;
+            return r <= -1.5 ? -2 : -1;  // Big vs small loss on stop
         }
+
         if (outcome.includes('tp')) {
-            if (r >= 3.0) return 2;
-            if (r >= 1.5) return 1;
-            return 0;
+            if (r >= 3.0) return 2;      // Monster win
+            if (r >= 1.5) return 1;      // Good win
+            return 0;                   // Small or breakeven
         }
-        return 0; // timeout or neutral
+
+        return 0; // Timeout or neutral exit
     }
 
-    // ===========================================================================
-    // CUSTOM ALERTS (user-defined conditions)
-    // ===========================================================================
+    // =========================================================================
+    // CUSTOM ALERTS: Evaluate user-defined conditions
+    // =========================================================================
+    /**
+     * Checks all active custom alerts against current market data.
+     *
+     * Called from:
+     *   • scanAllSymbols() – after processing all symbols
+     *
+     * Behavior:
+     *   • Respects per-alert cooldown
+     *   • Fetches fresh data for each alert's symbol/timeframe
+     *   • Evaluates conditions via AlertEvaluatorService
+     *   • Sends Telegram notification on trigger
+     *   • Updates lastAlertAt for throttling
+     */
     private async checkCustomAlerts(): Promise<void> {
         const alerts = await dbService.getActiveAlerts();
         const now = Date.now();
 
+        // Process each alert independently
         for (const alert of alerts) {
+            // Cooldown check (DB backend only – more reliable across restarts)
             if (this.opts.cooldownBackend === 'database' && alert.lastAlertAt && now - alert.lastAlertAt < this.opts.cooldownMs) {
                 continue;
             }
 
             try {
+                // Fetch data for alert's specific symbol and timeframe
                 const data = await this.exchangeService.getOHLCV(alert.symbol, alert.timeframe || '1h');
                 if (!data || data.closes.length < config.historyLength) continue;
 
+                // Evaluate user-defined conditions
                 const { conditionsMet, reasons } = this.alertEvaluator.evaluate(data, alert.conditions);
+
                 if (conditionsMet) {
+                    // Build and send trigger message
                     const msg = [
                         `**Custom Alert Triggered**`,
                         `**Symbol:** ${alert.symbol} (${alert.timeframe})`,
@@ -620,10 +710,14 @@ export class MarketScanner {
                     ].join('\n');
 
                     await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
+
+                    // Update cooldown timestamp
                     await dbService.setLastAlertTime(alert.id, now);
+
                     logger.info(`Custom alert ${alert.id} triggered`, { symbol: alert.symbol });
                 }
             } catch (err) {
+                // Individual alert failure – log but continue with others
                 logger.error(`Alert ${alert.id} failed`, { error: err });
             }
         }

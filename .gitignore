@@ -10,5 +10,5 @@ coverage
 yarn.lock
 .env
 local.db
-worker.lock
+# worker.lock
 rf_model.json

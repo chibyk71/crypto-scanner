@@ -1,28 +1,20 @@
 // src/lib/strategy.ts
 // ---------------------------------------------------------------
 // STRATEGY ENGINE: High-frequency scalping signals (3m + 1h HTF)
-// Goal: 0.5-1.5% per trade, avoid false signals, respect trend
+// Now enhanced with:
+//   • Centralized indicators via indicatorUtils
+//   • Excursion-based dynamic adjustments (MAE/MFE)
+//   • Adaptive SL/TP, confidence, and risk sizing
 // ---------------------------------------------------------------
 
-import type { ADXOutput } from 'technicalindicators/declarations/directionalmovement/ADX';
-import type { OhlcvData, SignalLabel, TradeSignal } from '../types';                                           // ← Custom type that holds OHLCV arrays for a symbol
-import {
-    calculateEMA,
-    calculateRSI,
-    calculateMACD,
-    calculateStochastic,
-    calculateATR,
-    calculateOBV,
-    calculateVWMA,
-    calculateVWAP,
-    calculateADX,
-    detectEngulfing,
-    calculateBollingerBands,
-} from './indicators';                                                             // ← All pure indicator functions (no side-effects)
-import { createLogger } from './logger';                                             // ← Simple winston/pino wrapper used everywhere
-import { MLService } from './services/mlService';                                    // ← Wrapper around a trained ML model (predicts buy/sell probability)
+import type { OhlcvData, SignalLabel, TradeSignal } from '../types';                          // ← NEW: For excursion stats
+import { createLogger } from './logger';
+import { MLService } from './services/mlService';
 import { config } from './config/settings';
-import type { MACDOutput } from 'technicalindicators/declarations/moving_averages/MACD';
+import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
+import { dbService } from './db';
+import { getExcursionAdvice } from './utils/excursionUtils';
+import { detectEngulfing } from './indicators';
 
 const logger = createLogger('Strategy');                                          // ← Dedicated logger for this module
 
@@ -36,32 +28,6 @@ export interface StrategyInput {                                                
     trailingStopPercent: number;                                                  // ← Kept for API compatibility, not used internally
 }
 
-// All calculated indicators stored here
-interface Indicators {                                                            // ← Internal bucket – one place for every indicator value
-    emaShort: number[];                                                           // ← Full EMA-20 series on 3m
-    htfEmaMid: number[];                                                          // ← Full EMA-50 series on 1h
-    vwma: number[];                                                               // ← Full VWMA-20 series on 3m
-    vwap: number[];                                                               // ← Full VWAP series (same look-back as VWMA)
-    rsi: number[];                                                                // ← Full RSI series
-    macd: Array<MACDOutput>;            // ← Full MACD object series
-    stochastic: Array<{ k: number; d: number }>;                                  // ← Full Stochastic series
-    atr: number[];                                                                // ← Full ATR series
-    obv: number[];                                                                // ← Full On-Balance Volume series
-    lastEmaShort: number;                                                         // ← Most recent EMA-20 value
-    lastHtfEmaMid: number;                                                        // ← Most recent EMA-50 on 1h
-    lastVwma20: number;                                                           // ← Most recent VWMA-20
-    lastVwap: number;                                                             // ← Most recent VWAP
-    rsiNow: number;                                                               // ← Current RSI
-    macdNow: MACDOutput | undefined;    // ← Current MACD (may be undefined on first bars)
-    stochNow: { k: number; d: number };                                           // ← Current Stochastic %K & %D
-    lastObv: number;                                                              // ← Current OBV
-    lastAtr: number;                                                              // ← Current ATR (used for stop-loss)
-    htfAdx: ADXOutput[];                                                          // ← Full ADX series on 1h
-    lastHtfAdx: ADXOutput;                                                        // ← Latest ADX values (adx, +DI, -DI)
-    bb: Array<{ middle: number; upper: number; lower: number }>;                  // ← Full Bollinger Bands series
-    lastBandwidth: number;                                                        // ← Bandwidth of the last Bollinger Band
-}
-
 // Trend + volume context
 interface TrendAndVolume {                                                        // ← Summary of market regime
     hasVolumeSurge: boolean;                                                      // ← Did volume spike > 2× recent average?
@@ -71,7 +37,6 @@ interface TrendAndVolume {                                                      
     engulfing: ("bullish" | "bearish" | null)[];                                  // ← Array of detected engulfing patterns (last element = current)
 }
 
-// Scoring output
 interface ScoresAndML {                                                           // ← Result of the point-system + ML
     buyScore: number;
     sellScore: number;
@@ -98,6 +63,7 @@ const ADX_POINTS = 10;                        // ← Confirms a trending market
 const ENGULFING_POINTS = 15;                  // ← Strong price-action candle
 const ML_BONUS_MAX = 20;                      // ← Max points added from ML probability
 
+
 // Total possible points per side (used later to normalise confidence)
 const MAX_SCORE_PER_SIDE =
     EMA_ALIGNMENT_POINTS +
@@ -123,118 +89,33 @@ const DEFAULT_COOLDOWN_MINUTES = 10;          // ← Don't spam signals – wait
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.75;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.5;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 20;
 
-const MIN_BB_BANDWIDTH_PCT = 0.5;             // ← Minimum Bollinger Band width percentage to avoid flat markets
+const MIN_BB_BANDWIDTH_PCT = 0.3;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
 const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative volume check
 
 const MIN_DI_DIFF = 4;                       // ← Minimum difference between +DI and -DI for trend dominance
 
-// ---------------------------------------------------------------
-// STRATEGY CLASS: Core logic
-// ---------------------------------------------------------------
+const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
+const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
+
 export class Strategy {
-    // ----------------------------------------------------------------
-    // PRIVATE FIELDS (tunable parameters & state)
-    // ----------------------------------------------------------------
-    private mlService: MLService;                                 // ← Injected ML wrapper
-    private cooldownMinutes: number;                              // ← How long to wait between signals per symbol
-    private lastSignalTimes: Map<string, number> = new Map();     // ← Timestamp of last *non-hold* signal per symbol
-    public lastAtr: number = 0;                                  // ← Cached ATR (used for risk calc outside the class)
+    private mlService: MLService;
+    private cooldownMinutes: number;
+    private lastSignalTimes: Map<string, number> = new Map();
+    public lastAtr: number = 0;
 
-    // ---- Indicator periods (all hard-coded but could be made configurable) ----
-    private emaShortPeriod: number = 20;                          // ← Fast EMA on 3m (kept standard)
-    private htfEmaMidPeriod: number = 50;                         // ← Mid-term EMA on 1h (trend filter)
-    private vwmaPeriod: number = 20;                              // ← VWMA look-back
-    private rsiPeriod: number = 14;                               // ← Short RSI for scalping responsiveness
-    private macdFast: number = 12;                                 // ← Very fast MACD (12-26-9)
-    private macdSlow: number = 26;
-    private macdSignal: number = 9;
-    private stochK: number = 14;                                  // ← %K period
-    private stochD: number = 3;                                   // ← %D smoothing
-    private atrPeriod: number = 10;                               // ← Slightly shorter for better sensitivity
-    private adxPeriod: number = 14;                               // ← ADX on 1h
-    private obvLookback: number = 20;                             // ← How many bars to compare for volume surge
-    private volumeSurgeMultiplier: number = 2;                    // ← Current volume > 2× avg of last 5 bars
-    private minAdx: number = 20;                                  // ← ADX threshold for "trending"
-
-    // ----------------------------------------------------------------
-    // CONSTRUCTOR
-    // ----------------------------------------------------------------
     constructor(mlService: MLService, cooldownMinutes: number = DEFAULT_COOLDOWN_MINUTES) {
-        this.mlService = mlService;                               // ← Must be provided (even if dummy)
+        this.mlService = mlService;
         this.cooldownMinutes = cooldownMinutes;
-    }
-
-    // ---------------------------------------------------------------
-    // INDICATORS: Compute all at once
-    // ---------------------------------------------------------------
-    private _calculateIndicators(primaryData: OhlcvData, htfData: OhlcvData): Indicators {
-        // ---- Calculate every indicator in one pass (avoid recomputing arrays) ----
-        const emaShort = calculateEMA(primaryData.closes, this.emaShortPeriod);
-        const htfEmaMid = calculateEMA(htfData.closes, this.htfEmaMidPeriod);
-        const vwma = calculateVWMA(primaryData.closes, primaryData.volumes, this.vwmaPeriod);
-        const vwap = calculateVWAP(primaryData.highs, primaryData.lows, primaryData.closes, primaryData.volumes, this.vwmaPeriod);
-        const rsi = calculateRSI(primaryData.closes, this.rsiPeriod);
-        const macd = calculateMACD(primaryData.closes, this.macdFast, this.macdSlow, this.macdSignal);
-        const stochastic = calculateStochastic(primaryData.highs, primaryData.lows, primaryData.closes, this.stochK, this.stochD);
-        const atr = calculateATR(primaryData.highs, primaryData.lows, primaryData.closes, this.atrPeriod);
-        const obv = calculateOBV(primaryData.closes, primaryData.volumes);
-        const htfAdx = calculateADX(htfData.highs, htfData.lows, htfData.closes, this.adxPeriod);
-        const bb = calculateBollingerBands(primaryData.closes, 20, 2);
-
-        // ---- Grab the *latest* values (most of the logic only needs the last bar) ----
-        const lastEmaShort = emaShort[emaShort.length - 1] ?? 0;
-        const lastHtfEmaMid = htfEmaMid[htfEmaMid.length - 1] ?? 0;
-        const lastVwma20 = vwma[vwma.length - 1] ?? 0;
-        const lastVwap = vwap[vwap.length - 1] ?? 0;
-        const rsiNow = rsi[rsi.length - 1] ?? 50;
-        let macdNow = macd[macd.length - 1];
-        const stochNow = stochastic[stochastic.length - 1] ?? { k: 50, d: 50 };
-        const lastObv = obv[obv.length - 1] ?? 0;
-        const lastAtr = atr[atr.length - 1] ?? 0;
-        const lastHtfAdx = htfAdx[htfAdx.length - 1] ?? { adx: 0, pdi: 0, mdi: 0 };
-        const lastBb = bb[bb.length - 1] ?? { middle: 0, upper: 0, lower: 0 };
-        const lastBandwidth = lastBb.middle > 0 ? ((lastBb.upper - lastBb.lower) / lastBb.middle) * 100 : 0;
-
-        // ---- MACD can produce NaN on the very first bars – fallback to previous bar ----
-        if (macdNow && ([macdNow.MACD, macdNow.signal, macdNow.histogram].some(v => Number.isNaN(Number(v))))) {
-            logger.warn('NaN detected in MACD, falling back to previous value');
-            macdNow = macd[macd.length - 2] ?? { MACD: 0, signal: 0, histogram: 0 };
-        }
-
-        return {
-            emaShort,
-            htfEmaMid,
-            vwma,
-            vwap,
-            rsi,
-            macd,
-            stochastic,
-            atr,
-            obv,
-            lastEmaShort,
-            lastHtfEmaMid,
-            lastVwma20,
-            lastVwap,
-            rsiNow,
-            macdNow,
-            stochNow,
-            lastObv,
-            lastAtr,
-            htfAdx,
-            lastHtfAdx,
-            bb,
-            lastBandwidth,
-        };
     }
 
     // ---------------------------------------------------------------
     // TREND + VOLUME: Analyze context (added liquidity check)
     // ---------------------------------------------------------------
-    private _analyzeTrendAndVolume(primaryData: OhlcvData, indicators: Indicators, _price: number): TrendAndVolume {
+    private _analyzeTrendAndVolume(primaryData: OhlcvData, indicators: IndicatorMap, _price: number): TrendAndVolume {
         // ------------------------------------------------------------------
         // 1. HTF TREND INITIALIZATION & LIQUIDITY CHECK
         // ------------------------------------------------------------------
@@ -255,10 +136,10 @@ export class Strategy {
         const avgVolumeUSD = avgBaseVol * avgPrice;
 
         // Determine 1h trend bias (used for dynamic liquidity and final output)
-        const { adx, pdi, mdi } = indicators.lastHtfAdx;
+        const { htfAdx: adx, htfPdi: pdi, htfMdi: mdi } = indicators.last;
         const diDiff = Math.abs(pdi - mdi);
         console.log(`ADX Analysis for ${primaryData.symbol}: ADX=${adx.toFixed(2)}, +DI=${pdi.toFixed(2)}, -DI=${mdi.toFixed(2)}, DI Diff=${diDiff.toFixed(2)}`);
-        const isTrending = adx > this.minAdx && diDiff > MIN_DI_DIFF;
+        const isTrending = adx > MIN_ADX && diDiff > MIN_DI_DIFF;
         const trendBias = isTrending
             ? pdi > mdi
                 ? 'bullish'
@@ -295,7 +176,7 @@ export class Strategy {
         // ------------------------------------------------------------------
         // 3. VOLUME SURGE – Current volume vs. previous N bars (all in USD)
         // ------------------------------------------------------------------
-        const lookback = this.obvLookback; // Use obvLookback for short-term volume average
+        const lookback = 20; // Use obvLookback for short-term volume average
         const recentVols = primaryData.volumes.slice(-lookback - 1, -1);
         const recentPrices = primaryData.closes.slice(-lookback - 1, -1);
 
@@ -309,7 +190,7 @@ export class Strategy {
             primaryData.volumes[primaryData.volumes.length - 1] *
             primaryData.closes[primaryData.closes.length - 1];
 
-        let hasVolumeSurge = currentVolUSD > avgPrevUSD * this.volumeSurgeMultiplier;
+        let hasVolumeSurge = currentVolUSD > avgPrevUSD * VOLUME_SURGE_MULTIPLIER;
 
         // Add relative volume check (base volume)
         const volLookback = 20;
@@ -323,9 +204,8 @@ export class Strategy {
         // ------------------------------------------------------------------
         // 4. VWMA slope
         // ------------------------------------------------------------------
-        const vwmaSlope =
-            indicators.lastVwma20 -
-            (indicators.vwma[indicators.vwma.length - 2] ?? indicators.lastVwma20);
+        const vwmaSlope = indicators.last.vwma -
+            (indicators.vwma[indicators.vwma.length - 2] ?? indicators.last.vwma);
         const vwmaFalling = vwmaSlope < 0;
 
         // ------------------------------------------------------------------
@@ -354,40 +234,34 @@ export class Strategy {
     // ---------------------------------------------------------------
     // SCORES: Compute buy/sell points (completed sell-side, tiered scoring)
     // ---------------------------------------------------------------
-    private _computeScores(
-        indicators: Indicators,
-        trendAndVolume: TrendAndVolume,
-        input: StrategyInput,
-        reasons: string[]                                   // ← mutated in-place with human explanations
-    ): ScoresAndML {
+    private async _computeScores(indicators: IndicatorMap, trendAndVolume: TrendAndVolume, input: StrategyInput, reasons: string[]): Promise<ScoresAndML> {
         let buyScore = 0;
         let sellScore = 0;
 
         // -------------------- EMA ALIGNMENT --------------------
-        if (input.price > indicators.lastEmaShort && indicators.lastEmaShort > indicators.lastHtfEmaMid) {
+        if (input.price > indicators.last.emaShort && indicators.last.emaShort > indicators.last.htfEmaMid) {
             buyScore += EMA_ALIGNMENT_POINTS;
             reasons.push('Bullish EMA alignment: Price > EMA20 > HTF EMA50');
-        } else if (input.price < indicators.lastEmaShort && indicators.lastEmaShort < indicators.lastHtfEmaMid) {
+        } else if (input.price < indicators.last.emaShort && indicators.last.emaShort < indicators.last.htfEmaMid) {
             sellScore += EMA_ALIGNMENT_POINTS;
             reasons.push('Bearish EMA alignment: Price < EMA20 < HTF EMA50');
         }
 
         // -------------------- VWMA vs VWAP --------------------
-        if (indicators.lastVwma20 > indicators.lastVwap) {
+        if (indicators.last.vwma > indicators.last.vwap) {
             buyScore += VWMA_VWAP_POINTS;
             reasons.push('Bullish VWMA > VWAP');
-        } else if (indicators.lastVwma20 < indicators.lastVwap) {
+        } else if (indicators.last.vwma < indicators.last.vwap) {
             sellScore += VWMA_VWAP_POINTS;
             reasons.push('Bearish VWMA < VWAP');
         }
 
         // -------------------- MACD (tiered) --------------------
-        if (indicators.macdNow) {
-            // Ensure MACD fields are numeric (some indicator implementations may return undefined)
-            const macdVal = Number(indicators.macdNow.MACD ?? 0);
-            const macdSignalVal = Number(indicators.macdNow.signal ?? 0);
-            const macdHistVal = Number(indicators.macdNow.histogram ?? 0);
-
+        // Ensure MACD fields are numeric (some indicator implementations may return undefined)
+        const macdVal = Number(indicators.last.macdLine ?? 0);
+        const macdSignalVal = Number(indicators.last.macdSignal ?? 0);
+        const macdHistVal = Number(indicators.last.macdHistogram ?? 0);
+        if (macdVal && macdHistVal && macdSignalVal) {
             const macdCrossUp = macdVal > macdSignalVal;
             const histPositive = macdHistVal > 0;
             if (macdCrossUp && histPositive) {
@@ -419,35 +293,35 @@ export class Strategy {
         }
 
         // -------------------- RSI --------------------
-        if (indicators.rsiNow < 30) {
+        if (indicators.last.rsi < 30) {
             buyScore += RSI_POINTS;
             reasons.push('Oversold RSI <30');
-        } else if (indicators.rsiNow > 70) {
+        } else if (indicators.last.rsi > 70) {
             sellScore += RSI_POINTS;
             reasons.push('Overbought RSI >70');
         }
 
         // -------------------- STOCHASTIC --------------------
-        if (indicators.stochNow.k < 20 && indicators.stochNow.k > indicators.stochNow.d) {
+        if (indicators.last.stochasticK < 20 && indicators.last.stochasticK > indicators.last.stochasticD) {
             buyScore += STOCH_POINTS;
             reasons.push('Bullish Stochastic crossover in oversold');
-        } else if (indicators.stochNow.k > 80 && indicators.stochNow.k < indicators.stochNow.d) {
+        } else if (indicators.last.stochasticK > 80 && indicators.last.stochasticK < indicators.last.stochasticD) {
             sellScore += STOCH_POINTS;
             reasons.push('Bearish Stochastic crossover in overbought');
         }
 
         // -------------------- OBV + VWMA (clarified for momentum) --------------------
-        const obvRising = indicators.lastObv > (indicators.obv[indicators.obv.length - 2] ?? indicators.lastObv);
-        if (obvRising && input.price > indicators.lastVwma20) {
+        const obvRising = indicators.last.obv > (indicators.obv[indicators.obv.length - 2] ?? indicators.last.obv);
+        if (obvRising && input.price > indicators.last.vwma) {
             buyScore += OBV_VWMA_POINTS;
             reasons.push('Bullish OBV rising with price above VWMA (momentum)');
-        } else if (!obvRising && input.price < indicators.lastVwma20) {
+        } else if (!obvRising && input.price < indicators.last.vwma) {
             sellScore += OBV_VWMA_POINTS;
             reasons.push('Bearish OBV falling with price below VWMA (momentum)');
         }
 
         // -------------------- ATR VOLATILITY RANGE --------------------
-        const atrPct = (indicators.lastAtr / input.price) * 100;
+        const atrPct = (indicators.last.atr / input.price) * 100;
         if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) { // Tighter range for crypto scalping
             buyScore += ATR_POINTS;
             sellScore += ATR_POINTS;
@@ -455,6 +329,7 @@ export class Strategy {
         }
 
         // -------------------- VWMA SLOPE --------------------
+        //
         if (!trendAndVolume.vwmaFalling) {
             buyScore += VWMA_SLOPE_POINTS;
             reasons.push('Bullish VWMA slope');
@@ -467,7 +342,7 @@ export class Strategy {
         if (trendAndVolume.isTrending) {
             buyScore += trendAndVolume.trendBias === 'bullish' ? ADX_POINTS : 0;
             sellScore += trendAndVolume.trendBias === 'bearish' ? ADX_POINTS : 0;;
-            reasons.unshift(`Strong trend confirmed by ADX >${this.minAdx}`);
+            reasons.unshift(`Strong trend confirmed by ADX >${MIN_ADX}`);
         }
 
         // -------------------- ENGULFING PATTERN --------------------
@@ -480,7 +355,7 @@ export class Strategy {
             reasons.push('Bearish Engulfing candle confirmed with volume surge');
         }
         // -------------------- ML PREDICTION – 5-TIER MODEL INTEGRATION (FINAL & CORRECT) --------------------
-        const features = this.mlService.extractFeatures(input);
+        const features = await this.mlService.extractFeatures(input);
 
         let mlWinConfidence = 0;        // Probability of good/great trade (label 1 or 2)
         let mlLossConfidence = 0;       // Approximate probability of loss (label -1 or -2)
@@ -708,50 +583,37 @@ export class Strategy {
         };
     }
 
-    // ---------------------------------------------------------------
-    // PUBLIC: Generate signal (added liquidity in trend analysis)
-    // ---------------------------------------------------------------
-    public generateSignal(input: StrategyInput): TradeSignal {
+    public async generateSignal(input: StrategyInput): Promise<TradeSignal> {
         const reasons: string[] = [];
         const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
 
-        // ---- COOLDOWN CHECK (per-symbol) ----
         const now = Date.now();
         const last = this.lastSignalTimes.get(symbol) ?? 0;
         if ((now - last) / (1000 * 60) < this.cooldownMinutes) {
-            reasons.push(`Cooldown active (last signal <${this.cooldownMinutes} min ago)`);
-            if (config.env === 'dev') {
-                logger.info(`[DEV] ${symbol} on cooldown – holding`);
-            }
+            reasons.push(`Cooldown active (<${this.cooldownMinutes} min since last signal)`);
             return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
         }
 
         try {
-            // ---- DATA LENGTH VALIDATION (need enough bars for every indicator) ----
-            const required = Math.max(
-                this.emaShortPeriod,
-                this.vwmaPeriod,
-                this.rsiPeriod,
-                this.atrPeriod,
-                this.macdSlow + this.macdSignal,
-                this.adxPeriod
-            );
-            if (
-                primaryData.closes.length < required ||
-                htfData.closes.length < this.htfEmaMidPeriod
-            ) {
-                reasons.push('Insufficient OHLCV data for indicator calculation');
-                if (config.env === 'dev') {
-                    logger.info(`[DEV] ${symbol} insufficient data – holding`);
-                }
-                return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
+            // === 1. Centralized indicator calculation ===
+            const indicators = computeIndicators(primaryData, htfData);
+            this.lastAtr = indicators.last.atr;
+
+            // === 2. Fetch excursion history ===
+            const excursions = await dbService.getSymbolExcursions(symbol);
+            let excursionAdvice = '⚪ No excursion history yet';
+            let adjustments = { slMultiplier: 1.0, tpMultiplier: 1.0, confidenceBoost: 0 };
+
+            if (excursions && excursions.avgMae > 0) {
+                const adviceObj = getExcursionAdvice(excursions.avgMfe, excursions.avgMae);
+                excursionAdvice = adviceObj.advice;
+                adjustments = adviceObj.adjustments;
+                reasons.push(excursionAdvice);
+            } else {
+                reasons.push(excursionAdvice);
             }
 
-            // ---- 1. CALCULATE ALL INDICATORS ----
-            const indicators = this._calculateIndicators(primaryData, htfData);
-            this.lastAtr = indicators.lastAtr; // cache for external use if needed
-
-            // ---- 2. TREND + VOLUME CONTEXT (includes liquidity filter) ----
+            // ---- 3. TREND + VOLUME CONTEXT (includes liquidity filter) ----
             const trendAndVolume = this._analyzeTrendAndVolume(primaryData, indicators, price);
             if (!trendAndVolume.isTrending) {
                 reasons.push('No trending market: Holding');
@@ -761,67 +623,68 @@ export class Strategy {
                 return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
             }
 
-            // ---- Check Bollinger Band width for flat markets ----
-            if (indicators.lastBandwidth < MIN_BB_BANDWIDTH_PCT) {
-                reasons.push(`Flat market detected: Bollinger Bandwidth ${indicators.lastBandwidth.toFixed(2)}% < ${MIN_BB_BANDWIDTH_PCT}%`);
+            // ---- 4 Check Bollinger Band width for flat markets ----
+            if (indicators.last.bbBandwidth < MIN_BB_BANDWIDTH_PCT) {
+                reasons.push(`Flat market detected: Bollinger Bandwidth ${indicators.last.bbBandwidth.toFixed(2)}% < ${MIN_BB_BANDWIDTH_PCT}%`);
                 if (config.env === 'dev') {
                     logger.info(`[DEV] ${symbol} flat market per BB width – holding`);
                 }
                 return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
             }
 
-            // ---- 3. POINT-BASED SCORING + ML ----
-            const { buyScore, sellScore, features, mlConfidence } = this._computeScores(
+            // ---- 5. POINT-BASED SCORING + ML ----
+            let { buyScore, sellScore, features, mlConfidence } = await this._computeScores(
                 indicators,
                 trendAndVolume,
                 input,
                 reasons
             );
 
-            // ---- 4. FINAL SIGNAL DECISION ----
+            // === 7. Apply excursion confidence boost ===
+            buyScore += adjustments.confidenceBoost * 20;
+            sellScore += adjustments.confidenceBoost * 20; // symmetric for now
+
+            // ---- 6. FINAL SIGNAL DECISION ----
             const { signal, confidence } = this._determineSignal(
                 buyScore,
                 sellScore,
                 trendAndVolume.trendBias,
-                this._isRiskEligible(price, indicators.lastAtr),
+                this._isRiskEligible(price, indicators.last.atr),
                 reasons
             );
 
-            // ---- 5. RISK PARAMETERS (SL/TP/Trailing/Size) ----
-            const risk = this._computeRiskParams(
+            // ---- 7. RISK PARAMETERS (SL/TP/Trailing/Size) ----
+            const { stopLoss, takeProfit, trailingStopDistance, positionSizeMultiplier } = this._computeRiskParams(
                 signal,
                 price,
                 atrMultiplier,
                 riskRewardTarget,
                 confidence,
-                indicators.lastAtr,
+                indicators.last.atr,
                 trendAndVolume.trendBias,
             );
 
-            // ---- 6. RECORD COOLDOWN (only for real trades) ----
             if (signal !== 'hold') {
                 this.lastSignalTimes.set(symbol, now);
             }
 
             if (config.env === 'dev') {
-                logger.info(`[DEV] ${symbol} Signal: ${signal.toUpperCase()} @ ${price.toFixed(8)} | Confidence: ${confidence.toFixed(2)}% | buyScore: ${buyScore.toFixed(1)} | sellScore: ${sellScore.toFixed(1)} | ATR: ${indicators.lastAtr.toFixed(4)}`);
+                logger.info(`[DEV] ${symbol} Signal: ${signal.toUpperCase()} @ ${price.toFixed(8)} | Confidence: ${confidence.toFixed(2)}% | buyScore: ${buyScore.toFixed(1)} | sellScore: ${sellScore.toFixed(1)} | ATR: ${indicators.last.atr.toFixed(4)}`);
             }
 
-            // ---- 7. RETURN FULL SIGNAL OBJECT ----
             return {
                 symbol,
                 signal,
                 confidence,
                 reason: reasons,
-                stopLoss: risk.stopLoss,
-                takeProfit: risk.takeProfit,
-                trailingStopDistance: risk.trailingStopDistance,
-                positionSizeMultiplier: risk.positionSizeMultiplier,
+                stopLoss: signal !== 'hold' ? Number(stopLoss?.toFixed(8)) : undefined,
+                takeProfit: signal !== 'hold' ? Number(takeProfit?.toFixed(8)) : undefined,
+                trailingStopDistance: signal !== 'hold' ? Number(trailingStopDistance?.toFixed(8)) : undefined,
+                positionSizeMultiplier: signal !== 'hold' ? Number(positionSizeMultiplier?.toFixed(3)) : undefined,
                 mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
                 features,
             };
         } catch (err) {
-            // ---- GLOBAL ERROR HANDLING (never crash the bot) ----
             logger.error(`Error generating signal for ${symbol}`, { err });
             reasons.push(`Exception: ${(err as Error).message}`);
             return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };

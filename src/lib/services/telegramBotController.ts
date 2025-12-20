@@ -6,7 +6,7 @@ import { dbService } from '../db';
 import { createLogger } from '../logger';
 import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
-import { Condition } from '../../types';
+import { Condition, type TradeSignal } from '../../types';
 import { closeAndCleanUp } from '../..';
 
 const logger = createLogger('TelegramBot');
@@ -123,6 +123,7 @@ export class TelegramBotController {
         this.bot.onText(/\/positions/, this.handlePositions);
         this.bot.onText(/\/trades/, this.handleTrades);
         this.bot.onText(/\/stopbot/, this.handleStopBot);
+        this.bot.onText(/\/excursions(?:\s+(.+))?/, this.handleExcursions);
 
         this.bot.on('message', this.handleMessage);
         this.bot.on('callback_query', this.handleCallbackQuery);
@@ -1026,6 +1027,66 @@ export class TelegramBotController {
             ...newState,
             lastActivity: Date.now(),
         });
+    }
+
+    private handleExcursions = async (msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> => {
+        if (!this.isAuthorized(msg.chat.id)) return;
+
+        const chatId = msg.chat.id;
+        const symbol = match?.[1]?.trim();
+
+        if (!symbol) {
+            await this.bot.sendMessage(chatId, 'Usage: `/excursions BTC/USDT`\n\nShows historical MAE/MFE stats for a symbol.');
+            return;
+        }
+
+        try {
+            const excursions = await dbService.getSymbolExcursions(symbol);
+            if (!excursions || excursions.avgMae === 0) {
+                await this.bot.sendMessage(chatId, `No excursion data yet for *${symbol}*. Run simulations first!`, { parse_mode: 'Markdown' });
+                return;
+            }
+
+            const { avgMfe, avgMae, ratio } = excursions;
+            const ratioColor = ratio > 1.5 ? '🟢' : ratio < 1 ? '🔴' : '🟡';
+            const maeColor = avgMae > config.strategy.maxMaePct ? '🔴' : '🟢';
+
+            const msgText = [
+                `**Excursion Stats for ${symbol}** 📊`,
+                '',
+                `Average MFE: ${avgMfe.toFixed(2)}% ${ratioColor}`,
+                `Average MAE: ${avgMae.toFixed(2)}% ${maeColor}`,
+                `MFE/MAE Ratio: ${ratio.toFixed(2)} ${ratioColor}`,
+                '',
+                `Risk Level: ${ratioColor === '🟢' ? 'Low' : ratioColor === '🔴' ? 'High' : 'Moderate'}`,
+            ].join('\n');
+
+            await this.bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+        } catch (error) {
+            logger.error('Error fetching excursions', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to fetch excursion stats. Try again later.');
+        }
+    };
+
+    // ===========================================================================
+    // SIGNAL ALERTS – Now include excursion advice
+    // ===========================================================================
+    public async sendSignalAlert(symbol: string, signal: TradeSignal, price: number, excursionAdvice: string): Promise<void> {
+        const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+        const lines = [
+            `**${signal.signal.toUpperCase()} SIGNAL**`,
+            `**Symbol:** ${escape(symbol)}`,
+            `**Price:** $${escape(price.toFixed(8))}`,
+            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
+            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
+            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(\\≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
+            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
+            `**Excursion Insight:** ${escape(excursionAdvice)}`,  // ← NEW: Excursion advice
+            `**Reasons:**`,
+            ...signal.reason.map(r => `• ${escape(r)}`),
+        ].filter(Boolean);
+
+        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
     }
 
     /**
