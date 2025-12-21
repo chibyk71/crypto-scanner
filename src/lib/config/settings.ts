@@ -72,6 +72,33 @@ const ConfigSchema = z.object({
     LEVERAGE: z.coerce.number().default(5),
 
     // ──────────────────────────────────────────────────────────────
+    // NEW: REGIME-AWARE & REVERSAL TRADING CONTROLS
+    // ──────────────────────────────────────────────────────────────
+    /**
+     * Enables automatic signal reversal in AutoTradeService when recent reversals are detected
+     * Only applies to live trading – Strategy alerts remain pure
+     */
+    AUTO_TRADE_REVERSAL_ENABLED: z.coerce.boolean().default(false),
+
+    /**
+     * Time window (in hours) for "recent" excursion and reversal statistics
+     * Used in symbolHistory recent fields and regime detection
+     */
+    RECENT_WINDOW_HOURS: z.coerce.number().min(1).max(24).default(3),
+
+    /**
+     * Minimum number of recent simulations required before applying regime adjustments
+     * Prevents overreaction on sparse data
+     */
+    MIN_RECENT_SAMPLES_FOR_ADJUSTMENT: z.coerce.number().min(1).default(1),
+
+    /**
+     * Minimum recent reversal count required to trigger auto-reversal in AutoTrade
+     * Only used when AUTO_TRADE_REVERSAL_ENABLED = true
+     */
+    MIN_REVERSE_COUNT_FOR_AUTO_REVERSAL: z.coerce.number().min(1).default(3),
+
+    // ──────────────────────────────────────────────────────────────
     // 5-Tier ML Labeling Thresholds (R-multiple based)
     // ──────────────────────────────────────────────────────────────
     ML_LABEL_STRONG_WIN: z.coerce.number().default(3.0),
@@ -249,10 +276,20 @@ export const config = {
         minExcursionRatio: rawConfig.MIN_EXCURSION_RATIO,
 
         /**
+         * Minimum recent samples to consider recent data for adjustments
+         */
+        minRecentSamplesForAdjustment: rawConfig.MIN_RECENT_SAMPLES_FOR_ADJUSTMENT, // Minimum recent samples to consider recent data
+
+        /**
          * Confidence boost (0.0–1.0) when excursion ratio is strong
          * Added directly to final signal confidence
          */
         excursionConfidenceBoost: rawConfig.EXCURSION_CONFIDENCE_BOOST,
+
+        // NEW: Regime-aware controls
+        autoTradeReversalEnabled: rawConfig.AUTO_TRADE_REVERSAL_ENABLED,
+        recentWindowHours: rawConfig.RECENT_WINDOW_HOURS,
+        minReverseCountForAutoReversal: rawConfig.MIN_REVERSE_COUNT_FOR_AUTO_REVERSAL,
     },
 
     // =========================================================================

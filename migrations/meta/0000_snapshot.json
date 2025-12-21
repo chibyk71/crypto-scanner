@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "0a7aaf99-cc52-4d3b-afda-cf98d71c67f1",
+  "id": "c4c82d00-e501-49ef-bde9-f50c385c4f1f",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -510,6 +510,102 @@
           "autoincrement": false,
           "default": 0
         },
+        "recent_mfe": {
+          "name": "recent_mfe",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_mae": {
+          "name": "recent_mae",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_sample_count": {
+          "name": "recent_sample_count",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "avg_mfe_long": {
+          "name": "avg_mfe_long",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "avg_mae_long": {
+          "name": "avg_mae_long",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "avg_mfe_short": {
+          "name": "avg_mfe_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "avg_mae_short": {
+          "name": "avg_mae_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "win_rate_long": {
+          "name": "win_rate_long",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "win_rate_short": {
+          "name": "win_rate_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_reverse_count_long": {
+          "name": "recent_reverse_count_long",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_reverse_count_short": {
+          "name": "recent_reverse_count_short",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_reverse_count": {
+          "name": "recent_reverse_count",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "updated_at": {
           "name": "updated_at",
           "type": "timestamp",
@@ -533,6 +629,13 @@
           "columns": [
             "avg_mae",
             "avg_mfe"
+          ],
+          "isUnique": false
+        },
+        "idx_symbol_history_recent": {
+          "name": "idx_symbol_history_recent",
+          "columns": [
+            "updated_at"
           ],
           "isUnique": false
         }

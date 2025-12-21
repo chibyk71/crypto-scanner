@@ -1,47 +1,70 @@
 // src/lib/strategy.ts
-// ---------------------------------------------------------------
-// STRATEGY ENGINE: High-frequency scalping signals (3m + 1h HTF)
-// Now enhanced with:
-//   • Centralized indicators via indicatorUtils
-//   • Excursion-based dynamic adjustments (MAE/MFE)
-//   • Adaptive SL/TP, confidence, and risk sizing
-// ---------------------------------------------------------------
+// =============================================================================
+// STRATEGY ENGINE – HIGH-FREQUENCY SCALPING SIGNALS (3m primary + 1h HTF filter)
+//
+// Purpose:
+//   • Generate precise buy/sell/hold signals using multi-timeframe confluence
+//   • Point-based scoring system with clear, debuggable reasons
+//   • Full integration of:
+//       - Centralized indicators (via indicatorUtils)
+//       - Excursion-based dynamic adjustments (MAE/MFE from symbolHistory)
+//       - Machine Learning confidence bonus (5-tier model)
+//       - Adaptive risk management (confidence + trend-aware sizing)
+//   • Designed for crypto volatility: tight filters, volume confirmation, trend bias
+//
+// Key Design Principles:
+//   • No black-box logic – every point addition has an explicit reason
+//   • Early exits for low-liquidity or flat markets
+//   • Counter-trend penalty (configurable)
+//   • Realistic position sizing with leverage caps and confidence scaling
+// =============================================================================
 
-import type { OhlcvData, SignalLabel, TradeSignal } from '../types';                          // ← NEW: For excursion stats
+import type { OhlcvData, SignalLabel, TradeSignal } from '../types';
 import { createLogger } from './logger';
 import { MLService } from './services/mlService';
 import { config } from './config/settings';
 import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
 import { dbService } from './db';
-import { getExcursionAdvice } from './utils/excursionUtils';
+import { getExcursionAdvice, isHighMaeRisk } from './utils/excursionUtils';
 import { detectEngulfing } from './indicators';
 
-const logger = createLogger('Strategy');                                          // ← Dedicated logger for this module
+// Dedicated logger – all strategy-related messages tagged 'Strategy'
+const logger = createLogger('Strategy');
 
-export interface StrategyInput {                                                  // ← Everything the engine needs from the outside
+/**
+ * Complete input required for signal generation
+ * Bundles market data and strategy parameters for clean API
+ */
+export interface StrategyInput {
     symbol: string;
-    primaryData: OhlcvData;                                                       // ← 3-minute candles (the "fast" timeframe)
-    htfData: OhlcvData;                                                           // ← 1-hour candles (higher-timeframe trend filter)
-    price: number;                                                                // ← Current market price (last trade or mid-price)
-    atrMultiplier: number;                                                        // ← How many ATRs away the stop-loss is placed
-    riskRewardTarget: number;                                                     // ← e.g. 2 = 2:1 reward:risk
-    trailingStopPercent: number;                                                  // ← Kept for API compatibility, not used internally
+    primaryData: OhlcvData;          // Fast timeframe (e.g., 3m) – primary signal source
+    htfData: OhlcvData;              // Higher timeframe (e.g., 1h) – trend filter
+    price: number;                   // Current market price
+    atrMultiplier: number;           // Stop-loss distance in ATR multiples
+    riskRewardTarget: number;        // Target R:R ratio
+    trailingStopPercent: number;     // Legacy – kept for compatibility
 }
 
-// Trend + volume context
-interface TrendAndVolume {                                                        // ← Summary of market regime
-    hasVolumeSurge: boolean;                                                      // ← Did volume spike > 2× recent average?
-    vwmaFalling: boolean;                                                         // ← Is VWMA sloping down?
-    trendBias: 'bullish' | 'bearish' | 'neutral';                                 // ← Higher-timeframe bias
-    isTrending: boolean;                                                          // ← ADX > 20 and one DI dominates
-    engulfing: ("bullish" | "bearish" | null)[];                                  // ← Array of detected engulfing patterns (last element = current)
+/**
+ * Internal summary of market regime (trend strength + volume behavior)
+ * Used heavily in scoring and filtering
+ */
+interface TrendAndVolume {
+    hasVolumeSurge: boolean;         // Significant volume spike vs recent average
+    vwmaFalling: boolean;            // Is VWMA trending down?
+    trendBias: 'bullish' | 'bearish' | 'neutral';  // HTF directional bias
+    isTrending: boolean;             // Strong trend confirmed by ADX + DI dominance
+    engulfing: ("bullish" | "bearish" | null)[];   // Detected engulfing patterns
 }
 
-interface ScoresAndML {                                                           // ← Result of the point-system + ML
-    buyScore: number;
-    sellScore: number;
-    features: number[];                                                           // ← Same vector that will be sent to ML
-    mlConfidence: number;                                                         // ← Highest probability returned by ML (0-1)
+/**
+ * Result of technical scoring + ML integration
+ */
+interface ScoresAndML {
+    buyScore: number;                // Total points for long direction
+    sellScore: number;               // Total points for short direction
+    features: number[];              // Feature vector for ML (same as training)
+    mlConfidence: number;            // ML probability of profitable outcome (0-1)
 }
 
 // ---------------------------------------------------------------
@@ -101,20 +124,65 @@ const MIN_DI_DIFF = 4;                       // ← Minimum difference between +
 const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
 
+/**
+ * Strategy – Core signal generation engine
+ *
+ * Responsibilities:
+ *   • Multi-timeframe analysis
+ *   • Point-based scoring with explicit reasons
+ *   • Excursion-aware adjustments
+ *   • ML integration
+ *   • Adaptive risk management
+ *   • Signal cooldown per symbol
+ */
 export class Strategy {
+    // External dependencies
     private mlService: MLService;
-    private cooldownMinutes: number;
-    private lastSignalTimes: Map<string, number> = new Map();
-    public lastAtr: number = 0;
 
+    // Configuration
+    private cooldownMinutes: number;
+
+    // State
+    private lastSignalTimes: Map<string, number> = new Map();  // Per-symbol cooldown tracking
+    public lastAtr: number = 0;                               // Latest ATR (exposed for debugging)
+
+    /**
+     * Constructor
+     * @param mlService - Machine learning service for prediction bonus
+     * @param cooldownMinutes - Minimum minutes between signals per symbol
+     */
     constructor(mlService: MLService, cooldownMinutes: number = DEFAULT_COOLDOWN_MINUTES) {
         this.mlService = mlService;
         this.cooldownMinutes = cooldownMinutes;
     }
 
-    // ---------------------------------------------------------------
-    // TREND + VOLUME: Analyze context (added liquidity check)
-    // ---------------------------------------------------------------
+    // =========================================================================
+    // TREND + VOLUME ANALYSIS: Market regime detection with liquidity filter
+    // =========================================================================
+    /**
+     * Analyzes higher-timeframe trend strength, volume behavior, and liquidity.
+     * 
+     * Called from:
+     *   • generateSignal() – early in the pipeline
+     * 
+     * Responsibilities:
+     *   • Determine HTF trend bias (bullish/bearish/neutral) using ADX + DI
+     *   • Calculate average hourly volume in USD for liquidity filtering
+     *   • Detect volume surges (both USD and base volume)
+     *   • Identify VWMA slope direction
+     *   • Detect engulfing patterns (cheap operation)
+     *   • Early exit with neutral result if liquidity too low
+     * 
+     * Why liquidity check here?
+     *   • Prevents processing illiquid symbols (slippage, fake moves)
+     *   • Dynamic threshold: relaxed in strong bull trends (ADX > 35)
+     * 
+     * @param primaryData - Fast timeframe OHLCV (for volume calculations)
+     * @param indicators - Pre-computed indicators (for HTF ADX/DI)
+     * @param _price - Current price (unused but kept for future extensions)
+     * @returns TrendAndVolume summary used throughout scoring
+     * @private
+     */
     private _analyzeTrendAndVolume(primaryData: OhlcvData, indicators: IndicatorMap, _price: number): TrendAndVolume {
         // ------------------------------------------------------------------
         // 1. HTF TREND INITIALIZATION & LIQUIDITY CHECK
@@ -130,31 +198,31 @@ export class Strategy {
             return this._neutral();
         }
 
-        // Calculate average volume in USD
+        // Calculate average volume in USD over last 50 candles
         const avgBaseVol = volSlice.slice(0, len).reduce((a, b) => a + b, 0) / len;
         const avgPrice = priceSlice.slice(0, len).reduce((a, b) => a + b, 0) / len;
         const avgVolumeUSD = avgBaseVol * avgPrice;
 
-        // Determine 1h trend bias (used for dynamic liquidity and final output)
+        // Determine HTF trend bias using ADX and Directional Indicators
         const { htfAdx: adx, htfPdi: pdi, htfMdi: mdi } = indicators.last;
         const diDiff = Math.abs(pdi - mdi);
+
+        // Debug log – helpful for tuning ADX thresholds
         console.log(`ADX Analysis for ${primaryData.symbol}: ADX=${adx.toFixed(2)}, +DI=${pdi.toFixed(2)}, -DI=${mdi.toFixed(2)}, DI Diff=${diDiff.toFixed(2)}`);
+
         const isTrending = adx > MIN_ADX && diDiff > MIN_DI_DIFF;
         const trendBias = isTrending
-            ? pdi > mdi
-                ? 'bullish'
-                : 'bearish'
+            ? pdi > mdi ? 'bullish' : 'bearish'
             : 'neutral';
 
-        // Apply Dynamic Liquidity Threshold: stricter in bear markets
+        // Dynamic liquidity threshold: more lenient in strong bull trends
         const baseThreshold = MIN_AVG_VOLUME_USD_PER_HOUR;
-        const bullMultiplier =
-            trendBias === 'bullish' && adx > 35 ? BULL_MARKET_LIQUIDITY_MULTIPLIER : 1.0;
+        const bullMultiplier = trendBias === 'bullish' && adx > 35 ? BULL_MARKET_LIQUIDITY_MULTIPLIER : 1.0;
         const threshold = baseThreshold * bullMultiplier;
         const hasLiquidity = avgVolumeUSD >= threshold;
 
         // ------------------------------------------------------------------
-        // 2. ENGULFING (run always – cheap)
+        // 2. ENGULFING PATTERN DETECTION (always run – low cost)
         // ------------------------------------------------------------------
         const engulfing = detectEngulfing(
             primaryData.opens,
@@ -163,7 +231,7 @@ export class Strategy {
             primaryData.closes
         );
 
-        // EARLY EXIT: If liquidity fails, we return a neutral signal
+        // EARLY EXIT: Reject low-liquidity symbols entirely
         if (!hasLiquidity) {
             logger.info(
                 `Low liquidity ${primaryData.symbol}: ` +
@@ -174,53 +242,61 @@ export class Strategy {
         }
 
         // ------------------------------------------------------------------
-        // 3. VOLUME SURGE – Current volume vs. previous N bars (all in USD)
+        // 3. VOLUME SURGE DETECTION – Dual confirmation (USD + base volume)
         // ------------------------------------------------------------------
         const lookback = 20; // Use obvLookback for short-term volume average
         const recentVols = primaryData.volumes.slice(-lookback - 1, -1);
         const recentPrices = primaryData.closes.slice(-lookback - 1, -1);
 
-        // Calculate average previous volume in USD
-        const avgPrevUSD =
-            recentVols.reduce((sum, v, i) => sum + v * recentPrices[i], 0) /
-            lookback;
+        // Average volume in USD over previous 20 candles
+        const avgPrevUSD = recentVols.reduce((sum, v, i) => sum + v * recentPrices[i], 0) / lookback;
 
-        // Calculate current volume in USD
-        const currentVolUSD =
-            primaryData.volumes[primaryData.volumes.length - 1] *
-            primaryData.closes[primaryData.closes.length - 1];
+        // Current candle volume in USD
+        const currentVolUSD = primaryData.volumes[primaryData.volumes.length - 1] * primaryData.closes[primaryData.closes.length - 1];
 
+        // Primary surge check (USD value)
         let hasVolumeSurge = currentVolUSD > avgPrevUSD * VOLUME_SURGE_MULTIPLIER;
 
-        // Add relative volume check (base volume)
+        // Secondary check: raw base volume surge (prevents price-driven false positives)
         const volLookback = 20;
         const recentBaseVols = primaryData.volumes.slice(-volLookback - 1, -1);
         const avgBaseVol20 = recentBaseVols.reduce((sum, v) => sum + v, 0) / volLookback;
         const currentBaseVol = primaryData.volumes[primaryData.volumes.length - 1];
         const hasRelativeVolumeSurge = currentBaseVol > avgBaseVol20 * RELATIVE_VOLUME_MULTIPLIER;
 
+        // Require both for strong confirmation
         hasVolumeSurge = hasVolumeSurge && hasRelativeVolumeSurge;
 
         // ------------------------------------------------------------------
-        // 4. VWMA slope
+        // 4. VWMA SLOPE DIRECTION
         // ------------------------------------------------------------------
-        const vwmaSlope = indicators.last.vwma -
-            (indicators.vwma[indicators.vwma.length - 2] ?? indicators.last.vwma);
+        const vwmaSlope = indicators.last.vwma - (indicators.vwma[indicators.vwma.length - 2] ?? indicators.last.vwma);
         const vwmaFalling = vwmaSlope < 0;
 
         // ------------------------------------------------------------------
-        // 5. RETURN (ADX/Trend Bias variables are already set in Section 1)
+        // 5. RETURN COMPREHENSIVE REGIME SUMMARY
         // ------------------------------------------------------------------
         return {
             hasVolumeSurge,
             vwmaFalling,
-            trendBias, // From Section 1
-            isTrending, // From Section 1
+            trendBias,
+            isTrending,
             engulfing,
         };
     }
 
-    /** Helper – keeps the early-exit return DRY */
+    // =========================================================================
+    // HELPER: Neutral regime state (DRY early exit)
+    // =========================================================================
+    /**
+     * Returns a neutral TrendAndVolume object.
+     * 
+     * Used for:
+     *   • Early exits (insufficient data, low liquidity)
+     *   • Prevents downstream null checks
+     * 
+     * @private
+     */
     private _neutral(): TrendAndVolume {
         return {
             hasVolumeSurge: false,
@@ -231,9 +307,28 @@ export class Strategy {
         };
     }
 
-    // ---------------------------------------------------------------
-    // SCORES: Compute buy/sell points (completed sell-side, tiered scoring)
-    // ---------------------------------------------------------------
+    // =========================================================================
+    // POINT-BASED SCORING: Calculate buy/sell strength with explicit reasons
+    // =========================================================================
+    /**
+     * Core scoring engine – assigns points to buy and sell sides based on technical conditions.
+     * 
+     * Called from:
+     *   • generateSignal() – after trend/volume analysis
+     * 
+     * Design:
+     *   • Tiered scoring for nuanced conditions (e.g., full vs partial MACD)
+     *   • Every point addition includes a clear reason string
+     *   • Integrates ML prediction as final bonus
+     *   • Safe numeric handling for potentially undefined indicator values
+     * 
+     * @param indicators - Centralized indicator results
+     * @param trendAndVolume - Market regime from _analyzeTrendAndVolume
+     * @param input - Strategy parameters and price
+     * @param reasons - Mutable array filled with human-readable explanations
+     * @returns Scores, ML features, and confidence for final decision
+     * @private
+     */
     private async _computeScores(indicators: IndicatorMap, trendAndVolume: TrendAndVolume, input: StrategyInput, reasons: string[]): Promise<ScoresAndML> {
         let buyScore = 0;
         let sellScore = 0;
@@ -256,14 +351,16 @@ export class Strategy {
             reasons.push('Bearish VWMA < VWAP');
         }
 
-        // -------------------- MACD (tiered) --------------------
-        // Ensure MACD fields are numeric (some indicator implementations may return undefined)
+        // -------------------- MACD (tiered scoring) --------------------
+        // Safe conversion – some indicator libs may return undefined
         const macdVal = Number(indicators.last.macdLine ?? 0);
         const macdSignalVal = Number(indicators.last.macdSignal ?? 0);
         const macdHistVal = Number(indicators.last.macdHistogram ?? 0);
+
         if (macdVal && macdHistVal && macdSignalVal) {
             const macdCrossUp = macdVal > macdSignalVal;
             const histPositive = macdHistVal > 0;
+
             if (macdCrossUp && histPositive) {
                 buyScore += MACD_POINTS;
                 reasons.push('Strong Bullish MACD: Crossover + Positive Histogram');
@@ -274,6 +371,7 @@ export class Strategy {
 
             const macdCrossDown = macdVal < macdSignalVal;
             const histNegative = macdHistVal < 0;
+
             if (macdCrossDown && histNegative) {
                 sellScore += MACD_POINTS;
                 reasons.push('Strong Bearish MACD: Crossover + Negative Histogram');
@@ -282,7 +380,7 @@ export class Strategy {
                 reasons.push('Weak Bearish MACD: Crossover but Histogram not negative');
             }
 
-            // -------------------- MACD ZERO LINE --------------------
+            // MACD zero-line confirmation
             if (macdVal > 0) {
                 buyScore += MACD_ZERO_POINTS;
                 reasons.push('Bullish MACD above zero line');
@@ -310,7 +408,7 @@ export class Strategy {
             reasons.push('Bearish Stochastic crossover in overbought');
         }
 
-        // -------------------- OBV + VWMA (clarified for momentum) --------------------
+        // -------------------- OBV + VWMA MOMENTUM --------------------
         const obvRising = indicators.last.obv > (indicators.obv[indicators.obv.length - 2] ?? indicators.last.obv);
         if (obvRising && input.price > indicators.last.vwma) {
             buyScore += OBV_VWMA_POINTS;
@@ -322,14 +420,13 @@ export class Strategy {
 
         // -------------------- ATR VOLATILITY RANGE --------------------
         const atrPct = (indicators.last.atr / input.price) * 100;
-        if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) { // Tighter range for crypto scalping
+        if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) {
             buyScore += ATR_POINTS;
             sellScore += ATR_POINTS;
             reasons.unshift(`Sane ATR volatility: ${atrPct.toFixed(2)}%`);
         }
 
         // -------------------- VWMA SLOPE --------------------
-        //
         if (!trendAndVolume.vwmaFalling) {
             buyScore += VWMA_SLOPE_POINTS;
             reasons.push('Bullish VWMA slope');
@@ -340,8 +437,11 @@ export class Strategy {
 
         // -------------------- ADX TREND STRENGTH --------------------
         if (trendAndVolume.isTrending) {
-            buyScore += trendAndVolume.trendBias === 'bullish' ? ADX_POINTS : 0;
-            sellScore += trendAndVolume.trendBias === 'bearish' ? ADX_POINTS : 0;;
+            if (trendAndVolume.trendBias === 'bullish') {
+                buyScore += ADX_POINTS;
+            } else if (trendAndVolume.trendBias === 'bearish') {
+                sellScore += ADX_POINTS;
+            }
             reasons.unshift(`Strong trend confirmed by ADX >${MIN_ADX}`);
         }
 
@@ -354,27 +454,27 @@ export class Strategy {
             sellScore += ENGULFING_POINTS;
             reasons.push('Bearish Engulfing candle confirmed with volume surge');
         }
-        // -------------------- ML PREDICTION – 5-TIER MODEL INTEGRATION (FINAL & CORRECT) --------------------
+
+        // -------------------- ML PREDICTION INTEGRATION --------------------
         const features = await this.mlService.extractFeatures(input);
 
-        let mlWinConfidence = 0;        // Probability of good/great trade (label 1 or 2)
-        let mlLossConfidence = 0;       // Approximate probability of loss (label -1 or -2)
+        let mlWinConfidence = 0;
+        let mlLossConfidence = 0;
         let predictedLabel: SignalLabel = 0;
 
         if (this.mlService.isReady()) {
-            const prediction = this.mlService.predict(features);  // Only 1 argument!
+            const prediction = this.mlService.predict(features);
 
-            predictedLabel = prediction.label;        // -2, -1, 0, 1, or 2
-            mlWinConfidence = prediction.confidence;  // P(label >= 1) — already calculated in MLService
-            mlLossConfidence = 1 - mlWinConfidence;    // Rough proxy for bearish confidence
+            predictedLabel = prediction.label;
+            mlWinConfidence = prediction.confidence;
+            mlLossConfidence = 1 - mlWinConfidence;
 
-            // Add bonus points based on prediction strength
             if (predictedLabel >= 1) {
                 const bonus = mlWinConfidence * ML_BONUS_MAX;
                 buyScore += bonus;
                 reasons.unshift(`ML PREDICTS WIN (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`);
             } else if (predictedLabel <= -1) {
-                const bonus = mlLossConfidence * ML_BONUS_MAX * 0.9; // Slightly less aggressive on shorts
+                const bonus = mlLossConfidence * ML_BONUS_MAX * 0.9;
                 sellScore += bonus;
                 reasons.unshift(`ML PREDICTS LOSS (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlLossConfidence * 100).toFixed(1)}%)`);
             } else {
@@ -391,7 +491,6 @@ export class Strategy {
             });
         } else {
             reasons.push('ML model not ready → no prediction bonus');
-            // Optional: small discount on all technical scores
             buyScore *= ML_CONFIDENCE_DISCOUNT;
             sellScore *= ML_CONFIDENCE_DISCOUNT;
         }
@@ -399,9 +498,29 @@ export class Strategy {
         return { buyScore, sellScore, features, mlConfidence: mlWinConfidence };
     }
 
-    // ---------------------------------------------------------------
-    // SIGNAL: Determine final action (added trend/ML gates)
-    // ---------------------------------------------------------------
+    // =========================================================================
+    // FINAL SIGNAL DECISION: Apply filters and determine direction/confidence
+    // =========================================================================
+    /**
+     * Converts raw scores into final signal with confidence level.
+     * 
+     * Called from:
+     *   • generateSignal() – after scoring complete
+     * 
+     * Logic:
+     *   • Early reject on poor risk conditions
+     *   • Dynamic score margin requirement
+     *   • Confidence normalized to 0-100%
+     *   • Clear reasons for hold decisions
+     * 
+     * @param buyScore - Total long points
+     * @param sellScore - Total short points
+     * @param trendBias - HTF directional bias
+     * @param isRiskEligible - ATR volatility sanity check
+     * @param reasons - Mutable array for explanations
+     * @returns Final signal and confidence
+     * @private
+     */
     private _determineSignal(
         buyScore: number,
         sellScore: number,
@@ -409,71 +528,93 @@ export class Strategy {
         isRiskEligible: boolean,
         reasons: string[]
     ): { signal: TradeSignal['signal']; confidence: number } {
-        // ---- Risk sanity check first (ATR % out of bounds → hold) ----
+        // Early exit if volatility out of bounds
         if (!isRiskEligible) {
             reasons.push('Risk ineligible: ATR out of bounds');
             return { signal: 'hold', confidence: 0 };
         }
 
-        // ---- Apply counter-trend penalty (not full block) ----
-        if (buyScore > sellScore) {
-            if (trendBias !== 'bullish' && trendBias !== 'neutral') {
-                buyScore *= 0.8; // 20% penalty for counter-trend
-                reasons.push('Counter-trend buy: 20% score penalty applied');
-            }
-        } else if (sellScore > buyScore) {
-            if (trendBias !== 'bearish' && trendBias !== 'neutral') {
-                sellScore *= 0.8; // 20% penalty for counter-trend
-                reasons.push('Counter-trend sell: 20% score penalty applied');
-            }
+        // Counter-trend penalty note (currently disabled but logged)
+        if (buyScore > sellScore && trendBias !== 'bullish' && trendBias !== 'neutral') {
+            buyScore *= 0.8;
+            reasons.push('Counter-trend buy: 20% score penalty applied');
+        } else if (sellScore > buyScore && trendBias !== 'bearish' && trendBias !== 'neutral') {
+            sellScore *= 0.8;
+            reasons.push('Counter-trend sell: 20% score penalty applied');
         }
 
-        // ---- Dynamic score margin (easier for high scores) ----
+        // Dynamic margin – stricter when scores are low
         const dynamicMargin = Math.min(SCORE_MARGIN_REQUIRED, CONFIDENCE_THRESHOLD * 0.29);
 
-        // ---- BUY PATH ----
         let signal: TradeSignal['signal'] = 'hold';
         let confidence = 0;
+
         if (buyScore >= CONFIDENCE_THRESHOLD && buyScore - sellScore >= dynamicMargin) {
             signal = 'buy';
             confidence = (buyScore / MAX_SCORE_PER_SIDE) * 100;
-        }
-        // ---- SELL PATH ----
-        else if (sellScore >= CONFIDENCE_THRESHOLD && sellScore - buyScore >= dynamicMargin) {
+        } else if (sellScore >= CONFIDENCE_THRESHOLD && sellScore - buyScore >= dynamicMargin) {
             signal = 'sell';
             confidence = (sellScore / MAX_SCORE_PER_SIDE) * 100;
-        }
-        // ---- NO CLEAR SIGNAL ----
-        else {
+        } else {
             reasons.push('No clear signal: Insufficient score margin or trend mismatch');
         }
 
-        confidence = Math.min(confidence, 100); // Never exceed 100%
+        confidence = Math.min(confidence, 100);
 
         return { signal, confidence };
     }
 
-    // ---------------------------------------------------------------
-    // RISK ELIGIBILITY: Sanity check (simplified to ATR % bounds)
-    // ---------------------------------------------------------------
+    // =========================================================================
+    // RISK ELIGIBILITY: Basic volatility sanity check
+    // =========================================================================
+    /**
+     * Quick filter to reject symbols with unrealistic ATR volatility.
+     * 
+     * Called from:
+     *   • _determineSignal() – before final signal decision
+     * 
+     * Purpose:
+     *   • Avoid trades in dead-flat or hyper-volatile markets
+     *   • Tighter bounds than general strategies (optimized for crypto scalping)
+     * 
+     * @param price - Current market price
+     * @param lastAtr - Latest ATR value
+     * @returns true if volatility is in acceptable range
+     * @private
+     */
     private _isRiskEligible(price: number, lastAtr: number): boolean {
         const atrPct = (lastAtr / price) * 100;
-        return atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT; // Tighter for realistic scalping
+        return atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT;
     }
 
-    // ---------------------------------------------------------------
-    // RISK MANAGEMENT: SL, TP, Trailing (tighter RR for realism)
-    // ---------------------------------------------------------------
+    // =========================================================================
+    // RISK MANAGEMENT: Dynamic SL/TP, trailing, and position sizing
+    // =========================================================================
     /**
- * COMPUTE RISK PARAMETERS + DYNAMIC POSITION SIZING (2025 Scalping Best Practice)
- *
- * Key upgrades:
- *  - Fixed % risk per trade (0.25%–0.75% depending on trend & confidence)
- *  - Confidence-scaled position size (70+ → full size, 90+ → up to +50% bonus)
- *  - Bear-market auto-reduction
- *  - Max 5× effective leverage cap
- *  - Realistic trailing stop (75% of initial risk distance)
- */
+     * Calculates all risk parameters for a valid signal using 2025 scalping best practices.
+     * 
+     * Called from:
+     *   • generateSignal() – after signal confirmation
+     * 
+     * Key Features:
+     *   • Trend-aware base risk (0.5% bull/neutral, 0.25% bear)
+     *   • Confidence scaling (70-100% → up to +0.5% extra risk)
+     *   • ATR-based stop distance with safety clamping
+     *   • Hard 5× leverage cap
+     *   • Aggressive trailing (75% of risk distance)
+     *   • Backward-compatible multiplier for legacy systems
+     * 
+     * @param signal - 'buy' or 'sell'
+     * @param price - Entry price
+     * @param atrMultiplier - Configured ATR multiple
+     * @param riskRewardTarget - Target R:R
+     * @param confidence - Final signal confidence (0-100)
+     * @param lastAtr - Current ATR
+     * @param trendBias - HTF trend direction
+     * @param accountBalance - Current account equity (defaults to $1000 for testing)
+     * @returns Complete risk parameters
+     * @private
+     */
     private _computeRiskParams(
         signal: TradeSignal['signal'],
         price: number,
@@ -481,18 +622,18 @@ export class Strategy {
         riskRewardTarget: number,
         confidence: number,
         lastAtr: number,
-        trendBias: TrendAndVolume['trendBias'],        // ← Now required from trend analysis
-        accountBalance: number | undefined = 1000                          // ← Must be passed from bot/exchange context
+        trendBias: TrendAndVolume['trendBias'],
+        accountBalance: number | undefined = 1000
     ): {
         stopLoss?: number;
         takeProfit?: number;
         trailingStopDistance?: number;
-        positionSizeUsd: number;                        // ← Absolute USD size (recommended)
-        positionSizeMultiplier?: number;                // ← Kept for backward compat (0–1.5)
-        riskAmountUsd: number;                          // ← How much $ you're actually risking
+        positionSizeUsd: number;
+        positionSizeMultiplier?: number;
+        riskAmountUsd: number;
     } {
+        // No signal → zero risk
         if (signal === 'hold') {
-            // No valid signal → nothing to risk
             return {
                 stopLoss: undefined,
                 takeProfit: undefined,
@@ -504,31 +645,29 @@ export class Strategy {
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 1. Base risk % per trade (this is the core of survival)
+        // 1. Base risk % per trade – survival first
         // ──────────────────────────────────────────────────────────────
-        const BASE_RISK_PERCENT_BULL = 0.005;   // 0.50% in bullish/neutral markets
-        const BASE_RISK_PERCENT_BEAR = 0.0025;  // 0.25% in bearish markets (volatility kills)
-        const MAX_RISK_BONUS_CONFIDENCE = 0.005;  // +0.50% extra at 100 confidence
+        const BASE_RISK_PERCENT_BULL = 0.005;    // 0.50% in bull/neutral
+        const BASE_RISK_PERCENT_BEAR = 0.0025;  // 0.25% in bear (volatility hurts)
+        const MAX_RISK_BONUS_CONFIDENCE = 0.005; // +0.50% at max confidence
 
-        const baseRiskPercent = trendBias === 'bearish'
-            ? BASE_RISK_PERCENT_BEAR
-            : BASE_RISK_PERCENT_BULL;
+        const baseRiskPercent = trendBias === 'bearish' ? BASE_RISK_PERCENT_BEAR : BASE_RISK_PERCENT_BULL;
 
-        // Confidence scaling: linear from 70 → 100 confidence = 1x → 1.5x base risk
-        const confidenceFactor = Math.min((confidence - 70) / 30, 1); // 0 to 1
+        // Confidence bonus: scales risk upward for high-confidence setups
+        const confidenceFactor = Math.min((confidence - 70) / 30, 1); // 0-1 range
         const bonusRiskPercent = confidenceFactor * MAX_RISK_BONUS_CONFIDENCE;
 
         const finalRiskPercent = baseRiskPercent + bonusRiskPercent;
         const riskAmountUsd = accountBalance * finalRiskPercent;
 
         // ──────────────────────────────────────────────────────────────
-        // 2. Stop-loss distance (ATR-based)
+        // 2. Stop-loss distance (ATR-based with bounds)
         // ──────────────────────────────────────────────────────────────
         const clampedMultiplier = Math.min(Math.max(atrMultiplier, MIN_ATR_MULTIPLIER), MAX_ATR_MULTIPLIER);
-        const riskDistance = lastAtr * clampedMultiplier; // e.g., 1.5 × ATR
+        const riskDistance = lastAtr * clampedMultiplier;
 
-        // Prevent insane stops (should never happen but safety first)
-        if (riskDistance <= 0 || riskDistance / price > 0.10) { // >10% stop = broken data
+        // Safety: reject absurd stops (>10% move)
+        if (riskDistance <= 0 || riskDistance / price > 0.10) {
             logger.info(`Unrealistic risk distance calculated: ${riskDistance.toFixed(4)} (skipping trade)`);
             return {
                 stopLoss: undefined,
@@ -541,37 +680,32 @@ export class Strategy {
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 3. Calculate actual position size in USD
+        // 3. Position size in USD (risk-based)
         // ──────────────────────────────────────────────────────────────
         const rawPositionSizeUsd = riskAmountUsd / (riskDistance / price);
 
-        // Hard cap: never exceed 5× effective leverage (scalping rule of thumb)
+        // Hard leverage cap – never exceed 5× notional
         const maxAllowedNotional = accountBalance * 5.0;
         const positionSizeUsd = Math.min(rawPositionSizeUsd, maxAllowedNotional);
 
         // ──────────────────────────────────────────────────────────────
         // 4. Stop Loss & Take Profit levels
         // ──────────────────────────────────────────────────────────────
-        const stopLoss = signal === 'buy'
-            ? price - riskDistance
-            : price + riskDistance;
-
-        const takeProfit = signal === 'buy'
-            ? price + riskDistance * riskRewardTarget
-            : price - riskDistance * riskRewardTarget;
+        const stopLoss = signal === 'buy' ? price - riskDistance : price + riskDistance;
+        const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
 
         // ──────────────────────────────────────────────────────────────
-        // 5. Trailing stop: 75% of initial risk distance (aggressive but proven)
+        // 5. Trailing stop – 75% of initial risk (aggressive for scalping)
         // ──────────────────────────────────────────────────────────────
         const trailingStopDistance = riskDistance * 0.75;
 
         // ──────────────────────────────────────────────────────────────
-        // 6. Legacy multiplier (0–1.5) for systems still using it
+        // 6. Legacy multiplier (for systems still using it)
         // ──────────────────────────────────────────────────────────────
         const positionSizeMultiplier = Math.min(positionSizeUsd / accountBalance * 5, 1.5);
 
         // ──────────────────────────────────────────────────────────────
-        // Final return
+        // Final structured return
         // ──────────────────────────────────────────────────────────────
         return {
             stopLoss: Number(stopLoss.toFixed(8)),
@@ -583,10 +717,52 @@ export class Strategy {
         };
     }
 
+    // =========================================================================
+    // PUBLIC API: Main signal generation entry point
+    // =========================================================================
+    /**
+     * Primary method – generates a complete TradeSignal for a symbol.
+     * 
+     * Called from:
+     *   • MarketScanner.processSymbol() – for every symbol on each scan
+     * 
+     * Full Pipeline:
+     *   1. Cooldown check per symbol
+         // =========================================================================
+    // PUBLIC API: Main signal generation entry point
+    // =========================================================================
+    /**
+     * Primary method – generates a complete TradeSignal for a symbol.
+     * 
+     * Called from:
+     *   • MarketScanner.processSymbol() – for every symbol on each scan
+     * 
+     * Full Pipeline:
+     *   1. Cooldown check per symbol
+     *   2. Centralized indicator calculation
+     *   3. Trend/volume analysis (liquidity + trend filter)
+     *   4. Flat market check (Bollinger Bandwidth)
+     *   5. Point scoring + ML prediction
+     *   6. Enriched excursion history fetch + regime-aware advice
+     *   7. Dynamic regime adjustments (recent reversals, MFE/MAE)
+     *   8. Final signal decision
+     *   9. Risk parameter calculation with dynamic SL/TP multipliers
+     *   10. Update cooldown and return rich TradeSignal
+     * 
+     * Early exits:
+     *   • Cooldown active
+     *   • No trending market
+     *   • Flat Bollinger Bands
+     *   • Excessive drawdown risk (high MAE)
+     * 
+     * @param input - Full market context and parameters
+     * @returns Complete TradeSignal with reasons, risk params, ML data
+     */
     public async generateSignal(input: StrategyInput): Promise<TradeSignal> {
         const reasons: string[] = [];
         const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
 
+        // Per-symbol cooldown – prevents signal spam
         const now = Date.now();
         const last = this.lastSignalTimes.get(symbol) ?? 0;
         if ((now - last) / (1000 * 60) < this.cooldownMinutes) {
@@ -595,25 +771,11 @@ export class Strategy {
         }
 
         try {
-            // === 1. Centralized indicator calculation ===
+            // === 1. Centralized indicator calculation (single source of truth) ===
             const indicators = computeIndicators(primaryData, htfData);
-            this.lastAtr = indicators.last.atr;
+            this.lastAtr = indicators.last.atr;  // Exposed for debugging/risk checks
 
-            // === 2. Fetch excursion history ===
-            const excursions = await dbService.getSymbolExcursions(symbol);
-            let excursionAdvice = '⚪ No excursion history yet';
-            let adjustments = { slMultiplier: 1.0, tpMultiplier: 1.0, confidenceBoost: 0 };
-
-            if (excursions && excursions.avgMae > 0) {
-                const adviceObj = getExcursionAdvice(excursions.avgMfe, excursions.avgMae);
-                excursionAdvice = adviceObj.advice;
-                adjustments = adviceObj.adjustments;
-                reasons.push(excursionAdvice);
-            } else {
-                reasons.push(excursionAdvice);
-            }
-
-            // ---- 3. TREND + VOLUME CONTEXT (includes liquidity filter) ----
+            // === 2. Trend + volume analysis (includes liquidity filter) ===
             const trendAndVolume = this._analyzeTrendAndVolume(primaryData, indicators, price);
             if (!trendAndVolume.isTrending) {
                 reasons.push('No trending market: Holding');
@@ -623,7 +785,7 @@ export class Strategy {
                 return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
             }
 
-            // ---- 4 Check Bollinger Band width for flat markets ----
+            // === 3. Flat market filter (Bollinger Bandwidth) ===
             if (indicators.last.bbBandwidth < MIN_BB_BANDWIDTH_PCT) {
                 reasons.push(`Flat market detected: Bollinger Bandwidth ${indicators.last.bbBandwidth.toFixed(2)}% < ${MIN_BB_BANDWIDTH_PCT}%`);
                 if (config.env === 'dev') {
@@ -632,19 +794,91 @@ export class Strategy {
                 return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
             }
 
-            // ---- 5. POINT-BASED SCORING + ML ----
-            let { buyScore, sellScore, features, mlConfidence } = await this._computeScores(
+            // === 4. Full point scoring + ML prediction ===
+            const scoringResult = await this._computeScores(
                 indicators,
                 trendAndVolume,
                 input,
                 reasons
             );
+            let buyScore = scoringResult.buyScore;
+            let sellScore = scoringResult.sellScore;
+            const features = scoringResult.features;
+            const mlConfidence = scoringResult.mlConfidence;
 
-            // === 7. Apply excursion confidence boost ===
-            buyScore += adjustments.confidenceBoost * 20;
-            sellScore += adjustments.confidenceBoost * 20; // symmetric for now
+            // === 5. Fetch enriched excursion history for regime-aware adjustments ===
+            const history = await dbService.getEnrichedSymbolHistory(symbol);
 
-            // ---- 6. FINAL SIGNAL DECISION ----
+            let excursionAdvice = '⚪ No excursion history yet';
+            let tpMultiplier = 1.0;
+            let slMultiplier = 1.0;
+            let confidenceBoost = 0;
+
+            const intendedDirection: 'long' | 'short' = buyScore > sellScore ? 'long' : 'short';
+
+            if (history && (history.avgMfe > 0 || history.recentMfe > 0)) {
+                // Get layered advice: recent → directional → lifetime
+                const adviceObj = getExcursionAdvice(history, intendedDirection);
+                excursionAdvice = adviceObj.advice;
+                reasons.push(excursionAdvice);
+
+                tpMultiplier *= adviceObj.adjustments.tpMultiplier;
+                slMultiplier *= adviceObj.adjustments.slMultiplier;
+                confidenceBoost += adviceObj.adjustments.confidenceBoost;
+
+                // === Additional recent regime penalties ===
+                const minRecentSamples = config.strategy.minRecentSamplesForAdjustment ?? 3;
+                const hasRecentData = history.recentSampleCount >= minRecentSamples;
+
+                if (hasRecentData) {
+                    const recentReverse = intendedDirection === 'long'
+                        ? history.recentReverseCountLong
+                        : history.recentReverseCountShort;
+
+                    if (recentReverse >= 3) {
+                        reasons.push(`🔴 Strong recent reversals (${recentReverse}) – high caution applied`);
+                        confidenceBoost -= 0.25;
+                        tpMultiplier *= 0.6;   // Aggressively reduce target
+                        slMultiplier *= 0.9;
+                    } else if (recentReverse >= 2) {
+                        reasons.push(`🟡 Recent reversals (${recentReverse}) – reducing target size`);
+                        confidenceBoost -= 0.15;
+                        tpMultiplier *= 0.75;
+                    }
+
+                    // Low recent MFE → price stalls early
+                    if (history.recentMfe < 1.8) {
+                        reasons.push(`Recent low MFE (${history.recentMfe.toFixed(2)}%) – shrinking take-profit`);
+                        tpMultiplier *= 0.7;
+                    }
+
+                    // High recent MAE → quick adverse moves
+                    if (history.recentMae > (config.strategy.maxMaePct ?? 3.0) * 0.8) {
+                        reasons.push(`Recent high MAE (${history.recentMae.toFixed(2)}%) – tightening stop-loss`);
+                        slMultiplier *= 0.8;
+                    }
+                }
+
+                // === Critical safety: Skip if excessive drawdown risk ===
+                if (isHighMaeRisk(history, intendedDirection)) {
+                    reasons.push(`🚫 Excessive drawdown risk detected – skipping signal`);
+                    return {
+                        symbol,
+                        signal: 'hold',
+                        confidence: 0,
+                        reason: reasons,
+                        features: [],
+                    };
+                }
+            } else {
+                reasons.push(excursionAdvice);
+            }
+
+            // === 6. Apply final confidence boost from excursions & regime ===
+            buyScore += confidenceBoost * 20;
+            sellScore += confidenceBoost * 20;
+
+            // === 7. Final signal decision ===
             const { signal, confidence } = this._determineSignal(
                 buyScore,
                 sellScore,
@@ -653,8 +887,8 @@ export class Strategy {
                 reasons
             );
 
-            // ---- 7. RISK PARAMETERS (SL/TP/Trailing/Size) ----
-            const { stopLoss, takeProfit, trailingStopDistance, positionSizeMultiplier } = this._computeRiskParams(
+            // === 8. Dynamic risk parameter calculation ===
+            const riskParams = this._computeRiskParams(
                 signal,
                 price,
                 atrMultiplier,
@@ -664,14 +898,40 @@ export class Strategy {
                 trendAndVolume.trendBias,
             );
 
+            // Apply regime multipliers to SL/TP
+            let stopLoss = riskParams.stopLoss;
+            let takeProfit = riskParams.takeProfit;
+
+            if (signal !== 'hold') {
+                const baseSlDistance = Math.abs(price - (stopLoss ?? price));
+                const baseTpDistance = Math.abs((takeProfit ?? price) - price);
+
+                stopLoss = signal === 'buy'
+                    ? price - baseSlDistance * slMultiplier
+                    : price + baseSlDistance * slMultiplier;
+
+                takeProfit = signal === 'buy'
+                    ? price + baseTpDistance * tpMultiplier
+                    : price - baseTpDistance * tpMultiplier;
+            }
+
+            // Add final adjustment summary
+            if (tpMultiplier < 0.95) reasons.push(`Take-profit reduced (x${tpMultiplier.toFixed(2)})`);
+            if (tpMultiplier > 1.05) reasons.push(`Take-profit expanded (x${tpMultiplier.toFixed(2)})`);
+            if (slMultiplier < 0.95) reasons.push(`Stop-loss tightened (x${slMultiplier.toFixed(2)})`);
+            if (slMultiplier > 1.05) reasons.push(`Stop-loss loosened (x${slMultiplier.toFixed(2)})`);
+
+            // Update cooldown on valid signal
             if (signal !== 'hold') {
                 this.lastSignalTimes.set(symbol, now);
             }
 
+            // Debug logging in development
             if (config.env === 'dev') {
-                logger.info(`[DEV] ${symbol} Signal: ${signal.toUpperCase()} @ ${price.toFixed(8)} | Confidence: ${confidence.toFixed(2)}% | buyScore: ${buyScore.toFixed(1)} | sellScore: ${sellScore.toFixed(1)} | ATR: ${indicators.last.atr.toFixed(4)}`);
+                logger.info(`[DEV] ${symbol} Signal: ${signal.toUpperCase()} @ ${price.toFixed(8)} | Confidence: ${confidence.toFixed(2)}% | buyScore: ${buyScore.toFixed(1)} | sellScore: ${sellScore.toFixed(1)} | ATR: ${indicators.last.atr.toFixed(4)} | TPx${tpMultiplier.toFixed(2)} SLx${slMultiplier.toFixed(2)}`);
             }
 
+            // === Final rich TradeSignal return ===
             return {
                 symbol,
                 signal,
@@ -679,13 +939,14 @@ export class Strategy {
                 reason: reasons,
                 stopLoss: signal !== 'hold' ? Number(stopLoss?.toFixed(8)) : undefined,
                 takeProfit: signal !== 'hold' ? Number(takeProfit?.toFixed(8)) : undefined,
-                trailingStopDistance: signal !== 'hold' ? Number(trailingStopDistance?.toFixed(8)) : undefined,
-                positionSizeMultiplier: signal !== 'hold' ? Number(positionSizeMultiplier?.toFixed(3)) : undefined,
+                trailingStopDistance: signal !== 'hold' ? riskParams.trailingStopDistance : undefined,
+                positionSizeMultiplier: signal !== 'hold' ? riskParams.positionSizeMultiplier : undefined,
                 mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
                 features,
             };
         } catch (err) {
-            logger.error(`Error generating signal for ${symbol}`, { err });
+            // Global error handling – ensure we never crash the scanner
+            logger.error(`Error generating signal for ${symbol}`, { error: err instanceof Error ? err.stack : err });
             reasons.push(`Exception: ${(err as Error).message}`);
             return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
         }

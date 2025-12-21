@@ -2,12 +2,13 @@
 
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config/settings';
-import { dbService } from '../db';
+import { dbService, type EnrichedSymbolHistory } from '../db';
 import { createLogger } from '../logger';
 import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
 import { Condition, type TradeSignal } from '../../types';
 import { closeAndCleanUp } from '../..';
+import { computeExcursionRatio, getExcursionAdvice, isHighMaeRisk } from '../utils/excursionUtils';
 
 const logger = createLogger('TelegramBot');
 
@@ -49,40 +50,58 @@ const PAGE_SIZE = 5;
 export class TelegramBotController {
     private bot: TelegramBot;
     private readonly authorizedChatId: string;
-    private readonly exchange: ExchangeService;
-    private readonly mlService: MLService;
     private userStates: Map<number, AlertState> = new Map();
     private cleanupInterval: NodeJS.Timeout | null = null;
 
     /**
-     * Initializes the Telegram bot in polling mode.
-     * - Validates configuration and sets up command listeners.
-     * @param exchange - ExchangeService instance for market data and trading.
-     * @param mlService - MLService instance for model training and predictions.
-     * @throws {Error} If Telegram token or chat ID is missing.
-     */
-    constructor(exchange: ExchangeService, mlService: MLService) {
-        if (!config.telegram.token) {
-            throw new Error('Telegram Bot token is missing in config');
+ * Initializes the Telegram bot in polling mode.
+ * 
+ * Responsibilities:
+ *   • Validates required Telegram configuration
+ *   • Stores dependencies (exchange, mlService)
+ *   • Creates the TelegramBot instance with optimized polling settings
+ *   • Registers all command and event listeners
+ *   • Starts periodic cleanup of stale user interaction states
+ * 
+ * @param exchange - ExchangeService instance for fetching market data and executing trades
+ * @param mlService - MLService instance for model status and training control
+ * @throws {Error} If required Telegram credentials are missing
+ */
+    constructor(
+        private readonly exchange: ExchangeService,
+        private readonly mlService: MLService
+    ) {
+        // === 1. Validate required configuration ===
+        if (!config.telegram?.token) {
+            throw new Error('FATAL: Telegram bot token is missing from config (TELEGRAM_BOT_TOKEN)');
         }
-        if (!config.telegram.chatId) {
-            throw new Error('Telegram chatId (Authorized Chat ID) is missing in config');
+        if (!config.telegram?.chatId) {
+            throw new Error('FATAL: Authorized Telegram chat ID is missing from config (TELEGRAM_CHAT_ID)');
         }
 
+        // === 2. Store dependencies and config ===
         this.authorizedChatId = config.telegram.chatId;
-        this.exchange = exchange;
-        this.mlService = mlService;
 
+        // === 3. Initialize the TelegramBot client ===
         this.bot = new TelegramBot(config.telegram.token, {
             polling: {
-                interval: 300,
-                params: { timeout: 30 },
+                interval: 300,     // Check for updates every 300ms
+                params: { timeout: 30 }, // Long-poll timeout
             },
         });
-        logger.info('Telegram Bot initialized and started polling for commands with optimized settings.');
 
+        logger.info('Telegram Bot client initialized', {
+            chatId: this.authorizedChatId,
+            polling: true,
+        });
+
+        // === 4. Register all command handlers and event listeners ===
         this.registerListeners();
+
+        // === 5. Start background cleanup of stale user states ===
         this.startStateCleanup();
+
+        logger.info('TelegramBotController fully initialized and ready');
     }
 
     /**
@@ -103,30 +122,67 @@ export class TelegramBotController {
     }
 
     /**
-     * Registers all command handlers and event listeners for the bot.
-     * - Includes commands for alerts, status, mode switching, ML training, and trade monitoring.
+     * Registers all command handlers, regex-based commands, and global event listeners.
+     * 
+     * Design:
+     *   • Uses node-telegram-bot-api's onText() for exact and regex commands
+     *   • Groups commands logically for readability
+     *   • Centralizes all listener registration in one place
+     *   • Ensures no duplicate registrations
+     * 
      * @private
      */
     private registerListeners(): void {
-        this.bot.onText(/\/start|\/help/, this.handleHelp);
-        this.bot.onText(/\/status/, this.handleStatus);
-        this.bot.onText(/\/alerts/, this.handleAlerts);
-        this.bot.onText(/\/create_alert/, this.handleCreateAlertStart);
-        this.bot.onText(/\/edit_alert/, this.handleEditAlertStart);
-        this.bot.onText(/\/delete_alert/, this.handleDeleteAlertStart);
-        this.bot.onText(/\/ml_status/, this.handleMLStatus);
-        this.bot.onText(/\/ml_pause/, this.handleMLPause);
-        this.bot.onText(/\/ml_resume/, this.handleMLResume);
-        this.bot.onText(/\/ml_train/, this.handleMLForceTrain);
-        this.bot.onText(/\/ml_samples/, this.handleMLSamples);
-        this.bot.onText(/\/ml_performance/, this.handleMLPerformance);
-        this.bot.onText(/\/positions/, this.handlePositions);
-        this.bot.onText(/\/trades/, this.handleTrades);
-        this.bot.onText(/\/stopbot/, this.handleStopBot);
-        this.bot.onText(/\/excursions(?:\s+(.+))?/, this.handleExcursions);
+        // =================================================================
+        // 1. Basic & Help Commands
+        // =================================================================
+        this.bot.onText(/\/start|\/help/, this.handleHelp.bind(this));
 
-        this.bot.on('message', this.handleMessage);
-        this.bot.on('callback_query', this.handleCallbackQuery);
+        // =================================================================
+        // 2. System Status & Control
+        // =================================================================
+        this.bot.onText(/\/status/, this.handleStatus.bind(this));
+        this.bot.onText(/\/stopbot/, this.handleStopBot.bind(this));
+
+        // =================================================================
+        // 3. Custom Alert Management
+        // =================================================================
+        this.bot.onText(/\/alerts/, this.handleAlerts.bind(this));
+        this.bot.onText(/\/create_alert/, this.handleCreateAlertStart.bind(this));
+        this.bot.onText(/\/edit_alert/, this.handleEditAlertStart.bind(this));
+        this.bot.onText(/\/delete_alert/, this.handleDeleteAlertStart.bind(this));
+
+        // =================================================================
+        // 4. ML Model Control & Monitoring
+        // =================================================================
+        this.bot.onText(/\/ml_status/, this.handleMLStatus.bind(this));
+        this.bot.onText(/\/ml_pause/, this.handleMLPause.bind(this));
+        this.bot.onText(/\/ml_resume/, this.handleMLResume.bind(this));
+        this.bot.onText(/\/ml_train/, this.handleMLForceTrain.bind(this));
+        this.bot.onText(/\/ml_samples/, this.handleMLSamples.bind(this));
+        this.bot.onText(/\/ml_performance/, this.handleMLPerformance.bind(this));
+
+        // =================================================================
+        // 5. Live Trading Monitoring
+        // =================================================================
+        this.bot.onText(/\/positions/, this.handlePositions.bind(this));
+        this.bot.onText(/\/trades/, this.handleTrades.bind(this));
+
+        // =================================================================
+        // 6. Analytics & Diagnostics
+        // =================================================================
+        this.bot.onText(/\/excursions(?:\s+(.+))?/, this.handleExcursions.bind(this));
+
+        // =================================================================
+        // 7. Global Event Listeners (non-command input)
+        // =================================================================
+        // Handles free-text input during multi-step workflows (e.g., entering period/target)
+        this.bot.on('message', this.handleMessage.bind(this));
+
+        // Handles all inline keyboard interactions (selections, pagination, actions)
+        this.bot.on('callback_query', this.handleCallbackQuery.bind(this));
+
+        logger.info('All Telegram command and event listeners registered successfully');
     }
 
     /**
@@ -144,75 +200,133 @@ export class TelegramBotController {
     }
 
     /**
-     * Handles all incoming messages, including stateful input for alert creation/editing.
-     * - Processes period and target inputs for alert conditions.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
+ * Handles free-text messages during multi-step alert configuration workflows.
+ * 
+ * Supported steps:
+ *   • enter_period  → Parses integer period (1–500) for indicators like RSI/EMA
+ *   • select_target → Parses number, range (min-max), or indicator reference
+ * 
+ * Features:
+ *   • Strict validation with helpful error messages
+ *   • Automatic state progression on success
+ *   • Ignores non-stateful messages (commands handled separately)
+ * 
+ * @param msg - Incoming Telegram message
+ * @private
+ */
     private handleMessage = async (msg: TelegramBot.Message): Promise<void> => {
         const chatId = msg.chat.id;
+
+        // Security check
         if (!this.isAuthorized(chatId)) {
-            await this.bot.sendMessage(chatId, 'Unauthorized access. This bot only responds to messages from its configured primary chat ID.');
+            await this.sendMessage(
+                'Unauthorized access. This bot only responds to messages from its configured primary chat ID.'
+            );
             return;
         }
 
+        // Only process text messages in active workflow states
         const state = this.userStates.get(chatId);
         if (!state || !msg.text) return;
 
         const text = msg.text.trim();
 
-        // Handle period input for indicators
-        if (state.step === 'enter_period') {
-            const period = parseInt(text, 10);
-            if (isNaN(period) || period <= 0 || period > 500) {
-                await this.bot.sendMessage(chatId, 'Invalid input. Please enter a positive whole number for the period (1-500, e.g., 14).');
+        try {
+            // === STEP: Entering period for indicators (e.g., RSI(14)) ===
+            if (state.step === 'enter_period') {
+                const period = parseInt(text, 10);
+
+                if (isNaN(period) || period < 1 || period > 500) {
+                    await this.bot.sendMessage(
+                        chatId,
+                        '❌ Invalid period. Please enter a whole number between 1 and 500 (e.g., 14, 50, 200).'
+                    );
+                    return;
+                }
+
+                if (state.temp) {
+                    state.temp.period = period;
+                }
+
+                state.step = 'select_operator';
+                this.updateUserState(chatId, state);
+
+                await this.sendOperatorSelection(
+                    chatId,
+                    state.temp?.indicator as Condition['indicator']
+                );
                 return;
             }
-            if (state.temp) state.temp.period = period;
-            state.step = 'select_operator';
-            this.updateUserState(chatId, state);
-            await this.sendOperatorSelection(chatId, state.temp?.indicator as Condition['indicator']);
-            return;
-        }
 
-        // Handle target input (number, range, or indicator)
-        if (state.step === 'select_target') {
-            try {
+            // === STEP: Entering target value (number, range, or indicator) ===
+            if (state.step === 'select_target') {
                 let target: number | string | number[];
+
                 if (state.temp?.operator === 'is_in_range') {
+                    // Format: "20-80" or "30 - 70"
                     const parts = text.split('-').map(p => parseFloat(p.trim()));
                     if (parts.length !== 2 || parts.some(isNaN) || parts[0] >= parts[1]) {
-                        throw new Error('Invalid range');
+                        throw new Error('Invalid range format. Use: min-max (e.g., 20-80)');
                     }
-                    target = parts as number[];
+                    target = parts;
                 } else if (['crosses_above', 'crosses_below'].includes(state.temp?.operator || '')) {
-                    const validIndicators = ['close', 'high', 'low', 'volume', 'rsi', 'ema', 'sma', 'macd_line', 'macd_signal', 'bb_upper', 'bb_lower'];
-                    if (validIndicators.includes(text) || text.match(/^(ema|sma)_[0-9]+$/)) {
-                        target = text;
+                    // Allow indicator reference (e.g., "ema_200") or number
+                    const validIndicators = [
+                        'close', 'high', 'low', 'volume',
+                        'rsi', 'ema', 'sma', 'macd_line', 'macd_signal',
+                        'bb_upper', 'bb_lower'
+                    ];
+                    const isValidIndicator = validIndicators.includes(text.toLowerCase()) ||
+                        /^ema_\d+$/i.test(text) ||
+                        /^sma_\d+$/i.test(text);
+
+                    if (isValidIndicator) {
+                        target = text.toLowerCase();
                     } else {
                         const num = parseFloat(text);
-                        if (isNaN(num)) throw new Error('Invalid number or indicator');
+                        if (isNaN(num)) throw new Error('Expected a number or valid indicator (e.g., ema_200)');
                         target = num;
                     }
                 } else {
+                    // Standard numeric comparison
                     const num = parseFloat(text);
-                    if (isNaN(num)) throw new Error('Invalid number');
+                    if (isNaN(num)) throw new Error('Expected a numeric value (e.g., 70)');
                     target = num;
                 }
 
+                // Save condition and return to menu
                 if (state.temp) {
                     state.temp.target = target;
                     state.data.conditions.push(state.temp as Condition);
                 }
                 delete state.temp;
+
                 state.step = 'conditions_menu';
                 this.updateUserState(chatId, state);
+
                 await this.sendConditionsMenu(chatId, state.data);
-            } catch (error) {
-                await this.bot.sendMessage(chatId, 'Invalid input. Please enter a number, range (min-max, e.g., 20-80), or indicator (e.g., ema_200).');
+                return;
             }
+
+            // If we reach here: message not expected in current step
+            await this.bot.sendMessage(
+                chatId,
+                '⚠️ Unexpected input. Use the buttons or follow the current prompt.'
+            );
+        } catch (error: any) {
+            logger.warn('Invalid input in alert workflow', {
+                chatId,
+                step: state.step,
+                input: text,
+                error: error.message,
+            });
+
+            await this.bot.sendMessage(
+                chatId,
+                `❌ ${error.message || 'Invalid input. Please try again.'}`
+            );
         }
-    }
+    };
 
     /**
  * Handles the /stopbot command.
@@ -248,15 +362,26 @@ export class TelegramBotController {
     }
 
     /**
-     * Handles callback queries from inline keyboards.
-     * - Processes selections for symbols, timeframes, indicators, operators, and alert actions.
-     * @param query - Incoming callback query from Telegram.
-     * @private
-     */
+ * Handles all callback queries from inline keyboards.
+ * 
+ * Routes actions based on callback_data prefix:
+ *   • Symbol/timeframe/indicator/operator selection
+ *   • Pagination (alerts, positions, trades)
+ *   • Alert CRUD actions (save, cancel, delete)
+ * 
+ * Features:
+ *   • Full state management
+ *   • Comprehensive error handling with user feedback
+ *   • Always acknowledges query (prevents "loading" spinner)
+ * 
+ * @param query - Incoming callback query
+ * @private
+ */
     private handleCallbackQuery = async (query: TelegramBot.CallbackQuery): Promise<void> => {
         const chatId = query.message?.chat.id ?? query.from.id;
+
         if (!this.isAuthorized(chatId)) {
-            await this.bot.answerCallbackQuery(query.id, { text: 'Unauthorized' });
+            await this.bot.answerCallbackQuery(query.id, { text: '❌ Unauthorized', show_alert: true });
             return;
         }
 
@@ -266,722 +391,1252 @@ export class TelegramBotController {
             return;
         }
 
-        const state: AlertState = this.userStates.get(chatId) || {
-            mode: 'create',
-            step: '',
-            data: { symbol: '', timeframe: '', conditions: [] },
-            page: 0,
-            lastActivity: Date.now(),
-        };
+        // Load or initialize state
+        let state = this.userStates.get(chatId);
+        if (!state) {
+            state = {
+                mode: 'create',
+                step: '',
+                data: { symbol: '', timeframe: '', conditions: [] },
+                page: 0,
+                lastActivity: Date.now(),
+            };
+            this.userStates.set(chatId, state);
+        }
         this.updateUserState(chatId, state);
 
         try {
+            // =================================================================
+            // Alert Creation Flow
+            // =================================================================
             if (data.startsWith('alert_select_symbol:')) {
                 state.data.symbol = data.split(':')[1];
                 state.step = 'select_timeframe';
                 await this.sendTimeframeSelection(chatId);
+
             } else if (data.startsWith('alert_next_symbols:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendSymbolSelection(chatId, state.page);
+
             } else if (data.startsWith('alert_select_timeframe:')) {
                 state.data.timeframe = data.split(':')[1];
                 state.step = 'conditions_menu';
                 await this.sendConditionsMenu(chatId, state.data);
+
             } else if (data === 'alert_add_condition') {
                 state.step = 'select_indicator';
                 await this.sendIndicatorSelection(chatId);
+
             } else if (data.startsWith('alert_select_indicator:')) {
                 const indicator = data.split(':')[1] as Condition['indicator'];
                 state.temp = { indicator };
-                const indicatorTypes = ['rsi', 'ema', 'sma', 'macd_line', 'macd_signal', 'bb_upper', 'bb_lower'];
-                if (indicatorTypes.includes(indicator)) {
-                    state.step = 'enter_period';
-                    await this.bot.sendMessage(chatId, `Enter the **Period** for ${indicator.toUpperCase()} (e.g., 14, 20):`, { parse_mode: 'Markdown' });
+
+                const needsPeriod = ['rsi', 'ema', 'sma', 'macd_line', 'macd_signal', 'bb_upper', 'bb_lower'].includes(indicator);
+                state.step = needsPeriod ? 'enter_period' : 'select_operator';
+
+                if (needsPeriod) {
+                    await this.bot.sendMessage(
+                        chatId,
+                        `Enter the **Period** for ${indicator.toUpperCase()} (e.g., 14):`,
+                        { parse_mode: 'Markdown' }
+                    );
                 } else {
-                    state.step = 'select_operator';
                     await this.sendOperatorSelection(chatId, indicator);
                 }
+
             } else if (data.startsWith('alert_select_operator:')) {
                 const operator = data.split(':')[1] as Condition['operator'];
                 if (state.temp) state.temp.operator = operator;
                 state.step = 'select_target';
-                const indicatorName = state.temp?.indicator?.toUpperCase() || 'Value';
-                let prompt = '';
+
+                const indicatorName = (state.temp?.indicator || 'Value').toUpperCase();
+                let prompt = `Enter value for ${indicatorName} `;
+
                 if (operator === 'is_in_range') {
-                    prompt = `Enter range for ${indicatorName} as MIN-MAX (e.g., 20-80):`;
+                    prompt += '(format: min-max, e.g., 20-80)';
                 } else if (['crosses_above', 'crosses_below'].includes(operator)) {
-                    prompt = `Enter target for ${indicatorName} (number or indicator, e.g., 10000 or ema_200):`;
+                    prompt += '(number or indicator, e.g., 10000 or ema_200)';
                 } else {
-                    prompt = `Enter trigger value for ${indicatorName} (e.g., 70):`;
+                    prompt += '(e.g., 70)';
                 }
+
                 await this.bot.sendMessage(chatId, prompt);
+
             } else if (data === 'alert_remove_last') {
-                state.data.conditions.pop();
+                if (state.data.conditions.length > 0) {
+                    state.data.conditions.pop();
+                }
                 await this.sendConditionsMenu(chatId, state.data);
+
             } else if (data === 'alert_save') {
-                if (state.data.symbol === '' || state.data.timeframe === '' || state.data.conditions.length === 0) {
-                    await this.bot.sendMessage(chatId, 'Incomplete alert configuration. Please ensure symbol, timeframe, and at least one condition are set.');
+                if (!state.data.symbol || !state.data.timeframe || state.data.conditions.length === 0) {
+                    await this.bot.answerCallbackQuery(query.id, {
+                        text: 'Incomplete alert! Add symbol, timeframe, and conditions.',
+                        show_alert: true,
+                    });
                     return;
                 }
+
                 if (state.mode === 'create') {
-                    const newAlert = await dbService.createAlert({
+                    const newId = await dbService.createAlert({
                         symbol: state.data.symbol,
                         timeframe: state.data.timeframe,
                         conditions: state.data.conditions,
                         status: 'active',
                     });
-                    await this.bot.sendMessage(chatId, `Alert created with ID: ${newAlert}`);
+                    await this.bot.sendMessage(chatId, `✅ Alert created successfully! ID: ${newId}`);
                 } else if (state.mode === 'edit' && state.alertId) {
                     await dbService.updateAlert(Number(state.alertId), state.data);
-                    await this.bot.sendMessage(chatId, `Alert ${state.alertId} updated.`);
+                    await this.bot.sendMessage(chatId, `✅ Alert ${state.alertId} updated successfully!`);
                 }
+
                 this.userStates.delete(chatId);
+
             } else if (data === 'alert_cancel') {
                 this.userStates.delete(chatId);
                 await this.bot.sendMessage(chatId, 'Operation cancelled.');
+
+                // =================================================================
+                // Edit / Delete Flows
+                // =================================================================
             } else if (data.startsWith('alert_edit_select:')) {
                 const alertId = data.split(':')[1];
                 const alert = await dbService.getAlertsById(Number(alertId));
-                if (alert) {
-                    state.mode = 'edit';
-                    state.alertId = alertId;
-                    state.data = {
-                        symbol: alert.symbol,
-                        timeframe: alert.timeframe,
-                        conditions: alert.conditions,
-                    };
-                    state.step = 'edit_menu';
-                    await this.sendEditMenu(chatId);
-                } else {
+                if (!alert) {
                     await this.bot.sendMessage(chatId, `Alert ${alertId} not found.`);
+                    return;
                 }
+                state.mode = 'edit';
+                state.alertId = alertId;
+                state.data = {
+                    symbol: alert.symbol,
+                    timeframe: alert.timeframe,
+                    conditions: alert.conditions,
+                };
+                state.step = 'conditions_menu';
+                await this.sendConditionsMenu(chatId, state.data);
+
             } else if (data.startsWith('alert_delete_confirm:')) {
                 const alertId = data.split(':')[1];
-                await this.bot.sendMessage(chatId, `Confirm delete alert ${alertId}?`, {
+                await this.bot.sendMessage(chatId, `⚠️ Confirm deletion of alert ${alertId}?`, {
                     reply_markup: {
                         inline_keyboard: [
-                            [{ text: 'Yes', callback_data: `alert_delete_yes:${alertId}` }],
-                            [{ text: 'No', callback_data: 'alert_cancel' }],
+                            [{ text: 'Yes, delete', callback_data: `alert_delete_yes:${alertId}` }],
+                            [{ text: 'Cancel', callback_data: 'alert_cancel' }],
                         ],
                     },
                 });
+
             } else if (data.startsWith('alert_delete_yes:')) {
                 const alertId = data.split(':')[1];
                 await dbService.deleteAlert(Number(alertId));
-                await this.bot.sendMessage(chatId, `Alert ${alertId} deleted.`);
+                await this.bot.sendMessage(chatId, `🗑️ Alert ${alertId} deleted.`);
                 this.userStates.delete(chatId);
+
+                // =================================================================
+                // Pagination
+                // =================================================================
             } else if (data.startsWith('alerts_page:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendAlertsList(chatId, state.page);
+
             } else if (data.startsWith('edit_alerts_page:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendEditAlertSelection(chatId, state.page);
+
             } else if (data.startsWith('delete_alerts_page:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendDeleteAlertSelection(chatId, state.page);
+
             } else if (data.startsWith('positions_page:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendPositionsList(chatId, state.page);
+
             } else if (data.startsWith('trades_page:')) {
                 state.page = parseInt(data.split(':')[1], 10);
                 await this.sendTradesList(chatId, state.page);
             }
 
+            // Always acknowledge the callback
             await this.bot.answerCallbackQuery(query.id);
-        } catch (error) {
-            logger.error('Error handling callback query', { error });
-            await this.bot.answerCallbackQuery(query.id, { text: 'An error occurred.' });
-            this.userStates.delete(chatId);
-            await this.bot.sendMessage(chatId, '❌ An unexpected error occurred. Operation cancelled.');
-        }
-    }
 
+        } catch (error: any) {
+            logger.error('Error in callback query handler', {
+                chatId,
+                data,
+                error: error.message,
+                stack: error.stack,
+            });
+
+            await this.bot.answerCallbackQuery(query.id, {
+                text: 'An error occurred. Operation cancelled.',
+                show_alert: true,
+            });
+
+            this.userStates.delete(chatId);
+            await this.bot.sendMessage(chatId, '❌ Unexpected error. Workflow cancelled.');
+        }
+    };
     /**
-     * Sends symbol selection keyboard with pagination.
-     * - Displays supported symbols from ExchangeService.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number for pagination.
+     * Sends a paginated symbol selection keyboard.
+     * 
+     * Features:
+     *   • Alphabetically sorted symbols for easier navigation
+     *   • Clear page indicator
+     *   • Responsive Next/Previous buttons
+     *   • Graceful handling of empty symbol list
+     * 
+     * @param chatId - Target Telegram chat ID
+     * @param page - Current page (0-based)
      * @private
      */
     private async sendSymbolSelection(chatId: number, page: number = 0): Promise<void> {
-        const symbols = Array.from(this.exchange.getSupportedSymbols());
+        let symbols = Array.from(this.exchange.getSupportedSymbols());
+
         if (symbols.length === 0) {
-            await this.bot.sendMessage(chatId, '❌ No supported symbols available. Please ensure exchange is initialized.');
+            await this.bot.sendMessage(
+                chatId,
+                '❌ No trading pairs available. Exchange connection may be down or not initialized yet.'
+            );
             return;
         }
+
+        // Sort alphabetically for consistent, predictable ordering
+        symbols = symbols.sort((a, b) => a.localeCompare(b));
+
+        const totalPages = Math.ceil(symbols.length / PAGE_SIZE);
         const start = page * PAGE_SIZE;
-        const pageSymbols = symbols.slice(start, start + PAGE_SIZE);
+        const end = Math.min(start + PAGE_SIZE, symbols.length);
+        const pageSymbols = symbols.slice(start, end);
 
-        const inlineKeyboard = pageSymbols.map(symbol => [{ text: symbol, callback_data: `alert_select_symbol:${symbol}` }]);
-        if (start + PAGE_SIZE < symbols.length) {
-            inlineKeyboard.push([{ text: 'Next Page', callback_data: `alert_next_symbols:${page + 1}` }]);
-        }
+        const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = pageSymbols.map(symbol => [
+            { text: symbol, callback_data: `alert_select_symbol:${symbol}` }
+        ]);
+
+        // Add navigation row if needed
+        const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
         if (page > 0) {
-            inlineKeyboard.push([{ text: 'Previous Page', callback_data: `alert_next_symbols:${page - 1}` }]);
+            navigationRow.push({ text: '⬅️ Previous', callback_data: `alert_next_symbols:${page - 1}` });
+        }
+        if (end < symbols.length) {
+            navigationRow.push({ text: 'Next ➡️', callback_data: `alert_next_symbols:${page + 1}` });
+        }
+        if (navigationRow.length > 0) {
+            inlineKeyboard.push(navigationRow);
         }
 
-        await this.bot.sendMessage(chatId, `Step 1: Choose a Symbol (Page ${page + 1}):`, {
+        const message = totalPages > 1
+            ? `**Step 1: Select Symbol** (Page ${page + 1}/${totalPages})\n\nChoose a trading pair:`
+            : '**Step 1: Select Symbol**\n\nChoose a trading pair:';
+
+        await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: inlineKeyboard },
         });
     }
 
     /**
-     * Sends timeframe selection keyboard.
-     * @param chatId - Telegram chat ID.
+     * Sends a compact timeframe selection keyboard.
+     * 
+     * Features:
+     *   • 2-column layout for better mobile experience
+     *   • Clear labels with full names
+     *   • Consistent with common crypto timeframes
+     * 
+     * @param chatId - Target Telegram chat ID
      * @private
      */
     private async sendTimeframeSelection(chatId: number): Promise<void> {
-        const timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'];
-        const inlineKeyboard = timeframes.map(tf => [{ text: tf, callback_data: `alert_select_timeframe:${tf}` }]);
+        const timeframes = [
+            { value: '1m', label: '1 Minute' },
+            { value: '5m', label: '5 Minutes' },
+            { value: '15m', label: '15 Minutes' },
+            { value: '30m', label: '30 Minutes' },
+            { value: '1h', label: '1 Hour' },
+            { value: '4h', label: '4 Hours' },
+            { value: '1d', label: '1 Day' },
+            { value: '1w', label: '1 Week' },
+        ];
 
-        await this.bot.sendMessage(chatId, 'Step 2: Choose a Timeframe:', {
+        // 2-column grid layout
+        const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = [];
+        for (let i = 0; i < timeframes.length; i += 2) {
+            const row = [
+                { text: timeframes[i].label, callback_data: `alert_select_timeframe:${timeframes[i].value}` }
+            ];
+            if (i + 1 < timeframes.length) {
+                row.push({
+                    text: timeframes[i + 1].label,
+                    callback_data: `alert_select_timeframe:${timeframes[i + 1].value}`
+                });
+            }
+            inlineKeyboard.push(row);
+        }
+
+        await this.bot.sendMessage(chatId, '**Step 2: Select Timeframe**\n\nChoose the candle interval for your alert:', {
+            parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: inlineKeyboard },
         });
     }
 
     /**
-     * Sends indicator selection keyboard for alert conditions.
-     * @param chatId - Telegram chat ID.
+     * Sends an indicator selection keyboard with grouped layout.
+     * 
+     * Features:
+     *   • Logical grouping (price, volume, oscillators, bands)
+     *   • Clean uppercase labels
+     *   • 2–3 column layout for density
+     * 
+     * @param chatId - Target Telegram chat ID
      * @private
      */
     private async sendIndicatorSelection(chatId: number): Promise<void> {
-        const indicators = ['close', 'high', 'low', 'volume', 'rsi', 'ema', 'sma', 'macd_line', 'macd_signal', 'bb_upper', 'bb_lower'];
-        const inlineKeyboard = indicators.map(ind => [{ text: ind.toUpperCase(), callback_data: `alert_select_indicator:${ind}` }]);
+        const indicators = [
+            // Price & Volume
+            { value: 'close', label: 'CLOSE' },
+            { value: 'high', label: 'HIGH' },
+            { value: 'low', label: 'LOW' },
+            { value: 'volume', label: 'VOLUME' },
 
-        await this.bot.sendMessage(chatId, 'Choose Indicator:', {
-            reply_markup: { inline_keyboard: inlineKeyboard },
-        });
-    }
+            // Oscillators & Momentum
+            { value: 'rsi', label: 'RSI' },
+            { value: 'macd_line', label: 'MACD Line' },
+            { value: 'macd_signal', label: 'MACD Signal' },
 
-    /**
-     * Sends operator selection keyboard based on the selected indicator.
-     * @param chatId - Telegram chat ID.
-     * @param indicator - Selected indicator for the condition.
-     * @private
-     */
-    private async sendOperatorSelection(chatId: number, indicator: Condition['indicator']): Promise<void> {
-        const operators: Condition['operator'][] = ['crosses_above', 'crosses_below', '>', '<', '>=', '<=', 'is_equal', 'is_not_equal', 'is_in_range'];
-        const inlineKeyboard = operators.map(op => [{ text: op, callback_data: `alert_select_operator:${op}` }]);
+            // Moving Averages
+            { value: 'ema', label: 'EMA' },
+            { value: 'sma', label: 'SMA' },
 
-        await this.bot.sendMessage(chatId, `Choose Operator for ${indicator.toUpperCase()}:`, {
-            reply_markup: { inline_keyboard: inlineKeyboard },
-        });
-    }
-
-    /**
-     * Sends conditions menu with current alert settings and actions.
-     * @param chatId - Telegram chat ID.
-     * @param data - Current alert data (symbol, timeframe, conditions).
-     * @private
-     */
-    private async sendConditionsMenu(chatId: number, data: AlertState['data']): Promise<void> {
-        const conditionsText = data.conditions.length
-            ? data.conditions
-                .map(c => {
-                    const period = c.period ? `(${c.period})` : '';
-                    const target = Array.isArray(c.target) ? c.target.join('-') : c.target;
-                    return `  - ${c.indicator.toUpperCase()}${period} ${c.operator} ${target || '(No Target)'}`;
-                })
-                .join('\n')
-            : 'None';
-
-        const message = `*Current Alert Settings:*\n*Symbol*: ${data.symbol} (${data.timeframe})\n\n*Conditions:*\n\`\`\`\n${conditionsText}\n\`\`\`\n\n*Actions:*`;
-
-        const inlineKeyboard = [[{ text: '➕ Add Condition', callback_data: 'alert_add_condition' }]];
-        if (data.conditions.length > 0) {
-            inlineKeyboard.push([{ text: '➖ Remove Last Condition', callback_data: 'alert_remove_last' }]);
-            inlineKeyboard.push([{ text: '✅ Save Alert', callback_data: 'alert_save' }]);
-        }
-        inlineKeyboard.push([{ text: '❌ Cancel', callback_data: 'alert_cancel' }]);
-
-        await this.bot.sendMessage(chatId, message, {
-            reply_markup: { inline_keyboard: inlineKeyboard },
-            parse_mode: 'Markdown',
-        });
-    }
-
-    /**
-     * Sends edit menu for modifying an existing alert.
-     * @param chatId - Telegram chat ID.
-     * @private
-     */
-    private async sendEditMenu(chatId: number): Promise<void> {
-        const inlineKeyboard = [
-            [{ text: 'Edit Symbol', callback_data: 'alert_edit_symbol' }],
-            [{ text: 'Edit Timeframe', callback_data: 'alert_edit_timeframe' }],
-            [{ text: 'Edit Conditions', callback_data: 'alert_edit_conditions' }],
-            [{ text: 'Save', callback_data: 'alert_save' }],
-            [{ text: 'Cancel', callback_data: 'alert_cancel' }],
+            // Bollinger Bands
+            { value: 'bb_upper', label: 'BB Upper' },
+            { value: 'bb_lower', label: 'BB Lower' },
         ];
 
-        await this.bot.sendMessage(chatId, 'Edit Alert:', {
+        const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = [];
+        for (let i = 0; i < indicators.length; i += 3) {
+            const row: TelegramBot.InlineKeyboardButton[] = [];
+            for (let j = 0; j < 3 && i + j < indicators.length; j++) {
+                const ind = indicators[i + j];
+                row.push({
+                    text: ind.label,
+                    callback_data: `alert_select_indicator:${ind.value}`
+                });
+            }
+            inlineKeyboard.push(row);
+        }
+
+        await this.bot.sendMessage(chatId, '**Choose Indicator**\n\nSelect the technical indicator for your condition:', {
+            parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: inlineKeyboard },
         });
     }
 
     /**
-     * Sends paginated list of active alerts.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number.
-     * @private
-     */
+ * Sends an operator selection keyboard tailored to the chosen indicator.
+ * 
+ * Features:
+ *   • Human-readable operator labels (e.g., "Crosses Above" instead of "crosses_above")
+ *   • Logical grouping in 3-column layout for faster selection
+ *   • Clear prompt with context
+ * 
+ * @param chatId - Target Telegram chat ID
+ * @param indicator - The currently selected indicator
+ * @private
+ */
+    private async sendOperatorSelection(chatId: number, indicator: Condition['indicator']): Promise<void> {
+        // Human-readable mapping for better UX
+        const operatorMap: Array<{ value: Condition['operator']; label: string }> = [
+            { value: 'crosses_above', label: 'Crosses Above ↗️' },
+            { value: 'crosses_below', label: 'Crosses Below ↘️' },
+            { value: '>', label: 'Greater Than >' },
+            { value: '<', label: 'Less Than <' },
+            { value: '>=', label: 'Greater or Equal ≥' },
+            { value: '<=', label: 'Less or Equal ≤' },
+            { value: 'is_equal', label: 'Equals =' },
+            { value: 'is_not_equal', label: 'Not Equal ≠' },
+            { value: 'is_in_range', label: 'In Range [min-max]' },
+        ];
+
+        // 3-column grid for compact, fast selection
+        const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = [];
+        for (let i = 0; i < operatorMap.length; i += 3) {
+            const row: TelegramBot.InlineKeyboardButton[] = [];
+            for (let j = 0; j < 3 && i + j < operatorMap.length; j++) {
+                const op = operatorMap[i + j];
+                row.push({
+                    text: op.label,
+                    callback_data: `alert_select_operator:${op.value}`
+                });
+            }
+            inlineKeyboard.push(row);
+        }
+
+        await this.bot.sendMessage(
+            chatId,
+            `**Choose Operator for ${indicator.toUpperCase()}**\n\nSelect how the indicator should trigger the alert:`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: inlineKeyboard },
+            }
+        );
+    }
+
+    /**
+ * Sends the main conditions menu with live preview and action buttons.
+ * 
+ * Features:
+ *   • Clean, formatted current configuration summary
+ *   • Logical condition display with periods and targets
+ *   • Dynamic action buttons (only show relevant ones)
+ *   • Professional layout with status indicators
+ * 
+ * @param chatId - Target Telegram chat ID
+ * @param data - Current alert configuration state
+ * @private
+ */
+    private async sendConditionsMenu(chatId: number, data: AlertState['data']): Promise<void> {
+        // Build symbol/timeframe header
+        const header = data.symbol && data.timeframe
+            ? `**${data.symbol}** • ${data.timeframe.toUpperCase()}`
+            : 'Not set yet';
+
+        // Format conditions list
+        let conditionsText: string;
+        if (data.conditions.length === 0) {
+            conditionsText = '_No conditions added yet_';
+        } else {
+            conditionsText = data.conditions
+                .map((c, idx) => {
+                    const period = c.period ? `(${c.period})` : '';
+                    const target = Array.isArray(c.target)
+                        ? c.target.join('–')
+                        : c.target ?? '(pending)';
+
+                    return `${idx + 1}. ${c.indicator.toUpperCase()}${period} ${c.operator.replace(/_/g, ' ')} ${target}`;
+                })
+                .join('\n');
+        }
+
+        // Build message
+        const messageLines = [
+            `*Current Alert Configuration* 🔧`,
+            '',
+            `**Pair:** ${header}`,
+            '',
+            `**Conditions (${data.conditions.length}):**`,
+            '```',
+            conditionsText,
+            '```',
+            '',
+            `*Actions:*`,
+        ];
+
+        // Dynamic keyboard based on state
+        const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = [
+            [{ text: '➕ Add Condition', callback_data: 'alert_add_condition' }]
+        ];
+
+        if (data.conditions.length > 0) {
+            inlineKeyboard.push([
+                { text: '➖ Remove Last', callback_data: 'alert_remove_last' }
+            ]);
+
+            // Only show Save if configuration is complete
+            if (data.symbol && data.timeframe && data.conditions.length > 0) {
+                inlineKeyboard.push([
+                    { text: '💾 Save Alert', callback_data: 'alert_save' }
+                ]);
+            }
+        }
+
+        inlineKeyboard.push([
+            { text: '❌ Cancel', callback_data: 'alert_cancel' }
+        ]);
+
+        await this.bot.sendMessage(chatId, messageLines.join('\n'), {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: inlineKeyboard },
+        });
+    }
+
+    /**
+ * Sends a paginated list of all active custom alerts.
+ * 
+ * Features:
+ *   • Clear formatting with ID, symbol, timeframe, conditions
+ *   • Human-readable last trigger time
+ *   • Responsive pagination with page counter
+ *   • Empty state handling
+ * 
+ * @param chatId - Target Telegram chat ID
+ * @param page - Current page (0-based)
+ * @private
+ */
     private async sendAlertsList(chatId: number, page: number = 0): Promise<void> {
         try {
             const allAlerts = await dbService.getActiveAlerts();
-            if (!allAlerts.length) {
-                await this.bot.sendMessage(chatId, 'No custom alerts are currently active. Use `/create_alert` to add one.');
+
+            if (allAlerts.length === 0) {
+                await this.bot.sendMessage(
+                    chatId,
+                    'ℹ️ *No active custom alerts*\n\nUse `/create_alert` to set up your first alert.',
+                    { parse_mode: 'Markdown' }
+                );
                 return;
             }
 
+            const totalPages = Math.ceil(allAlerts.length / PAGE_SIZE);
             const start = page * PAGE_SIZE;
-            const pageAlerts = allAlerts.slice(start, start + PAGE_SIZE);
+            const end = Math.min(start + PAGE_SIZE, allAlerts.length);
+            const pageAlerts = allAlerts.slice(start, end);
+
             const alertSummaries = pageAlerts.map((alert: any) => {
-                const conditions = alert.conditions.map((c: any) => {
-                    const period = c.period ? `(${c.period})` : '';
-                    const target = Array.isArray(c.target) ? c.target.join('-') : c.target;
-                    return `${c.indicator.toUpperCase()}${period} ${c.operator} ${target}`;
-                }).join(' & ');
-                const lastTriggered = alert.lastAlertAt ? new Date(alert.lastAlertAt).toLocaleString() : 'Never';
-                return `**ID: ${alert.id}** (${alert.timeframe}) - ${alert.symbol}\n  Conditions: ${conditions}\n  Last Trigger: ${lastTriggered}`;
+                const conditions = alert.conditions
+                    .map((c: any) => {
+                        const period = c.period ? `(${c.period})` : '';
+                        const target = Array.isArray(c.target)
+                            ? c.target.join('–')
+                            : c.target ?? '(any)';
+
+                        return `${c.indicator.toUpperCase()}${period} ${c.operator.replace(/_/g, ' ')} ${target}`;
+                    })
+                    .join(' AND ');
+
+                const lastTriggered = alert.lastAlertAt
+                    ? new Date(alert.lastAlertAt).toLocaleString()
+                    : 'Never';
+
+                return [
+                    `**ID:** \`${alert.id}\` • **${alert.symbol}** • \`${alert.timeframe.toUpperCase()}\``,
+                    `**Conditions:** ${conditions}`,
+                    `**Last Triggered:** ${lastTriggered}`,
+                ].join('\n');
             });
 
-            const inlineKeyboard = [];
-            if (start + PAGE_SIZE < allAlerts.length) {
-                inlineKeyboard.push([{ text: 'Next Page', callback_data: `alerts_page:${page + 1}` }]);
-            }
+            // Navigation row
+            const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
             if (page > 0) {
-                inlineKeyboard.push([{ text: 'Previous Page', callback_data: `alerts_page:${page - 1}` }]);
+                navigationRow.push({
+                    text: '⬅️ Previous',
+                    callback_data: `alerts_page:${page - 1}`
+                });
+            }
+            if (end < allAlerts.length) {
+                navigationRow.push({
+                    text: 'Next ➡️',
+                    callback_data: `alerts_page:${page + 1}`
+                });
             }
 
-            const response = [`**Active Custom Alerts (Page ${page + 1})** 🔔:`, ...alertSummaries].join('\n\n');
-            await this.bot.sendMessage(chatId, response, {
-                reply_markup: { inline_keyboard: inlineKeyboard },
+            const message = [
+                `**Active Custom Alerts** 🔔`,
+                `Page ${page + 1} of ${totalPages}`,
+                '',
+                ...alertSummaries
+            ].join('\n\n');
+
+            await this.bot.sendMessage(chatId, message, {
                 parse_mode: 'Markdown',
+                reply_markup: navigationRow.length > 0
+                    ? { inline_keyboard: [navigationRow] }
+                    : undefined,
             });
-        } catch (error) {
-            logger.error('Error listing alerts', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to retrieve alerts. Database error.');
+        } catch (error: any) {
+            logger.error('Error listing active alerts', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to retrieve alerts. Please try again later.');
         }
     }
 
     /**
-     * Sends paginated list of alerts for editing.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number.
+     * Sends a paginated selection menu for editing an existing alert.
+     * 
+     * @param chatId - Target Telegram chat ID
+     * @param page - Current page (0-based)
      * @private
      */
     private async sendEditAlertSelection(chatId: number, page: number = 0): Promise<void> {
         try {
             const alerts = await dbService.getActiveAlerts();
-            if (!alerts.length) {
-                await this.bot.sendMessage(chatId, 'No active alerts to edit.');
+
+            if (alerts.length === 0) {
+                await this.bot.sendMessage(chatId, 'ℹ️ No active alerts available to edit.');
                 return;
             }
 
+            const totalPages = Math.ceil(alerts.length / PAGE_SIZE);
             const start = page * PAGE_SIZE;
-            const pageAlerts = alerts.slice(start, start + PAGE_SIZE);
-            const inlineKeyboard = pageAlerts.map(alert => [
-                { text: `${alert.id} - ${alert.symbol} (${alert.timeframe})`, callback_data: `alert_edit_select:${alert.id}` },
+            const end = Math.min(start + PAGE_SIZE, alerts.length);
+            const pageAlerts = alerts.slice(start, end);
+
+            const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = pageAlerts.map(alert => [
+                {
+                    text: `#${alert.id} • ${alert.symbol} • ${alert.timeframe.toUpperCase()}`,
+                    callback_data: `alert_edit_select:${alert.id}`
+                }
             ]);
 
-            if (start + PAGE_SIZE < alerts.length) {
-                inlineKeyboard.push([{ text: 'Next Page', callback_data: `edit_alerts_page:${page + 1}` }]);
-            }
+            // Pagination
+            const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
             if (page > 0) {
-                inlineKeyboard.push([{ text: 'Previous Page', callback_data: `edit_alerts_page:${page - 1}` }]);
+                navigationRow.push({ text: '⬅️ Previous', callback_data: `edit_alerts_page:${page - 1}` });
+            }
+            if (end < alerts.length) {
+                navigationRow.push({ text: 'Next ➡️', callback_data: `edit_alerts_page:${page + 1}` });
+            }
+            if (navigationRow.length > 0) {
+                inlineKeyboard.push(navigationRow);
             }
 
-            await this.bot.sendMessage(chatId, `Select Alert to Edit (Page ${page + 1}):`, {
-                reply_markup: { inline_keyboard: inlineKeyboard },
-            });
-        } catch (error) {
-            logger.error('Error listing alerts for edit', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to start alert edit.');
+            await this.bot.sendMessage(
+                chatId,
+                `**Select Alert to Edit** ✏️\nPage ${page + 1}/${totalPages}`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: inlineKeyboard },
+                }
+            );
+        } catch (error: any) {
+            logger.error('Error loading alerts for edit', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to load alerts for editing.');
         }
     }
 
     /**
-     * Sends paginated list of alerts for deletion.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number.
+     * Sends a paginated selection menu for deleting an alert (with confirmation step).
+     * 
+     * @param chatId - Target Telegram chat ID
+     * @param page - Current page (0-based)
      * @private
      */
     private async sendDeleteAlertSelection(chatId: number, page: number = 0): Promise<void> {
         try {
             const alerts = await dbService.getActiveAlerts();
-            if (!alerts.length) {
-                await this.bot.sendMessage(chatId, 'No active alerts to delete.');
+
+            if (alerts.length === 0) {
+                await this.bot.sendMessage(chatId, 'ℹ️ No active alerts available to delete.');
                 return;
             }
 
+            const totalPages = Math.ceil(alerts.length / PAGE_SIZE);
             const start = page * PAGE_SIZE;
-            const pageAlerts = alerts.slice(start, start + PAGE_SIZE);
-            const inlineKeyboard = pageAlerts.map(alert => [
-                { text: `${alert.id} - ${alert.symbol} (${alert.timeframe})`, callback_data: `alert_delete_confirm:${alert.id}` },
+            const end = Math.min(start + PAGE_SIZE, alerts.length);
+            const pageAlerts = alerts.slice(start, end);
+
+            const inlineKeyboard: TelegramBot.InlineKeyboardButton[][] = pageAlerts.map(alert => [
+                {
+                    text: `🗑️ #${alert.id} • ${alert.symbol} • ${alert.timeframe.toUpperCase()}`,
+                    callback_data: `alert_delete_confirm:${alert.id}`
+                }
             ]);
 
-            if (start + PAGE_SIZE < alerts.length) {
-                inlineKeyboard.push([{ text: 'Next Page', callback_data: `delete_alerts_page:${page + 1}` }]);
-            }
+            // Pagination
+            const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
             if (page > 0) {
-                inlineKeyboard.push([{ text: 'Previous Page', callback_data: `delete_alerts_page:${page - 1}` }]);
+                navigationRow.push({ text: '⬅️ Previous', callback_data: `delete_alerts_page:${page - 1}` });
+            }
+            if (end < alerts.length) {
+                navigationRow.push({ text: 'Next ➡️', callback_data: `delete_alerts_page:${page + 1}` });
+            }
+            if (navigationRow.length > 0) {
+                inlineKeyboard.push(navigationRow);
             }
 
-            await this.bot.sendMessage(chatId, `Select Alert to Delete (Page ${page + 1}):`, {
-                reply_markup: { inline_keyboard: inlineKeyboard },
-            });
-        } catch (error) {
-            logger.error('Error listing alerts for delete', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to start alert delete.');
+            await this.bot.sendMessage(
+                chatId,
+                `**Select Alert to Delete** 🗑️\nPage ${page + 1}/${totalPages}\n\n⚠️ This action cannot be undone.`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: inlineKeyboard },
+                }
+            );
+        } catch (error: any) {
+            logger.error('Error loading alerts for deletion', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to load alerts for deletion.');
         }
     }
 
     /**
-     * Sends paginated list of open positions.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number.
+     * Sends a paginated list of currently open positions.
+     * 
+     * Features:
+     *   • Clean, structured formatting with key metrics
+     *   • Page counter and responsive navigation
+     *   • Handles empty states and exchange errors gracefully
+     *   • Optimized for readability on mobile
+     * 
+     * @param chatId - Target Telegram chat ID
+     * @param page - Current page (0-based)
      * @private
      */
     private async sendPositionsList(chatId: number, page: number = 0): Promise<void> {
         try {
             const symbols = this.exchange.getSupportedSymbols();
+
             if (symbols.length === 0) {
-                await this.bot.sendMessage(chatId, '❌ No supported symbols available.');
+                await this.bot.sendMessage(chatId, '❌ No trading pairs available. Exchange may not be initialized.');
                 return;
             }
 
+            // Fetch all positions across symbols
             const allPositions: { symbol: string; position: any }[] = [];
             for (const symbol of symbols) {
-                const positions = await this.exchange.getPositions(symbol);
-                positions.forEach(p => allPositions.push({ symbol, position: p }));
+                try {
+                    const positions = await this.exchange.getPositions(symbol);
+                    positions.forEach(p => allPositions.push({ symbol, position: p }));
+                } catch (err) {
+                    logger.warn(`Failed to fetch positions for ${symbol}`, { error: err });
+                    // Continue with others
+                }
             }
 
             if (allPositions.length === 0) {
-                await this.bot.sendMessage(chatId, 'No open positions.');
+                await this.bot.sendMessage(chatId, 'ℹ️ *No open positions currently.*\n\nAll clear! 📈', { parse_mode: 'Markdown' });
                 return;
             }
 
+            const totalPages = Math.ceil(allPositions.length / PAGE_SIZE);
             const start = page * PAGE_SIZE;
-            const pagePositions = allPositions.slice(start, start + PAGE_SIZE);
+            const end = Math.min(start + PAGE_SIZE, allPositions.length);
+            const pagePositions = allPositions.slice(start, end);
+
             const positionSummaries = pagePositions.map(({ symbol, position }) => {
-                const side = position.side === 'long' ? 'Buy' : 'Sell';
+                const side = position.side === 'long' ? 'LONG 🟢' : 'SHORT 🔴';
                 const contracts = position.contracts ?? 0;
-                const entryPrice = position.entryPrice ?? 'N/A';
-                const unrealizedPnl = position.unrealizedPnl ?? 0;
-                return `**${symbol}** (${side})\n  Contracts: ${contracts}\n  Entry Price: ${entryPrice}\n  Unrealized PnL: ${unrealizedPnl.toFixed(2)} USDT`;
+                const entryPrice = position.entryPrice?.toFixed(8) ?? 'N/A';
+                const unrealizedPnl = (position.unrealizedPnl ?? 0).toFixed(2);
+                const pnlColor = parseFloat(unrealizedPnl) >= 0 ? '🟢' : '🔴';
+
+                return [
+                    `**${symbol}** • ${side}`,
+                    `   Contracts: ${contracts}`,
+                    `   Entry: $${entryPrice}`,
+                    `   Unrealized PnL: ${pnlColor} ${unrealizedPnl} USDT`,
+                ].join('\n');
             });
 
-            const inlineKeyboard = [];
-            if (start + PAGE_SIZE < allPositions.length) {
-                inlineKeyboard.push([{ text: 'Next Page', callback_data: `positions_page:${page + 1}` }]);
-            }
+            // Navigation row
+            const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
             if (page > 0) {
-                inlineKeyboard.push([{ text: 'Previous Page', callback_data: `positions_page:${page - 1}` }]);
+                navigationRow.push({ text: '⬅️ Previous', callback_data: `positions_page:${page - 1}` });
+            }
+            if (end < allPositions.length) {
+                navigationRow.push({ text: 'Next ➡️', callback_data: `positions_page:${page + 1}` });
             }
 
-            const response = [`**Open Positions (Page ${page + 1})** 📈:`, ...positionSummaries].join('\n\n');
-            await this.bot.sendMessage(chatId, response, {
-                reply_markup: { inline_keyboard: inlineKeyboard },
+            const message = [
+                `**Open Positions** 📈`,
+                `Page ${page + 1} of ${totalPages} • Total: ${allPositions.length}`,
+                '',
+                ...positionSummaries
+            ].join('\n\n');
+
+            await this.bot.sendMessage(chatId, message, {
                 parse_mode: 'Markdown',
+                reply_markup: navigationRow.length > 0
+                    ? { inline_keyboard: [navigationRow] }
+                    : undefined,
             });
-        } catch (error) {
-            logger.error('Error fetching positions', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to fetch positions. Exchange error.');
+        } catch (error: any) {
+            logger.error('Error fetching open positions', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to retrieve positions. Exchange may be temporarily unavailable.');
         }
     }
 
     /**
-     * Sends paginated list of recent closed trades.
-     * @param chatId - Telegram chat ID.
-     * @param page - Current page number.
+     * Sends a paginated list of recently closed trades (last 24 hours).
+     * 
+     * Features:
+     *   • Shows profit/loss with color indicators
+     *   • Human-readable timestamps
+     *   • Handles partial failures per symbol
+     *   • Clear empty state
+     * 
+     * @param chatId - Target Telegram chat ID
+     * @param page - Current page (0-based)
      * @private
      */
     private async sendTradesList(chatId: number, page: number = 0): Promise<void> {
         try {
             const symbols = this.exchange.getSupportedSymbols();
+
             if (symbols.length === 0) {
-                await this.bot.sendMessage(chatId, '❌ No supported symbols available.');
+                await this.bot.sendMessage(chatId, '❌ No trading pairs available.');
                 return;
             }
 
             const since = Date.now() - 24 * 60 * 60 * 1000; // Last 24 hours
             const allTrades: { symbol: string; trade: any }[] = [];
+
             for (const symbol of symbols) {
-                const trades = await this.exchange.getClosedTrades(symbol, since);
-                trades.forEach(t => allTrades.push({ symbol, trade: t }));
+                try {
+                    const trades = await this.exchange.getClosedTrades(symbol, since);
+                    trades.forEach(t => allTrades.push({ symbol, trade: t }));
+                } catch (err) {
+                    logger.warn(`Failed to fetch closed trades for ${symbol}`, { error: err });
+                }
             }
 
             if (allTrades.length === 0) {
-                await this.bot.sendMessage(chatId, 'No recent closed trades.');
+                await this.bot.sendMessage(chatId, 'ℹ️ *No closed trades in the last 24 hours.*\n\nQuiet market or no activity.', { parse_mode: 'Markdown' });
                 return;
             }
 
+            // Sort newest first
+            allTrades.sort((a, b) => (b.trade.timestamp || b.trade.datetime || 0) - (a.trade.timestamp || a.trade.datetime || 0));
+
+            const totalPages = Math.ceil(allTrades.length / PAGE_SIZE);
             const start = page * PAGE_SIZE;
-            const pageTrades = allTrades.slice(start, start + PAGE_SIZE);
+            const end = Math.min(start + PAGE_SIZE, allTrades.length);
+            const pageTrades = allTrades.slice(start, end);
+
             const tradeSummaries = pageTrades.map(({ symbol, trade }) => {
-                const side = trade.side === 'buy' ? 'Buy' : 'Sell';
-                const amount = trade.amount ?? 0;
-                const price = trade.price ?? 'N/A';
-                const profit = trade.info?.realized_pnl ?? 0;
-                const timestamp = trade.datetime ? new Date(trade.datetime).toLocaleString() : 'N/A';
-                return `**${symbol}** (${side})\n  Amount: ${amount}\n  Price: ${price}\n  Profit: ${profit.toFixed(2)} USDT\n  Time: ${timestamp}`;
+                const side = trade.side === 'buy' ? 'BUY 🟢' : 'SELL 🔴';
+                const amount = (trade.amount ?? 0).toFixed(6);
+                const price = trade.price?.toFixed(8) ?? 'N/A';
+                const profit = (trade.info?.realized_pnl ?? trade.realizedPnl ?? 0);
+                const profitStr = profit.toFixed(2);
+                const pnlColor = profit >= 0 ? '🟢' : '🔴';
+                const timestamp = trade.datetime
+                    ? new Date(trade.datetime).toLocaleString()
+                    : trade.timestamp
+                        ? new Date(trade.timestamp).toLocaleString()
+                        : 'Unknown';
+
+                return [
+                    `**${symbol}** • ${side}`,
+                    `   Amount: ${amount}`,
+                    `   Price: $${price}`,
+                    `   Profit: ${pnlColor} ${profitStr} USDT`,
+                    `   Time: ${timestamp}`,
+                ].join('\n');
             });
 
-            const inlineKeyboard = [];
-            if (start + PAGE_SIZE < allTrades.length) {
-                inlineKeyboard.push([{ text: 'Next Page', callback_data: `trades_page:${page + 1}` }]);
-            }
+            // Navigation
+            const navigationRow: TelegramBot.InlineKeyboardButton[] = [];
             if (page > 0) {
-                inlineKeyboard.push([{ text: 'Previous Page', callback_data: `trades_page:${page - 1}` }]);
+                navigationRow.push({ text: '⬅️ Previous', callback_data: `trades_page:${page - 1}` });
+            }
+            if (end < allTrades.length) {
+                navigationRow.push({ text: 'Next ➡️', callback_data: `trades_page:${page + 1}` });
             }
 
-            const response = [`**Recent Closed Trades (Last 24 Hours, Page ${page + 1})** 📉:`, ...tradeSummaries].join('\n\n');
-            await this.bot.sendMessage(chatId, response, {
-                reply_markup: { inline_keyboard: inlineKeyboard },
+            const message = [
+                `**Recent Closed Trades** 📉`,
+                `Last 24 hours • Page ${page + 1} of ${totalPages} • Total: ${allTrades.length}`,
+                '',
+                ...tradeSummaries
+            ].join('\n\n');
+
+            await this.bot.sendMessage(chatId, message, {
                 parse_mode: 'Markdown',
+                reply_markup: navigationRow.length > 0
+                    ? { inline_keyboard: [navigationRow] }
+                    : undefined,
             });
-        } catch (error) {
-            logger.error('Error fetching trades', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to fetch trades. Exchange error.');
+        } catch (error: any) {
+            logger.error('Error fetching closed trades', { error });
+            await this.bot.sendMessage(chatId, '❌ Failed to retrieve trade history. Exchange may be unavailable.');
         }
     }
 
     /**
-     * Handles the /start and /help commands.
-     * - Displays available commands and their descriptions.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
+ * Handles the /start and /help commands.
+ * 
+ * Displays a comprehensive, up-to-date command reference with:
+ *   • Clear categories
+ *   • Emojis for visual hierarchy
+ *   • Accurate descriptions
+ *   • Professional formatting
+ * 
+ * This is the primary onboarding and reference point for users.
+ * 
+ * @param msg - Incoming Telegram message
+ * @private
+ */
     private handleHelp = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
-        const helpText = '🤖 *Market Scanner Bot Commands*:\n\n' +
-            '• `/start` - Display this help message.\n' +
-            '• `/help` - Display this help message.\n' +
-            '• `/status` - Check worker health, lock status, and exchange connection.\n' +
-            '• `/stopbot` - Emergency stop: stops bot polling, clears memory, releases DB lock (use before restarting worker)\n' +
-            '• `/alerts` - List all active custom alerts with pagination.\n' +
-            '• `/create_alert` - Create a new custom alert with step-by-step configuration.\n' +
-            '• `/edit_alert` - Edit an existing alert (symbol, timeframe, conditions).\n' +
-            '• `/delete_alert` - Delete an existing alert with confirmation.\n' +
-            '• `/mode` - Switch between testnet and live trading modes.\n' +
-            '• `/ml_status` - Check ML model training status and sample count.\n' +
-            '• `/ml_pause` - Pause ML model training.\n' +
-            '• `/ml_resume` - Resume ML model training.\n' +
-            '• `/ml_train` - Force immediate ML model training.\n' +
-            '• `/ml_samples` - View summary of training samples by symbol.\n' +
-            '• `/ml_performance` - View trading performance metrics.\n' +
-            '• `/positions` - List open trading positions with pagination.\n' +
-            '• `/trades` - List recent closed trades (last 24 hours) with pagination.\n';
+
+        const helpText = [
+            '🤖 *Crypto Scanner Bot — Command Reference*',
+            '',
+            '*🔧 Alert Management*',
+            '• `/alerts` — List all active custom alerts (paginated)',
+            '• `/create_alert` — Step-by-step wizard to create a new alert',
+            '• `/edit_alert` — Modify an existing alert',
+            '• `/delete_alert` — Delete an alert (with confirmation)',
+            '',
+            '*📊 Monitoring & Analytics*',
+            '• `/status` — Bot health, lock, heartbeat, balance, and exchange status',
+            '• `/positions` — View current open positions',
+            '• `/trades` — Recent closed trades (last 24 hours)',
+            '• `/excursions [symbol]` — Show MAE/MFE excursion stats for a symbol',
+            '',
+            '*🧠 Machine Learning Controls*',
+            '• `/ml_status` — Model training status and sample count',
+            '• `/ml_pause` — Temporarily pause ML training',
+            '• `/ml_resume` — Resume ML training',
+            '• `/ml_train` — Force immediate model retraining',
+            '• `/ml_samples` — Training sample breakdown by symbol',
+            '• `/ml_performance` — Overall strategy performance metrics',
+            '',
+            '*⚙️ System Control*',
+            '• `/stopbot` — Emergency shutdown (releases lock, clears state)',
+            '',
+            '*ℹ️ Help*',
+            '• `/start` or `/help` — Show this message',
+            '',
+            '👤 Only authorized administrators can use these commands.',
+            '💡 Tip: Use inline keyboards during workflows for the best experience!',
+        ].join('\n');
 
         await this.bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
-    }
+    };
 
     /**
-     * Handles the /status command.
-     * - Reports worker status, lock state, heartbeat, exchange connection, and trading mode.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
+ * Handles the /status command.
+ * 
+ * Provides a comprehensive real-time health report including:
+ *   • Worker lock status
+ *   • Last heartbeat timestamp
+ *   • Exchange connection state
+ *   • Account balance
+ *   • Trading mode indicator
+ * 
+ * @param msg - Incoming Telegram message
+ * @private
+ */
     private handleStatus = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
         try {
             const lockStatus = await dbService.getLock();
-            const heartbeat = await dbService.getHeartbeatCount();
+            const heartbeatData = await dbService.getHeartbeatCount();
             const balance = await this.exchange.getAccountBalance();
+            const isLive = config.autoTrade;
+
+            const lastHeartbeat = heartbeatData
+                ? new Date(heartbeatData).toLocaleString()
+                : 'Never';
 
             const statusLines = [
-                '**Worker Status Report** 📊',
-                `\n*Operational Status*: ${lockStatus ? '🔴 RUNNING (LOCKED)' : '🟢 IDLE (UNLOCKED)'}`,
-                `\n*Last Heartbeat*: ${heartbeat ? new Date(heartbeat).toLocaleString() : 'N/A'}`,
-                `\n*Exchange Connection*: ${this.exchange.isInitialized() ? '✅ Connected' : '❌ Disconnected'}`,
-                `\n*Account Balance*: ${balance?.toFixed(2)} USDT`,
+                '*📊 Bot Status Report*',
+                '',
+                `*Mode:* ${isLive ? '🟢 **LIVE TRADING**' : '🔵 Testnet / Paper Mode'}`,
+                `*Worker:* ${lockStatus ? '🔒 Running (Locked)' : '🟢 Idle (Unlocked)'}`,
+                `*Last Heartbeat:* ${lastHeartbeat}`,
+                `*Exchange:* ${this.exchange.isInitialized() ? '✅ Connected' : '❌ Disconnected'}`,
+                `*Balance:* $${balance?.toFixed(2) ?? 'N/A'} USDT`,
+                '',
+                '✅ All systems nominal',
             ];
 
             await this.bot.sendMessage(msg.chat.id, statusLines.join('\n'), { parse_mode: 'Markdown' });
-        } catch (error) {
-            logger.error('Error fetching status data', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to fetch worker status. Database or exchange error.');
+        } catch (error: any) {
+            logger.error('Error generating status report', { error });
+
+            await this.bot.sendMessage(
+                msg.chat.id,
+                '❌ Unable to retrieve full status.\n\nSome services may be unavailable. Check logs for details.'
+            );
         }
-    }
+    };
 
     /**
-     * Handles the /alerts command.
-     * - Initiates paginated alert listing.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
+ * Handles the /alerts command.
+ * 
+ * Initiates the paginated view of all active custom alerts.
+ * Sets workflow state and jumps directly to the list.
+ * 
+ * @param msg - Incoming Telegram message
+ * @private
+ */
     private handleAlerts = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
-        this.updateUserState(msg.chat.id, { mode: 'alerts', step: 'view_alerts', page: 0 });
-        await this.sendAlertsList(msg.chat.id, 0);
-    }
+
+        const chatId = msg.chat.id;
+
+        // Set state for consistent pagination handling
+        this.updateUserState(chatId, {
+            mode: 'alerts',
+            step: 'view_alerts',
+            page: 0,
+            lastActivity: Date.now(),
+        });
+
+        await this.sendAlertsList(chatId, 0);
+    };
 
     /**
      * Handles the /create_alert command.
-     * - Initiates the alert creation workflow by prompting for symbol selection.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Starts the multi-step alert creation wizard:
+     *   1. Symbol selection
+     *   2. Timeframe
+     *   3. Conditions
+     * 
+     * Validates exchange readiness before beginning.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleCreateAlertStart = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+
         try {
             const symbols = Array.from(this.exchange.getSupportedSymbols());
+
             if (symbols.length === 0) {
-                await this.bot.sendMessage(msg.chat.id, '❌ Exchange is not initialized or has no supported symbols.');
+                await this.bot.sendMessage(
+                    chatId,
+                    '❌ Cannot start alert creation.\n\nExchange connection not ready or no trading pairs available.'
+                );
                 return;
             }
 
-            const chatId = msg.chat.id;
+            // Initialize clean state for creation workflow
             this.updateUserState(chatId, {
                 mode: 'create',
                 step: 'select_symbol',
                 data: { symbol: '', timeframe: '', conditions: [] },
                 page: 0,
+                lastActivity: Date.now(),
+            });
+
+            await this.bot.sendMessage(chatId, '🔔 *Create New Custom Alert*\n\nLet\'s begin! First, choose a trading pair:', {
+                parse_mode: 'Markdown',
             });
 
             await this.sendSymbolSelection(chatId, 0);
-        } catch (error) {
-            logger.error('Error starting alert creation', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to start alert creation. Exchange error.');
+        } catch (error: any) {
+            logger.error('Failed to initiate alert creation', { error, chatId });
+            await this.bot.sendMessage(
+                chatId,
+                '❌ Unable to start alert creation.\n\nPlease try again later or check exchange connection.'
+            );
         }
-    }
+    };
 
     /**
      * Handles the /edit_alert command.
-     * - Initiates paginated alert selection for editing.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Initiates selection of an existing alert for modification.
+     * Sets edit mode state and shows paginated selection menu.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleEditAlertStart = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
-        this.updateUserState(msg.chat.id, { mode: 'edit', step: 'select_alert', page: 0 });
-        await this.sendEditAlertSelection(msg.chat.id, 0);
-    }
+
+        const chatId = msg.chat.id;
+
+        this.updateUserState(chatId, {
+            mode: 'edit',
+            step: 'select_alert',
+            page: 0,
+            lastActivity: Date.now(),
+        });
+
+        await this.bot.sendMessage(chatId, '✏️ *Edit Existing Alert*\n\nSelect the alert you want to modify:', {
+            parse_mode: 'Markdown',
+        });
+
+        await this.sendEditAlertSelection(chatId, 0);
+    };
 
     /**
      * Handles the /delete_alert command.
-     * - Initiates paginated alert selection for deletion.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Initiates deletion workflow with confirmation.
+     * Shows paginated list with delete buttons.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleDeleteAlertStart = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
-        this.updateUserState(msg.chat.id, { mode: 'delete', step: 'delete_alert', page: 0 });
-        await this.sendDeleteAlertSelection(msg.chat.id, 0);
-    }
+
+        const chatId = msg.chat.id;
+
+        this.updateUserState(chatId, {
+            mode: 'delete',
+            step: 'delete_alert',
+            page: 0,
+            lastActivity: Date.now(),
+        });
+
+        await this.bot.sendMessage(
+            chatId,
+            '🗑️ *Delete Alert*\n\n⚠️ This action is permanent and cannot be undone.\n\nSelect an alert to remove:',
+            { parse_mode: 'Markdown' }
+        );
+
+        await this.sendDeleteAlertSelection(chatId, 0);
+    };
 
     /**
-     * Handles the /ml_status command.
-     * - Displays the current ML training status.
-     * @param msg - Incoming Telegram message.
-     * @private
-     */
+ * Handles the /ml_status command.
+ * 
+ * Displays comprehensive ML model status:
+ *   • Training paused/resumed state
+ *   • Model loaded or fresh
+ *   • Sample counts and readiness
+ * 
+ * @param msg - Incoming Telegram message
+ * @private
+ */
     private handleMLStatus = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+
         try {
             const status = await this.mlService.getStatus();
-            await this.bot.sendMessage(msg.chat.id, `**ML Training Status** 🤖\n\n${status}`, { parse_mode: 'Markdown' });
-        } catch (error) {
-            logger.error('Error fetching ML training status', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to fetch ML training status.');
+
+            await this.bot.sendMessage(
+                chatId,
+                `**🤖 Machine Learning Status**\n\n${status}`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (error: any) {
+            logger.error('Failed to retrieve ML status', { error, chatId });
+            await this.bot.sendMessage(chatId, '❌ Unable to fetch ML status at this time.');
         }
-    }
+    };
 
     /**
      * Handles the /ml_pause command.
-     * - Pauses ML model training.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Pauses ongoing ML model training.
+     * Provides confirmation and logs action.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleMLPause = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+        const username = msg.from?.username || msg.from?.first_name || 'unknown';
+
         try {
             this.mlService.pauseTraining();
-            await this.bot.sendMessage(msg.chat.id, 'ML training paused.');
-            logger.info('ML training paused', { user: msg.from?.username });
-        } catch (error) {
-            logger.error('Error pausing ML training', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to pause ML training.');
+
+            await this.bot.sendMessage(chatId, '⏸️ *ML training has been paused.*\n\nNew samples will be collected but no retraining will occur until resumed.');
+            logger.info('ML training paused by user', { username, chatId });
+        } catch (error: any) {
+            logger.error('Error pausing ML training', { error, username });
+            await this.bot.sendMessage(chatId, '❌ Failed to pause ML training.');
         }
-    }
+    };
 
     /**
      * Handles the /ml_resume command.
-     * - Resumes ML model training.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Resumes paused ML model training.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleMLResume = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+        const username = msg.from?.username || msg.from?.first_name || 'unknown';
+
         try {
             this.mlService.resumeTraining();
-            await this.bot.sendMessage(msg.chat.id, 'ML training resumed.');
-            logger.info('ML training resumed', { user: msg.from?.username });
-        } catch (error) {
-            logger.error('Error resuming ML training', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to resume ML training.');
+
+            await this.bot.sendMessage(chatId, '▶️ *ML training has been resumed.*\n\nRetraining will occur automatically when sufficient new samples are available.');
+            logger.info('ML training resumed by user', { username, chatId });
+        } catch (error: any) {
+            logger.error('Error resuming ML training', { error, username });
+            await this.bot.sendMessage(chatId, '❌ Failed to resume ML training.');
         }
-    }
+    };
 
     /**
      * Handles the /ml_train command.
-     * - Forces immediate ML model training.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Forces an immediate retraining of the ML model regardless of sample threshold.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleMLForceTrain = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+        const username = msg.from?.username || msg.from?.first_name || 'unknown';
+
         try {
+            await this.bot.sendMessage(chatId, '🔄 *Forcing ML model retraining...*\n\nThis may take 30–90 seconds depending on sample count.');
+
             await this.mlService.forceRetrain();
-            await this.bot.sendMessage(msg.chat.id, 'ML model training forced successfully.');
-            logger.info('Forced ML model training', { user: msg.from?.username });
-        } catch (error) {
-            logger.error('Error forcing ML training', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to force ML training.');
+
+            await this.bot.sendMessage(chatId, '✅ *ML model retraining completed successfully!*');
+            logger.info('Forced ML retraining completed', { username, chatId });
+        } catch (error: any) {
+            logger.error('Error during forced ML training', { error, username });
+            await this.bot.sendMessage(chatId, '❌ Failed to complete forced training.\n\nCheck logs for details.');
         }
-    }
+    };
 
     /**
      * Handles the /ml_samples command.
-     * - Displays a summary of training samples by symbol.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Shows a detailed breakdown of training samples by symbol.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleMLSamples = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+
         try {
             const summary = await this.mlService.getSampleSummary();
-            await this.bot.sendMessage(msg.chat.id, `**Training Sample Summary** 📈\n\n${summary}`, { parse_mode: 'Markdown' });
-        } catch (error) {
-            logger.error('Error fetching ML sample summary', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to fetch training sample summary.');
+
+            await this.bot.sendMessage(
+                chatId,
+                `**📈 Training Sample Summary**\n\n${summary}`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (error: any) {
+            logger.error('Error fetching training sample summary', { error, chatId });
+            await this.bot.sendMessage(chatId, '❌ Unable to retrieve sample summary.');
         }
-    }
+    };
 
     /**
      * Handles the /ml_performance command.
-     * - Displays trading performance metrics.
-     * @param msg - Incoming Telegram message.
+     * 
+     * Displays overall strategy performance metrics derived from simulations.
+     * 
+     * @param msg - Incoming Telegram message
      * @private
      */
     private handleMLPerformance = async (msg: TelegramBot.Message): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
+        const chatId = msg.chat.id;
+
         try {
             const metrics = await this.mlService.getPerformanceMetrics();
-            await this.bot.sendMessage(msg.chat.id, `**Trading Performance Metrics** 📊\n\n${metrics}`, { parse_mode: 'Markdown' });
-        } catch (error) {
-            logger.error('Error fetching ML performance metrics', { error });
-            await this.bot.sendMessage(msg.chat.id, '❌ Failed to fetch performance metrics.');
+
+            await this.bot.sendMessage(
+                chatId,
+                `**📊 Strategy Performance Metrics**\n\n${metrics}`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (error: any) {
+            logger.error('Error fetching performance metrics', { error, chatId });
+            await this.bot.sendMessage(chatId, '❌ Unable to retrieve performance metrics.');
         }
-    }
+    };
 
     /**
      * Handles the /positions command.
@@ -1008,86 +1663,163 @@ export class TelegramBotController {
     }
 
     /**
-     * Updates the user state with new data and refreshes the last activity timestamp.
-     * @param chatId - Telegram chat ID.
-     * @param newState - Partial state to update.
-     * @private
-     */
+ * Updates (or creates) a user's workflow state and refreshes activity timestamp.
+ * 
+ * Purpose:
+ *   • Centralizes all state mutations
+ *   • Ensures `lastActivity` is always current (critical for stale cleanup)
+ *   • Provides safe defaults for new users
+ * 
+ * Used throughout multi-step workflows (alert creation, editing, pagination).
+ * 
+ * @param chatId - Telegram chat ID of the user
+ * @param newState - Partial state updates to merge
+ * @private
+ */
     private updateUserState(chatId: number, newState: Partial<AlertState>): void {
-        const currentState = this.userStates.get(chatId) || {
-            mode: 'create',
+        // Retrieve existing state or initialize with clean defaults
+        const currentState: AlertState = this.userStates.get(chatId) || {
+            mode: 'create',                    // Default workflow mode
             step: '',
-            data: { symbol: '', timeframe: '', conditions: [] },
+            data: {
+                symbol: '',
+                timeframe: '',
+                conditions: [],
+            },
+            temp: undefined,
+            alertId: undefined,
             page: 0,
             lastActivity: Date.now(),
         };
 
-        this.userStates.set(chatId, {
+        // Merge updates and always refresh activity timestamp
+        const updatedState: AlertState = {
             ...currentState,
             ...newState,
+            // Ensure nested objects are properly merged
+            data: {
+                ...currentState.data,
+                ...(newState.data || {}),
+            },
             lastActivity: Date.now(),
+        };
+
+        // Store back in map
+        this.userStates.set(chatId, updatedState);
+
+        logger.debug('User state updated', {
+            chatId,
+            mode: updatedState.mode,
+            step: updatedState.step,
+            symbol: updatedState.data.symbol,
+            conditionsCount: updatedState.data.conditions.length,
         });
     }
 
+        /**
+     * Handles the /excursions [symbol] command.
+     * 
+     * Displays comprehensive excursion statistics for a symbol:
+     *   • Lifetime averages (MFE/MAE/Ratio)
+     *   • Recent regime (last ~3h): samples, reversals, MFE/MAE
+     *   • Directional asymmetry (long vs short)
+     *   • Risk assessment and visual indicators
+     * 
+     * Falls back gracefully if only partial data available.
+     * 
+     * @param msg - Incoming Telegram message
+     * @param match - Regex match from onText (symbol captured)
+     * @private
+     */
     private handleExcursions = async (msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
         const chatId = msg.chat.id;
-        const symbol = match?.[1]?.trim();
+        const symbolInput = match?.[1]?.trim().toUpperCase();
 
-        if (!symbol) {
-            await this.bot.sendMessage(chatId, 'Usage: `/excursions BTC/USDT`\n\nShows historical MAE/MFE stats for a symbol.');
+        if (!symbolInput) {
+            await this.bot.sendMessage(
+                chatId,
+                '*Usage:* `/excursions BTC/USDT`\n\nShows detailed excursion (MFE/MAE) statistics for a symbol, including recent regime behavior.',
+                { parse_mode: 'Markdown' }
+            );
             return;
         }
 
         try {
-            const excursions = await dbService.getSymbolExcursions(symbol);
-            if (!excursions || excursions.avgMae === 0) {
-                await this.bot.sendMessage(chatId, `No excursion data yet for *${symbol}*. Run simulations first!`, { parse_mode: 'Markdown' });
+            const history = await dbService.getEnrichedSymbolHistory(symbolInput);
+
+            if (!history || (history.avgMfe === 0 && history.recentMfe === 0)) {
+                await this.bot.sendMessage(
+                    chatId,
+                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nSimulations must run first to collect MFE/MAE stats.`,
+                    { parse_mode: 'Markdown' }
+                );
                 return;
             }
 
-            const { avgMfe, avgMae, ratio } = excursions;
-            const ratioColor = ratio > 1.5 ? '🟢' : ratio < 1 ? '🔴' : '🟡';
-            const maeColor = avgMae > config.strategy.maxMaePct ? '🔴' : '🟢';
+            const lines: string[] = [`**Excursion Analysis: ${symbolInput}** 📊`];
 
-            const msgText = [
-                `**Excursion Stats for ${symbol}** 📊`,
-                '',
-                `Average MFE: ${avgMfe.toFixed(2)}% ${ratioColor}`,
-                `Average MAE: ${avgMae.toFixed(2)}% ${maeColor}`,
-                `MFE/MAE Ratio: ${ratio.toFixed(2)} ${ratioColor}`,
-                '',
-                `Risk Level: ${ratioColor === '🟢' ? 'Low' : ratioColor === '🔴' ? 'High' : 'Moderate'}`,
-            ].join('\n');
+            // === Lifetime Stats ===
+            const lifetimeRatio = history.avgExcursionRatio || computeExcursionRatio(history.avgMfe, history.avgMae);
+            const lifetimeColor = lifetimeRatio > 1.8 ? '🟢' : lifetimeRatio < 1.2 ? '🔴' : '🟡';
 
-            await this.bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
-        } catch (error) {
-            logger.error('Error fetching excursions', { error });
-            await this.bot.sendMessage(chatId, '❌ Failed to fetch excursion stats. Try again later.');
+            lines.push('');
+            lines.push('*Lifetime Averages*');
+            lines.push(`MFE: ${history.avgMfe.toFixed(2)}%`);
+            lines.push(`MAE: ${history.avgMae.toFixed(2)}% ${history.avgMae > (config.strategy.maxMaePct ?? 3.0) ? '🔴' : '🟢'}`);
+            lines.push(`Ratio: ${lifetimeRatio.toFixed(2)} ${lifetimeColor}`);
+
+            // === Recent Regime (if available) ===
+            if (history.recentSampleCount > 0) {
+                const recentRatio = computeExcursionRatio(history.recentMfe, history.recentMae);
+                const recentColor = recentRatio > 1.8 ? '🟢' : recentRatio < 1.0 ? '🔴' : '🟡';
+                const totalRev = history.recentReverseCount;
+
+                lines.push('');
+                lines.push(`*Recent Regime (last ~${config.strategy.recentWindowHours}h)*`);
+                lines.push(`Samples: ${history.recentSampleCount}`);
+                lines.push(`Reversals: ${totalRev} (Long: ${history.recentReverseCountLong} | Short: ${history.recentReverseCountShort}) ${totalRev >= 3 ? '⚠️ High' : totalRev >= 2 ? '🟡 Moderate' : ''}`);
+                lines.push(`Recent MFE: ${history.recentMfe.toFixed(2)}%`);
+                lines.push(`Recent MAE: ${history.recentMae.toFixed(2)}%`);
+                lines.push(`Recent Ratio: ${recentRatio.toFixed(2)} ${recentColor}`);
+
+                if (totalRev >= 3 && recentRatio < 1.0) {
+                    lines.push('→ *Mean-reversion regime detected* – consider fading or reducing targets');
+                } else if (recentRatio > 2.0) {
+                    lines.push('→ *Strong trending reward* – favorable excursions');
+                } else if (recentRatio < 1.0) {
+                    lines.push('→ *Low reward phase* – consider early profit taking');
+                }
+            }
+
+            // === Directional Asymmetry ===
+            if (history.avgMfeLong > 0 || history.avgMfeShort > 0) {
+                const longRatio = computeExcursionRatio(history.avgMfeLong, history.avgMaeLong);
+                const shortRatio = computeExcursionRatio(history.avgMfeShort, history.avgMaeShort);
+
+                lines.push('');
+                lines.push('*Directional Bias*');
+                lines.push(`Long MFE/MAE: ${history.avgMfeLong.toFixed(2)}% / ${history.avgMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
+                lines.push(`Short MFE/MAE: ${history.avgMfeShort.toFixed(2)}% / ${history.avgMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
+            }
+
+            // === Final Risk Assessment ===
+            lines.push('');
+            const overallRisk = isHighMaeRisk(history, 'long') || isHighMaeRisk(history, 'short')
+                ? '🔴 High drawdown risk'
+                : lifetimeRatio > 1.8
+                ? '🟢 Low risk – strong reward profile'
+                : '🟡 Moderate risk';
+
+            lines.push(`**Assessment:** ${overallRisk}`);
+
+            await this.bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
+        } catch (error: any) {
+            logger.error('Error in /excursions command', { symbol: symbolInput, error });
+            await this.bot.sendMessage(chatId, '❌ Failed to retrieve excursion statistics. Please try again later.');
         }
     };
-
-    // ===========================================================================
-    // SIGNAL ALERTS – Now include excursion advice
-    // ===========================================================================
-    public async sendSignalAlert(symbol: string, signal: TradeSignal, price: number, excursionAdvice: string): Promise<void> {
-        const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-        const lines = [
-            `**${signal.signal.toUpperCase()} SIGNAL**`,
-            `**Symbol:** ${escape(symbol)}`,
-            `**Price:** $${escape(price.toFixed(8))}`,
-            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
-            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
-            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(\\≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
-            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
-            `**Excursion Insight:** ${escape(excursionAdvice)}`,  // ← NEW: Excursion advice
-            `**Reasons:**`,
-            ...signal.reason.map(r => `• ${escape(r)}`),
-        ].filter(Boolean);
-
-        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
-    }
 
     /**
      * Starts periodic cleanup of stale user states.
@@ -1113,6 +1845,116 @@ export class TelegramBotController {
         }, 5 * 60 * 1000);
     }
 
+    // ===========================================================================
+    // SIGNAL ALERTS – Now with rich recent regime insights
+    // ===========================================================================
+    /**
+     * Sends a detailed, actionable signal alert to the authorized chat.
+     * Includes:
+     *   - Signal basics (symbol, price, confidence, SL/TP)
+     *   - Excursion advice (from getExcursionAdvice)
+     *   - Recent regime summary (last ~3h): samples, reversals, MFE/MAE
+     *   - Auto-reversal info if applicable
+     *   - All original reasons from Strategy
+     * Sends a detailed signal alert with full context.
+     * 
+     * @param symbol - Trading pair
+     * @param signal - Original TradeSignal from Strategy
+     * @param price - Current market price
+     * @param excursionAdvice - Optional pre-computed excursion advice string
+     * @param history - Optional enriched history (fetched once if provided)
+     * @param reversalInfo - Optional: only used by AutoTradeService when reversing
+     */
+    public async sendSignalAlert(
+        symbol: string,
+        signal: TradeSignal,
+        price: number,
+        excursionAdvice?: string,
+        history?: EnrichedSymbolHistory,
+        reversalInfo?: {
+            wasReversed: boolean;
+            originalSignal: 'buy' | 'sell';
+            reversalReason: string;
+        }
+    ): Promise<void> {
+        const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+
+        const lines = [
+            `**${signal.signal.toUpperCase()} SIGNAL** ${signal.signal !== 'hold' ? '🚀' : '🟡'}`,
+            `**Symbol:** ${escape(symbol)}`,
+            `**Price:** $${escape(price.toFixed(8))}`,
+            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
+            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
+            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(\\≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
+            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
+        ].filter(Boolean);
+
+        // === Auto-reversal header (only if triggered by AutoTrade) ===
+        if (reversalInfo?.wasReversed) {
+            lines.unshift('');
+            lines.unshift(`⚠️ **AUTO-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
+            lines.unshift(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
+            lines.unshift(`**New TP:** halfway to original SL (mean-reversion target)`);
+        }
+
+        // === Recent regime summary ===
+        let regimeHistory = history;
+        if (!regimeHistory) {
+            regimeHistory = await dbService.getEnrichedSymbolHistory(symbol) ?? undefined;
+        }
+
+        if (regimeHistory && regimeHistory.recentSampleCount > 0) {
+            const recentSamples = regimeHistory.recentSampleCount;
+            const recentMfe = regimeHistory.recentMfe.toFixed(2);
+            const recentMae = regimeHistory.recentMae.toFixed(2);
+            const recentRatio = (regimeHistory.recentMfe / Math.max(regimeHistory.recentMae, 1e-6)).toFixed(2);
+
+            const longRev = regimeHistory.recentReverseCountLong;
+            const shortRev = regimeHistory.recentReverseCountShort;
+            const totalRev = regimeHistory.recentReverseCount;
+
+            lines.push('');
+            lines.push('**Recent Regime (last ~3h)** 📊');
+            lines.push(`• Samples: ${recentSamples} | Reversals: ${totalRev} (long: ${longRev}, short: ${shortRev})`);
+            lines.push(`• Recent MFE: ${recentMfe}% | MAE: ${recentMae}% → Ratio: ${recentRatio}`);
+
+            if (parseFloat(recentRatio) < 1.0) {
+                lines.push('→ Low reward phase – consider early profit taking or fading');
+            } else if (parseFloat(recentRatio) > 2.0) {
+                lines.push('→ Strong reward phase – favorable excursions');
+            } else {
+                lines.push('→ Balanced regime – standard risk management');
+            }
+
+            if (totalRev >= 3) {
+                lines.push('⚠️ High reversal risk – possible mean-reversion detected');
+            } else if (totalRev >= 2) {
+                lines.push('🟡 Moderate reversal activity – monitor closely');
+            }
+        }
+
+        // === Excursion insight (fallback if not provided) ===
+        let finalExcursionAdvice = excursionAdvice;
+        if (!finalExcursionAdvice && regimeHistory) {
+            const direction = signal.signal === 'buy' ? 'long' : 'short';
+            finalExcursionAdvice = getExcursionAdvice(regimeHistory, direction).advice;
+        }
+
+        if (finalExcursionAdvice) {
+            lines.push('');
+            lines.push(`**Excursion Insight:** ${escape(finalExcursionAdvice)}`);
+        }
+
+        // === Reasons from Strategy ===
+        if (signal.reason.length > 0) {
+            lines.push('');
+            lines.push('**Reasons:**');
+            signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
+        }
+
+        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
+    }
+
     /**
      * Stops the bot from polling and clears the cleanup interval.
      */
@@ -1128,17 +1970,47 @@ export class TelegramBotController {
     }
 
     /**
-     * Sends a message to the authorized chat ID.
-     * - Used for alerts and notifications.
-     * @param message - Message to send.
-     * @throws {Error} If sending the message fails.
-     */
-    public async sendMessage(message: string, options?: TelegramBot.SendMessageOptions): Promise<void> {
+ * Sends a message to the pre-configured authorized chat.
+ * 
+ * Used throughout the bot for:
+ *   • Trade signal alerts
+ *   • Custom alert triggers
+ *   • Command responses and confirmations
+ *   • System notifications
+ * 
+ * All messages are routed through this method to ensure:
+ *   • Consistent logging
+ *   • Centralized error handling
+ *   • Single point of truth for the target chat ID
+ * 
+ * @param message - The message content (supports MarkdownV2 if parse_mode is set)
+ * @param options - Optional Telegram sendMessage options (e.g., parse_mode, reply_markup)
+ * @throws {Error} Re-throws any Telegram API error for upstream handling
+ */
+    public async sendMessage(
+        message: string,
+        options?: TelegramBot.SendMessageOptions
+    ): Promise<void> {
         try {
             await this.bot.sendMessage(this.authorizedChatId, message, options);
-            logger.info('Message sent to Telegram', { message: message.substring(0, 50) });
-        } catch (error) {
-            logger.error('Failed to send Telegram message', { error });
+
+            // Log a short preview for traceability (avoid flooding logs with huge messages)
+            const preview = message.length > 100 ? message.substring(0, 97) + '...' : message;
+            logger.info('Telegram message sent successfully', {
+                chatId: this.authorizedChatId,
+                preview,
+                hasMarkup: !!options?.reply_markup,
+                parseMode: options?.parse_mode,
+            });
+        } catch (error: any) {
+            logger.error('Failed to send message to Telegram', {
+                chatId: this.authorizedChatId,
+                errorMessage: error.message,
+                errorCode: error.code,
+                response: error.response?.body,
+            });
+
+            // Re-throw to allow callers to handle gracefully (e.g., retry or fallback)
             throw error;
         }
     }

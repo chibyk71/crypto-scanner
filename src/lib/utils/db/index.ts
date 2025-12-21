@@ -51,6 +51,15 @@ import { createLogger } from '../logger';
 const logger = createLogger('db');
 
 // ===========================================================================
+// FATAL CONFIG VALIDATION – Fail fast if DB URL is missing
+// ===========================================================================
+if (!config.databaseUrl) {
+    logger.error('FATAL: DATABASE_URL is missing from config');
+    throw new Error('DATABASE_URL environment variable is required');
+}
+
+
+// ===========================================================================
 // ENRICHED SYMBOL HISTORY TYPE
 // ===========================================================================
 export interface EnrichedSymbolHistory extends SymbolHistory {
@@ -71,13 +80,6 @@ export interface EnrichedSymbolHistory extends SymbolHistory {
     winRateShort: number;
 }
 
-// ===========================================================================
-// FATAL CONFIG VALIDATION – Fail fast if DB URL is missing
-// ===========================================================================
-if (!config.databaseUrl) {
-    logger.error('FATAL: DATABASE_URL is missing from config');
-    throw new Error('DATABASE_URL environment variable is required');
-}
 
 /**
  * DatabaseService – Core class managing MySQL connection and all queries
@@ -1019,6 +1021,9 @@ class DatabaseService {
         await this.updateSymbolHistoryExcursions(trade.symbol);
     }
 
+
+
+
     // =========================================================================
     // SYMBOL EXCURSION STATS: Fast read of pre-computed averages
     // =========================================================================
@@ -1053,6 +1058,8 @@ class DatabaseService {
         // Return null if symbol has no history yet
         return result || null;
     }
+
+
 
     // =========================================================================
     // SYMBOL EXCURSION STATS: Recalculate and update denormalized averages
@@ -1146,6 +1153,69 @@ class DatabaseService {
             symbol,
             avgMfe: avgMfe.toFixed(2),
             avgMae: avgMae.toFixed(2),
+            ratio: ratio.toFixed(2),
+        });
+    }
+
+    // =========================================================================
+    // SYMBOL EXCURSION STATS: Interim update during active simulation
+    // =========================================================================
+    /**
+     * Updates the symbolHistory table with the *current* MFE/MAE values
+     * while a simulation is still running.
+     *
+     * Purpose:
+     *   • Provides near-real-time excursion advice in Telegram alerts
+     *   • Allows subsequent signals on the same symbol to benefit from
+     *     early insight (e.g., "Strong reward potential" after 5-10 minutes)
+     *   • Critical fix for live trading: avoids "No excursion history"
+     *     on repeat signals during strong moves
+     *
+     * Called from:
+     *   • simulateTrade() – every ~5 minutes and on partial TP hits
+     *
+     * Behavior:
+     *   • UPSERT pattern: creates row if new, overwrites excursion fields if exists
+     *   • Preserves other fields (historyJson, avgR, winRate, reverseCount)
+     *   • Uses current (live) MFE/MAE percentages – not final averages
+     *   • Updates timestamp for monitoring
+     *
+     * Note:
+     *   • This is *interim* data – final accurate averages are still calculated
+     *     in updateSymbolHistoryExcursions() on full close
+     *   • Overwrites previous interim values (we only care about latest live view)
+     *
+     * @param symbol - Trading pair
+     * @param currentMfePct - Current Max Favorable Excursion (%)
+     * @param currentMaePct - Current Max Adverse Excursion (%)
+     */
+    public async updateInterimExcursions(symbol: string, currentMfePct: number, currentMaePct: number): Promise<void> {
+        // Calculate current ratio (avoid division by zero)
+        const ratio = currentMaePct === 0 ? 0 : currentMfePct / currentMaePct;
+
+        // UPSERT into symbolHistory – updates excursion stats immediately
+        await this.db
+            .insert(symbolHistory)
+            .values({
+                symbol,
+                avgMae: currentMaePct,
+                avgMfe: currentMfePct,
+                avgExcursionRatio: ratio,
+            })
+            .onDuplicateKeyUpdate({
+                set: {
+                    avgMae: currentMaePct,
+                    avgMfe: currentMfePct,
+                    avgExcursionRatio: ratio,
+                },
+            })
+            .execute();
+
+        // Debug log – helps monitor how excursions evolve in real time
+        logger.debug('Interim excursion update', {
+            symbol,
+            currentMfe: currentMfePct.toFixed(2),
+            currentMae: currentMaePct.toFixed(2),
             ratio: ratio.toFixed(2),
         });
     }
@@ -1277,6 +1347,56 @@ class DatabaseService {
             .execute();
     }
 
+    // =========================================================================
+    // ML TRAINING: Full label distribution across all samples
+    // =========================================================================
+    /**
+     * Returns the count of training samples for each possible label (-2 to +2).
+     *
+     * Used by:
+     *   • MLService status reporting
+     *   • Monitoring class balance (critical for model health)
+     *   • Telegram /ml_status command
+     *
+     * Important feature:
+     *   • Ensures all 5 labels are represented, even if count = 0
+     *   • Prevents missing labels in charts/reports
+     *
+     * @returns Array of { label: number, count: number } with all labels present
+     */
+    public async getLabelDistribution(): Promise<{ label: number; count: number }[]> {
+        // Raw query: count per existing label
+        const result = await this.db
+            .select({
+                label: trainingSamples.label,
+                count: count().as('count'),
+            })
+            .from(trainingSamples)
+            .groupBy(trainingSamples.label)
+            .orderBy(trainingSamples.label)
+            .execute();
+
+        // Initialize map with all possible labels set to 0
+        // This guarantees complete distribution even for unused labels
+        const distributionMap = new Map<number, number>();
+        for (let label = -2; label <= 2; label++) {
+            distributionMap.set(label, 0);
+        }
+
+        // Fill in actual counts from query results
+        for (const row of result) {
+            if (row.label !== null) {
+                distributionMap.set(row.label, row.count);
+            }
+        }
+
+        // Convert map to array for clean return
+        return Array.from(distributionMap.entries()).map(([label, count]) => ({
+            label,
+            count,
+        }));
+    }
+
     // ===========================================================================
     // NEW: Update recent excursions (time-bound rolling average)
     // ===========================================================================
@@ -1300,7 +1420,7 @@ class DatabaseService {
         mfePct: number,
         maePct: number,
         direction: 'long' | 'short',
-        _windowHours = 3
+        windowHours = 3
     ): Promise<void> {
         const history = await this.db
             .select()
@@ -1456,56 +1576,6 @@ class DatabaseService {
                 recentReverseCountShort: 0,
             })
             .where(sql`${symbolHistory.updatedAt} < ${new Date(cutoff)}`);
-    }
-
-    // =========================================================================
-    // ML TRAINING: Full label distribution across all samples
-    // =========================================================================
-    /**
-     * Returns the count of training samples for each possible label (-2 to +2).
-     *
-     * Used by:
-     *   • MLService status reporting
-     *   • Monitoring class balance (critical for model health)
-     *   • Telegram /ml_status command
-     *
-     * Important feature:
-     *   • Ensures all 5 labels are represented, even if count = 0
-     *   • Prevents missing labels in charts/reports
-     *
-     * @returns Array of { label: number, count: number } with all labels present
-     */
-    public async getLabelDistribution(): Promise<{ label: number; count: number }[]> {
-        // Raw query: count per existing label
-        const result = await this.db
-            .select({
-                label: trainingSamples.label,
-                count: count().as('count'),
-            })
-            .from(trainingSamples)
-            .groupBy(trainingSamples.label)
-            .orderBy(trainingSamples.label)
-            .execute();
-
-        // Initialize map with all possible labels set to 0
-        // This guarantees complete distribution even for unused labels
-        const distributionMap = new Map<number, number>();
-        for (let label = -2; label <= 2; label++) {
-            distributionMap.set(label, 0);
-        }
-
-        // Fill in actual counts from query results
-        for (const row of result) {
-            if (row.label !== null) {
-                distributionMap.set(row.label, row.count);
-            }
-        }
-
-        // Convert map to array for clean return
-        return Array.from(distributionMap.entries()).map(([label, count]) => ({
-            label,
-            count,
-        }));
     }
 }
 
