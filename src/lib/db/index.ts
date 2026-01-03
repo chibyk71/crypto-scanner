@@ -967,17 +967,23 @@ class DatabaseService {
     public async closeSimulatedTrade(
         signalId: string,
         outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
-        pnl: number,
-        rMultiple: number,
-        label: -2 | -1 | 0 | 1 | 2,
-        maxFavorablePrice: number,
-        maxAdversePrice: number
+        pnl: number,                  // PnL as decimal (e.g., 0.05 = +5%)
+        rMultiple: number,            // R-multiple of the trade (can be null if not applicable)
+        label: -2 | -1 | 0 | 1 | 2,   // ML label: -2 strong loser, -1 weak loser, 0 breakeven-ish, 1 weak winner, 2 strong winner
+        maxFavorablePrice: number,    // Best price reached in favor of the trade direction
+        maxAdversePrice: number       // Worst price reached against the trade direction
     ): Promise<void> {
+        // Current timestamp in milliseconds
         const now = Date.now();
+
+        // We only keep trade history from the last 3 hours for "recent" statistics
         const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
         const cutoffTime = now - THREE_HOURS_MS;
 
-        // Fetch original trade details
+        // ===================================================================
+        // 1. Fetch the original simulated trade details from the database
+        // ===================================================================
+        // We need entry price, side (buy/sell), symbol, and when it was opened
         const [trade] = await this.db
             .select({
                 entryPrice: simulatedTrades.entryPrice,
@@ -989,80 +995,98 @@ class DatabaseService {
             .where(eq(simulatedTrades.signalId, signalId))
             .execute();
 
+        // If no trade found with this signalId, log error and exit early
         if (!trade) {
             logger.error('Cannot close simulated trade – signalId not found', { signalId });
             return;
         }
 
+        // Determine trade direction
         const isLong = trade.side === 'buy';
-        const entryPrice = Number(trade.entryPrice) / 1e8; // Unscale from ×1e8
 
-        // Compute final MFE/MAE as percentages
+        // Entry price is stored scaled by 1e8 for precision – unscale it here
+        const entryPrice = Number(trade.entryPrice);
+
+        // ===================================================================
+        // 2. Calculate final MFE and MAE as percentages
+        // ===================================================================
+        // MFE = Max Favorable Excursion (how much the trade went in our favor)
+        // MAE = Max Adverse Excursion (how much the trade went against us)
         const mfePct = isLong
-            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100
-            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;
+            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100    // Long: higher price = favorable
+            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;   // Short: lower price = favorable
 
+        // Raw MAE percentage (always positive for now)
         const maePctRaw = isLong
-            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100
-            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;
+            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100      // Long: lower price = adverse
+            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;     // Short: higher price = adverse
 
-        // Negative MAE by convention
+        // By convention, MAE is stored as a negative number
         const maePctNegative = -Math.abs(maePctRaw);
 
-        // Update the simulatedTrades row with final results
+        // ===================================================================
+        // 3. Update the simulatedTrades row with closing information
+        // ===================================================================
         await this.db
             .update(simulatedTrades)
             .set({
                 closedAt: now,
-                outcome,
-                pnl: Math.round(pnl * 1e8),
-                rMultiple: rMultiple === null ? null : Math.round(rMultiple * 1e4),
-                label,
-                maxFavorableExcursion: Math.round(mfePct * 1e4),
-                maxAdverseExcursion: Math.round(maePctNegative * 1e4), // Store negative
+                outcome,                                          // tp, partial_tp, sl, timeout
+                pnl: Math.round(pnl * 1e8),                       // Store PnL scaled by 1e8
+                rMultiple: rMultiple === null ? null : Math.round(rMultiple * 1e4), // Scale R by 1e4 for precision
+                label,                                            // ML label
+                maxFavorableExcursion: Math.round(mfePct * 1e4),   // Store MFE scaled by 1e4
+                maxAdverseExcursion: Math.round(maePctNegative * 1e4), // Store negative MAE scaled
             })
             .where(eq(simulatedTrades.signalId, signalId))
             .execute();
 
+        // Log a clear summary of the closed trade for monitoring / debugging
         logger.info('SIMULATED TRADE CLOSED – ML LABEL READY', {
             signalId,
             symbol: trade.symbol,
             side: isLong ? 'LONG' : 'SHORT',
             outcome: outcome.toUpperCase(),
             pnlPct: (pnl * 100).toFixed(2),
-            rMultiple: rMultiple.toFixed(3),
+            rMultiple: rMultiple?.toFixed(3),
             label,
             mfePct: mfePct.toFixed(2),
             maePct: maePctNegative.toFixed(2),
         });
 
-        // === UPDATE RECENT-ONLY symbolHistory ===
+        // ===================================================================
+        // 4. Update the rolling "recent-only" history for this symbol
+        // ===================================================================
         const symbol = trade.symbol;
 
-        // Detect strong reversal for current trade (using pnl or rMultiple sign)
-        const expectedPositiveR = isLong; // long expects positive R, short expects negative
+        // Detect if this trade was a "strong reversal"
+        // Strong reversal = labeled as meaningful move (|label| >= 1) but R-multiple went opposite to expected direction
+        const expectedPositiveR = isLong; // Long should have positive R, Short should have negative R
         const actualPositiveR = rMultiple > 0;
         const isStrongReversal = Math.abs(label) >= 1 && actualPositiveR !== expectedPositiveR;
 
-        // New simulation entry
+        // Create a new history entry for this just-closed trade
         const newEntry: SimulationHistoryEntry = {
             timestamp: now,
             direction: trade.side,
             outcome,
             rMultiple,
             label,
-            durationMs: now - trade.openedAt,
+            durationMs: now - trade.openedAt,         // How long the trade was open
             mfe: mfePct,
             mae: maePctNegative,
         };
 
-        // Fetch current symbolHistory row (if exists)
+        // ===================================================================
+        // 5. Load existing recent history for this symbol (if any)
+        // ===================================================================
         const [existing] = await this.db
             .select()
             .from(symbolHistory)
             .where(eq(symbolHistory.symbol, symbol))
             .execute();
 
+        // Start with empty array; if we have existing history, filter to only last 3 hours
         let recentEntries: SimulationHistoryEntry[] = [];
 
         if (existing && Array.isArray(existing.historyJson)) {
@@ -1071,63 +1095,77 @@ class DatabaseService {
             );
         }
 
-        // Add the new closed entry
+        // Add the freshly closed trade
         recentEntries.push(newEntry);
 
-        // Sort newest first
+        // Sort newest first (most recent at index 0)
         recentEntries.sort((a, b) => b.timestamp - a.timestamp);
 
-        // === Recalculate all recent aggregates ===
+        // ===================================================================
+        // 6. Recalculate all aggregate statistics based on recent entries only
+        // ===================================================================
         const sampleCount = recentEntries.length;
-        if (sampleCount === 0) return;
+        if (sampleCount === 0) return; // Safety check (should never happen)
 
+        // Overall recent averages
         const recentAvgR = recentEntries.reduce((sum, e) => sum + e.rMultiple, 0) / sampleCount;
         const recentWinRate = recentEntries.filter(e => e.label >= 1).length / sampleCount;
 
-        // Reverse count using rMultiple sign
+        // Count of strong reversals in recent history
         const recentReverseCount = recentEntries.filter(e => {
             const expectedPositive = e.direction === 'buy';
             const actualPositive = e.rMultiple > 0;
             return Math.abs(e.label) >= 1 && actualPositive !== expectedPositive;
         }).length;
 
+        // Average MFE / MAE across all recent trades
         const recentMfe = recentEntries.reduce((sum, e) => sum + e.mfe, 0) / sampleCount;
         const recentMae = recentEntries.reduce((sum, e) => sum + e.mae, 0) / sampleCount;
+        // Excursion ratio = how much favorable movement vs adverse (higher = better risk/reward behavior)
         const recentExcursionRatio = recentMae >= -1e-6 ? recentMfe / Math.abs(recentMae) : 999999;
 
-        // Directional stats
+        // ===================================================================
+        // 7. Directional (long vs short) statistics
+        // ===================================================================
         const longEntries = recentEntries.filter(e => e.direction === 'buy');
         const shortEntries = recentEntries.filter(e => e.direction === 'sell');
 
+        // Long-specific stats
         const recentMfeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mfe, 0) / longEntries.length : 0;
         const recentMaeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mae, 0) / longEntries.length : 0;
         const recentWinRateLong = longEntries.length ? longEntries.filter(e => e.label >= 1).length / longEntries.length : 0;
         const recentReverseCountLong = longEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple <= 0).length;
         const recentSampleCountLong = longEntries.length;
 
+        // Short-specific stats
         const recentMfeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mfe, 0) / shortEntries.length : 0;
         const recentMaeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mae, 0) / shortEntries.length : 0;
         const recentWinRateShort = shortEntries.length ? shortEntries.filter(e => e.label >= 1).length / shortEntries.length : 0;
         const recentReverseCountShort = shortEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple >= 0).length;
         const recentSampleCountShort = shortEntries.length;
 
-        // === UPSERT into symbolHistory ===
+        // ===================================================================
+        // 8. Upsert the updated recent statistics back into symbolHistory table
+        // ===================================================================
         const updateData = {
-            historyJson: recentEntries,
+            historyJson: recentEntries,                     // Full array of recent entries (newest first)
             recentAvgR,
             recentWinRate,
+            // Add 1 if the current trade was a strong reversal
             recentReverseCount: recentReverseCount + (isStrongReversal ? 1 : 0),
             recentMae,
             recentMfe,
             recentExcursionRatio,
             recentSampleCount: sampleCount,
 
+            // Long directional stats
             recentMfeLong,
             recentMaeLong,
             recentWinRateLong,
             recentReverseCountLong: recentReverseCountLong + (isLong && isStrongReversal ? 1 : 0),
             recentSampleCountLong,
 
+            // Short directional stats
             recentMfeShort,
             recentMaeShort,
             recentWinRateShort,
@@ -1137,6 +1175,7 @@ class DatabaseService {
             updatedAt: new Date(),
         };
 
+        // If row already exists → UPDATE, otherwise → INSERT
         if (existing) {
             await this.db
                 .update(symbolHistory)
@@ -1153,6 +1192,7 @@ class DatabaseService {
                 .execute();
         }
 
+        // Debug log showing key recent metrics after update
         logger.debug('Updated recent-only symbolHistory', {
             symbol,
             recentSampleCount: sampleCount,
