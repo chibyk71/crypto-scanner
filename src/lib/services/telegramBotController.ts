@@ -1891,9 +1891,10 @@ export class TelegramBotController {
             `**${signal.signal.toUpperCase()} SIGNAL** ${signal.signal !== 'hold' ? '🚀' : '🟡'}`,
             `**Symbol:** ${escape(symbol)}`,
             `**Price:** $${escape(price.toFixed(8))}`,
-            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
+            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(1))}%` : '',
             signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
             signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(\\≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
+            signal.mlConfidence ? `**ML Confidence:** ${escape(signal.mlConfidence.toFixed(1))}%` : '',
             signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
         ].filter(Boolean);
 
@@ -1911,7 +1912,7 @@ export class TelegramBotController {
         if (regime.sampleCount > 0) {
             const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
             lines.push('');
-            lines.push(`**Current Regime \\(last \\~3h + live\\)${liveNote}** 📊`);
+            lines.push(`**Current Regime \\(last \\~3h \\+ live\\)${liveNote}** 📊`);
             lines.push(escape(`• Samples: ${regime.sampleCount} | Reversals: ${regime.reverseCount}`));
             lines.push(escape(`• MFE: ${regime.mfe.toFixed(2)}% | MAE: ${regime.mae.toFixed(2)}% → Ratio: ${regime.excursionRatio.toFixed(2)}`));
 

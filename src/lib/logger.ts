@@ -93,7 +93,7 @@ export function createLogger(label: string) {
                 tailable: true,
             }),
 
-            // Separate error log (only error/warn)
+            // Separate debug log (all debug/info)
             new transports.File({
                 filename: path.join(LOG_DIR, 'debug.log'),
                 level: "debug",
