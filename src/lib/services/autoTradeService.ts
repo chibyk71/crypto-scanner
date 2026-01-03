@@ -16,12 +16,13 @@
 // =============================================================================
 
 import { ExchangeService } from './exchange';
-import { dbService, type EnrichedSymbolHistory } from '../db';
+import { dbService } from '../db';
 import { createLogger } from '../logger';
 import { config } from '../config/settings';                  // ← For ingesting live outcomes
 import type { TradeSignal } from '../../types';
 import { getExcursionAdvice, isHighMaeRisk } from '../utils/excursionUtils';
 import type { TelegramBotController } from './telegramBotController';
+import { computeLabel } from './simulateTrade';
 
 const logger = createLogger('AutoTradeService');
 
@@ -32,153 +33,151 @@ export class AutoTradeService {
     ) { }
 
     /**
-     * Main entry point: Execute a live trade with full safety checks
-     * Called from MarketScanner when a strong signal is generated
-     */
+ * Main entry point: Execute a live trade with full real-time safety checks
+ * Uses current regime (closed recent + live active simulations)
+ */
     public async execute(originalSignal: TradeSignal): Promise<void> {
-        // Master switch – if disabled, do nothing
+        // Master switch
         if (!config.autoTrade) {
-            logger.debug('AutoTrade disabled in config – ignoring signal', { symbol: originalSignal.symbol });
+            logger.debug('AutoTrade disabled – ignoring signal', { symbol: originalSignal.symbol });
             return;
         }
 
         const { symbol } = originalSignal;
 
         try {
-            logger.info(`Evaluating live trade opportunity: ${originalSignal.signal.toUpperCase()} ${symbol}`, {
+            logger.info(`Evaluating live trade: ${originalSignal.signal.toUpperCase()} ${symbol}`, {
                 confidence: originalSignal.confidence.toFixed(1),
             });
 
             // =================================================================
-            // 1. Fetch enriched symbol history (recent + directional)
+            // 1. Get real-time regime (closed recent + all live simulations)
             // =================================================================
-            const history: EnrichedSymbolHistory | null = await dbService.getEnrichedSymbolHistory(symbol);
+            const regime = await dbService.getCurrentRegime(symbol);
 
-            if (!history || (history.avgMae === 0 && history.recentMae === 0)) {
-                logger.warn(`NO simulation history for ${symbol} – refusing live trade`);
+            if (regime.sampleCount === 0) {
+                logger.warn(`NO simulation history yet for ${symbol} – refusing live trade`);
                 return;
             }
 
             // =================================================================
-            // 2. Determine final direction (with optional reversal)
+            // 2. Auto-reversal logic using live regime
             // =================================================================
             let signal = { ...originalSignal };
             let direction: 'long' | 'short' = signal.signal === 'buy' ? 'long' : 'short';
             let wasReversed = false;
             let reversalReason = '';
 
-            if (config.autoTrade) {
-                const minReverseForReversal = config.strategy.minReverseCountForAutoReversal ?? 3;
-                const recentReverse = direction === 'long' ? history.recentReverseCountLong : history.recentReverseCountShort;
-                const recentRatio = history.recentMfe / Math.max(history.recentMae, 1e-6);
+            const minReverseForReversal = config.strategy.minReverseCountForAutoReversal ?? 3;
 
-                if (
-                    history.recentSampleCount >= 3 &&
-                    recentReverse >= minReverseForReversal &&
-                    recentRatio < 1.0
-                ) {
-                    // Strong evidence of mean-reversion regime → reverse the trade
-                    signal.signal = signal.signal === 'buy' ? 'sell' : 'buy';
-                    direction = signal.signal === 'buy' ? 'long' : 'short';
-                    wasReversed = true;
-                    reversalReason = `Auto-reversed due to ${recentReverse} recent reversals and poor recent reward ratio (${recentRatio.toFixed(2)})`;
-                    logger.info(reversalReason, { symbol });
-                }
+            if (
+                regime.sampleCount >= 3 &&
+                regime.reverseCount >= minReverseForReversal &&
+                regime.excursionRatio < 1.0
+            ) {
+                // Strong mean-reversion regime detected → reverse
+                signal.signal = signal.signal === 'buy' ? 'sell' : 'buy';
+                direction = signal.signal === 'buy' ? 'long' : 'short';
+                wasReversed = true;
+                reversalReason = `Auto-reversed: ${regime.reverseCount} reversals, ratio ${regime.excursionRatio.toFixed(2)} (live+recent)`;
+                logger.info(reversalReason, { symbol });
             }
 
             // =================================================================
-            // 3. High MAE Risk Filter – skip dangerous symbols
+            // 3. High drawdown risk filter (using live MAE)
             // =================================================================
-            if (isHighMaeRisk(history, direction)) {
-                logger.warn(`SKIPPING trade: High drawdown risk detected`, {
+            if (isHighMaeRisk(regime as any, direction)) {  // Temporary cast until utils updated
+                logger.warn(`SKIPPING trade: High live drawdown risk`, {
                     symbol,
-                    recentMae: history.recentMae.toFixed(2),
+                    liveMae: regime.mae.toFixed(2),
                     threshold: config.strategy.maxMaePct,
+                    activeSims: regime.activeCount,
                 });
                 return;
             }
 
             // =================================================================
-            // 4. Apply excursion-based adjustments (recent → directional → lifetime)
+            // 4. Excursion-based adjustments using live regime
             // =================================================================
-            const { advice: excursionAdvice, adjustments } = getExcursionAdvice(history, direction);
-            logger.info(`Excursion analysis: ${excursionAdvice}`, { symbol });
+            const { advice: excursionAdvice, adjustments } = getExcursionAdvice(regime as any, direction);
+            logger.info(`Excursion advice: ${excursionAdvice}`, { symbol });
 
             let finalConfidence = signal.confidence + (adjustments.confidenceBoost * 100);
             if (finalConfidence < config.strategy.confidenceThreshold) {
-                logger.warn(`Confidence too low after adjustments`, {
+                logger.warn(`Confidence too low after excursion adjustments`, {
                     original: signal.confidence,
                     adjusted: finalConfidence.toFixed(1),
                 });
                 return;
             }
 
-            // Position size adjustment
+            // =================================================================
+            // 5. Position sizing with excursion boost
+            // =================================================================
             let sizeMultiplier = (signal.positionSizeMultiplier ?? 1.0) * (1 + adjustments.confidenceBoost);
             if (wasReversed) {
-                sizeMultiplier *= 0.7; // Reduce size on reversed trades
+                sizeMultiplier *= 0.7; // Reduce size on reversals
             }
             sizeMultiplier = Math.max(0.2, Math.min(2.0, sizeMultiplier));
 
             // =================================================================
-            // 5. Calculate dynamic SL/TP (with reversal adjustment)
+            // 6. Dynamic SL/TP adjustment
             // =================================================================
             let stopLoss = signal.stopLoss;
             let takeProfit = signal.takeProfit;
             const currentPrice = this.exchange.getLatestPrice(symbol);
 
             if (!currentPrice || currentPrice <= 0) {
-                logger.error(`Invalid price`, { symbol });
+                logger.error('Invalid current price', { symbol });
                 return;
             }
 
             if (signal.signal !== 'hold' && stopLoss && takeProfit) {
-                const baseSlDistance = Math.abs(currentPrice! - stopLoss);
-                const baseTpDistance = Math.abs(takeProfit - currentPrice!);
+                const baseSlDistance = Math.abs(currentPrice - stopLoss);
+                const baseTpDistance = Math.abs(takeProfit - currentPrice);
 
-                // Apply regime multipliers
                 const adjustedSlDistance = baseSlDistance * adjustments.slMultiplier;
                 const adjustedTpDistance = baseTpDistance * adjustments.tpMultiplier;
 
                 if (signal.signal === 'buy') {
-                    stopLoss = currentPrice! - adjustedSlDistance;
+                    stopLoss = currentPrice - adjustedSlDistance;
                     takeProfit = wasReversed
-                        ? currentPrice! + adjustedTpDistance * 0.5  // Halfway to original SL on reversal
-                        : currentPrice! + adjustedTpDistance;
+                        ? currentPrice + adjustedTpDistance * 0.5
+                        : currentPrice + adjustedTpDistance;
                 } else {
-                    stopLoss = currentPrice! + adjustedSlDistance;
+                    stopLoss = currentPrice + adjustedSlDistance;
                     takeProfit = wasReversed
-                        ? currentPrice! - adjustedTpDistance * 0.5
-                        : currentPrice! - adjustedTpDistance;
+                        ? currentPrice - adjustedTpDistance * 0.5
+                        : currentPrice - adjustedTpDistance;
                 }
             }
 
             // =================================================================
-            // 6. Validate symbol and fetch current price
+            // 7. Validate symbol
             // =================================================================
             const isValid = await this.exchange.validateSymbol(symbol);
             if (!isValid) {
-                logger.error(`Symbol not supported`, { symbol });
+                logger.error('Symbol not supported on exchange', { symbol });
                 return;
             }
 
             // =================================================================
-            // 7. Calculate position size
+            // 8. Calculate final position size
             // =================================================================
             const balance = await this.exchange.getAccountBalance();
             if (!balance || balance <= 0) {
-                logger.warn('Insufficient balance');
+                logger.warn('Insufficient account balance');
                 return;
             }
 
             const baseRiskUsd = balance * (config.strategy.positionSizePercent / 100);
             const adjustedRiskUsd = baseRiskUsd * sizeMultiplier;
-            const maxRiskUsd = balance * 0.10;
+            const maxRiskUsd = balance * 0.10; // Hard cap at 10%
             const finalRiskUsd = Math.min(adjustedRiskUsd, maxRiskUsd);
 
             const amount = finalRiskUsd / currentPrice;
             if (amount < 0.0001) {
-                logger.warn('Position size too small', { symbol, amount });
+                logger.warn('Calculated position size too small', { symbol, amount });
                 return;
             }
 
@@ -193,10 +192,12 @@ export class AutoTradeService {
                 confidence: finalConfidence.toFixed(1),
                 reversed: wasReversed,
                 excursionAdvice,
+                liveSamples: regime.sampleCount,
+                activeSims: regime.activeCount,
             });
 
             // =================================================================
-            // 8. Place the order
+            // 9. Place order
             // =================================================================
             const order = await this.exchange.placeOrder(
                 symbol,
@@ -210,7 +211,7 @@ export class AutoTradeService {
             const orderId = order.id || 'unknown';
 
             // =================================================================
-            // 9. Log trade to DB
+            // 10. Log to DB
             // =================================================================
             await dbService.logTrade({
                 symbol,
@@ -223,18 +224,19 @@ export class AutoTradeService {
             });
 
             // =================================================================
-            // 10. Rich Telegram notification
+            // 11. Telegram notification
             // =================================================================
             const lines = [
                 `*LIVE TRADE EXECUTED*${wasReversed ? ' (AUTO-REVERSED)' : ''}`,
                 `• Symbol: ${symbol}`,
-                `• Direction: ${side.toUpperCase()}${wasReversed ? ' ← Original was opposite' : ''}`,
+                `• Direction: ${side.toUpperCase()}${wasReversed ? ' ← Original opposite' : ''}`,
                 `• Amount: ${amount.toFixed(6)}`,
                 `• Entry: $${currentPrice.toFixed(8)}`,
                 `• Risk: $${finalRiskUsd.toFixed(2)} (${((finalRiskUsd / balance) * 100).toFixed(1)}%)`,
                 stopLoss ? `• SL: $${stopLoss.toFixed(8)}` : '',
                 takeProfit ? `• TP: $${takeProfit.toFixed(8)}${wasReversed ? ' (halfway)' : ''}` : '',
                 `• Excursion: ${excursionAdvice}`,
+                `• Live Regime: ${regime.sampleCount} samples (${regime.activeCount} active) | Ratio ${regime.excursionRatio.toFixed(2)}`,
             ];
 
             if (wasReversed) {
@@ -246,20 +248,20 @@ export class AutoTradeService {
             if (this.telegramService) {
                 await this.telegramService.sendMessage(telegramMsg, { parse_mode: 'Markdown' });
             } else {
-                logger.info('Telegram notification would be sent', { message: telegramMsg });
+                logger.info('Telegram notification (dry)', { message: telegramMsg });
             }
 
-            logger.info('Live trade successfully placed', { symbol, orderId });
+            logger.info('Live trade placed successfully', { symbol, orderId });
 
             // =================================================================
-            // 11. Start background monitoring
+            // 12. Start monitoring (if enabled)
             // =================================================================
             if (config.ml.trainingEnabled) {
-                void this.monitorLiveTradeOutcome(symbol, signal, amount, orderId);
+                void this.monitorLiveTradeOutcome(symbol, signal, amount, orderId, currentPrice);
             }
 
         } catch (error: any) {
-            logger.error(`AUTOTRADE FAILED for ${symbol}`, {
+            logger.error(`AutoTrade failed for ${symbol}`, {
                 error: error.message,
                 stack: error.stack,
             });
@@ -270,21 +272,28 @@ export class AutoTradeService {
     // BACKGROUND TRADE MONITORING – Capture real PnL for ML improvement
     // =========================================================================
     /**
-     * Monitors an open live trade until it closes
-     * When closed, extracts realized PnL and feeds into ML training
-     * Runs in background (fire-and-forget)
+     * Monitors an open live trade until it closes.
+     * When closed, captures the actual realized PnL and feeds it into ML training
+     * as a high-quality labeled sample (real outcome > simulated).
+     * Runs fire-and-forget in background.
      */
     private async monitorLiveTradeOutcome(
         symbol: string,
-        _signal: TradeSignal,
+        signal: TradeSignal,        // Keep for potential feature re-extraction later
         entryAmount: number,
-        orderId: string
+        orderId: string,
+        entryPrice: number          // Add entry price for accurate PnL calc
     ): Promise<void> {
-        const maxHoldTimeMs = 4 * 60 * 60 * 1000;  // 4 hours max hold
-        const pollIntervalMs = 60_000;            // Check every minute
+        const maxHoldTimeMs = 4 * 60 * 60 * 1000;  // 4 hours
+        const pollIntervalMs = 60_000;            // 1 minute
         const entryTime = Date.now();
 
-        logger.info('Started monitoring live trade', { symbol, orderId, entryAmount });
+        logger.info('Started monitoring live trade for ML ingestion', {
+            symbol,
+            orderId,
+            entryAmount: entryAmount.toFixed(6),
+            entryPrice: entryPrice.toFixed(8),
+        });
 
         try {
             while (Date.now() - entryTime < maxHoldTimeMs) {
@@ -292,49 +301,80 @@ export class AutoTradeService {
                 const positions = await this.exchange.getPositions(symbol);
                 const stillOpen = positions.some((p: any) =>
                     p.symbol === symbol &&
-                    Math.abs(p.contracts - entryAmount) < entryAmount * 0.2 // Allow small diff due to fees
+                    Math.abs(p.contracts - entryAmount) > entryAmount * 0.01  // >1% remaining
                 );
 
                 if (!stillOpen) {
-                    // Position closed – fetch closed trades
-                    const closedTrades = await this.exchange.getClosedTrades(symbol, entryTime);
+                    // Position closed — fetch recent closed trades
+                    const closedTrades = await this.exchange.getClosedTrades(symbol, entryTime - 60_000); // slight buffer
+
+                    // Find matching trade by orderId or amount + time
                     const matchedTrade = closedTrades.find((t: any) =>
                         t.orderId === orderId ||
-                        (Math.abs(t.amount - entryAmount) < entryAmount * 0.2 && t.timestamp >= entryTime)
+                        (Math.abs(t.amount - entryAmount) < entryAmount * 0.2 &&
+                            t.timestamp >= entryTime)
                     );
 
                     if (matchedTrade) {
-                        const pnlUsd = (matchedTrade.amount ?? 0) * matchedTrade.price || 0;
-                        const pnlPercent = (pnlUsd / (entryAmount * matchedTrade.price)) * 100;
+                        // Calculate real PnL
+                        const exitPrice = matchedTrade.price || matchedTrade.amount || 0;
+                        const pnlPercent = signal.signal === 'buy'
+                            ? ((exitPrice - entryPrice) / entryPrice) * 100
+                            : ((entryPrice - exitPrice) / entryPrice) * 100;
 
-                        const label = pnlPercent >= 3 ? 2 :
-                            pnlPercent >= 1.5 ? 1 :
-                                pnlPercent >= -1 ? 0 :
-                                    pnlPercent >= -3 ? -1 : -2;
+                        const riskPercent = 1.5; // e.g., 1.5%
+                        const rMultiple = pnlPercent / riskPercent;
 
-                        logger.info('Live trade closed – ingesting real outcome into ML', {
+                        // 5-tier label based on real R-multiple
+                        const label = computeLabel(rMultiple);
+
+                        logger.info('Live trade closed – ingesting real outcome into ML training', {
                             symbol,
-                            pnlUsd: pnlUsd.toFixed(2),
+                            orderId,
+                            entryPrice: entryPrice.toFixed(8),
+                            exitPrice: exitPrice.toFixed(8),
                             pnlPercent: pnlPercent.toFixed(2),
+                            rMultiple: rMultiple.toFixed(3),
                             label,
                         });
 
-                        // TODO: Re-extract features at close time if possible
-                        // For now, we just log – future: improve with actual close-time features
+                        // Ingest into ML as a high-value real sample
+                        // Note: features are dummy here — future improvement: re-extract at close time
+                        await dbService.addTrainingSample({
+                            symbol,
+                            features: new Array(50).fill(0), // placeholder — replace with real features later
+                            label,
+                            // Optional: add metadata like isLive: true
+                        });
+                    } else {
+                        logger.warn('Live trade closed but no matching closed trade record found', {
+                            symbol,
+                            orderId,
+                            entryAmount,
+                        });
                     }
 
-                    return; // Done monitoring
+                    return; // Done
                 }
 
                 await new Promise(r => setTimeout(r, pollIntervalMs));
             }
 
-            // Timeout reached – optionally force close
-            logger.warn('Live trade timed out – consider forced exit', { symbol, holdHours: 4 });
-            // You could add forced close here if desired
+            // Timeout reached
+            logger.warn('Live trade monitoring timed out after 4 hours', {
+                symbol,
+                orderId,
+                holdHours: 4,
+            });
+            // Optional: force close or alert here
 
-        } catch (err) {
-            logger.error('Error during live trade monitoring', { symbol, error: err });
+        } catch (err: any) {
+            logger.error('Error in live trade monitoring', {
+                symbol,
+                orderId,
+                error: err.message,
+                stack: err.stack,
+            });
         }
     }
 }

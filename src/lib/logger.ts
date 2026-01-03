@@ -14,6 +14,7 @@
 import { createLogger as winstonCreateLogger, format, transports } from 'winston';
 import * as path from 'path';
 import * as fs from 'fs';
+import { config } from './config/settings';
 
 // Ensure logs directory exists (critical for Docker/K8s environments)
 const LOG_DIR = path.resolve(process.cwd(), 'logs');
@@ -33,9 +34,8 @@ const DEFAULT_LOG_LEVEL = 'info';
  */
 export function createLogger(label: string) {
     // Pull log level from config first, then env var, then default
-    const configLevel = (global as any).config?.log_level;
-    const envLevel = process.env.LOG_LEVEL;
-    const logLevel = (configLevel || envLevel || DEFAULT_LOG_LEVEL).toLowerCase();
+    const envLevel = config.log_level;
+    const logLevel = (envLevel || DEFAULT_LOG_LEVEL).toLowerCase();
 
     // Human-readable format for console (dev-friendly)
     const consoleFormat = format.combine(
@@ -80,16 +80,26 @@ export function createLogger(label: string) {
             // Console: colored, human-readable
             new transports.Console({
                 format: consoleFormat,
-                stderrLevels: ['error', 'warn'],
+                stderrLevels: ['error', 'warn', 'debug'],
             }),
 
             // File: daily rotating + JSON (perfect for production)
             new transports.File({
                 filename: path.join(LOG_DIR, 'app.log'),
+                level: 'info',
                 format: fileFormat,
                 maxsize: 50 * 1024 * 1024,    // 50 MB
                 maxFiles: 10,
                 tailable: true,
+            }),
+
+            // Separate error log (only error/warn)
+            new transports.File({
+                filename: path.join(LOG_DIR, 'debug.log'),
+                level: "debug",
+                format: fileFormat,
+                maxsize: 20 * 1024 * 1024,
+                maxFiles: 5,
             }),
 
             // Separate error log (only error/warn)

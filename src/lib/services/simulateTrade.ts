@@ -20,7 +20,8 @@ import { ExchangeService } from './exchange';
 import { dbService } from '../db';
 import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
-import { normalizeExcursion } from '../utils/excursionUtils';  // ← NEW
+import { config } from '../config/settings';
+import { activeSimulationsCache } from './activeSimulationsCache';
 
 const logger = createLogger('simulateTrade');
 
@@ -79,75 +80,144 @@ export interface SimulationResult {
  * @param entryPrice - Exact entry price at signal generation
  * @returns Full simulation outcome for immediate ML ingestion
  */
+/**
+ * High-fidelity trade simulator – runs a complete simulated trade from signal generation.
+ *
+ * Core Responsibilities:
+ *   • Polls real-time market data (3m candles) every 15 seconds
+ *   • Tracks price extremes to compute accurate Max Favorable Excursion (MFE) and Max Adverse Excursion (MAE)
+ *   • Supports trailing stops, single TP, and multi-level partial take-profits
+ *   • Provides interim excursion updates every 5 minutes for real-time regime awareness
+ *   • Handles timeout exits after 1 hour
+ *   • Validates candle data to prevent corruption from exchange glitches
+ *   • Caps extreme values to protect downstream stats and ML training
+ *   • Fires-and-forgets DB updates without blocking the simulation loop
+ *
+ * Key Design Principles:
+ *   • Never blocks the main scanner – all DB calls are non-critical
+ *   • MFE stored as positive %, MAE as negative % (matches Strategy expectations)
+ *   • Robust against bad candles (NaN, zero prices, unrealistic spikes)
+ *   • Comprehensive logging for debugging simulation behavior
+ *
+ * @param exchangeService - Live market data provider
+ * @param symbol - Trading pair (e.g., 'TON/USDT')
+ * @param signal - Full TradeSignal from Strategy (includes SL, TP, trailing, etc.)
+ * @param entryPrice - Exact price at signal time
+ * @returns SimulationResult with outcome, PnL, R-multiple, label, and bounded excursions
+ */
 export async function simulateTrade(
     exchangeService: ExchangeService,
     symbol: string,
     signal: TradeSignal,
     entryPrice: number
 ): Promise<SimulationResult> {
-    // Critical safety check – avoid division by zero in PnL calculations
+
+    // =========================================================================
+    // 0. Initial Safety Checks
+    // =========================================================================
     if (entryPrice <= 0) {
-        throw new Error('Invalid entryPrice: must be positive');
+        throw new Error(`Invalid entryPrice for ${symbol}: ${entryPrice} (must be > 0)`);
     }
 
     const isLong = signal.signal === 'buy';
     const direction: 'long' | 'short' = isLong ? 'long' : 'short';
     const hasTrailing = !!signal.trailingStopDistance;
-    let currentStopLoss = signal.stopLoss ?? null;      // Updated dynamically by trailing
-    let bestPrice = entryPrice;                         // Best favorable price seen (for trailing)
 
-    const startTime = Date.now();
-    const timeoutMs = 60 * 60 * 1000;                   // Max simulation time: 1 hour
-    const pollIntervalMs = 15_000;                      // Poll exchange every 15 seconds
-    const INTERIM_UPDATE_INTERVAL_MS = 5 * 60 * 1000;   // Every 5 minutes
+    // Current stop-loss (updated dynamically if trailing)
+    let currentStopLoss = signal.stopLoss ?? null;
+
+    // Best price seen in favorable direction (used for trailing stop movement)
+    let bestPrice = entryPrice;
 
     // Real-time excursion tracking
-    let maxFavorablePrice = entryPrice;
-    let maxAdversePrice = entryPrice;
+    let maxFavorablePrice = entryPrice;  // Highest (long) or lowest (short) price seen
+    let maxAdversePrice = entryPrice;    // Lowest (long) or highest (short) price seen
 
-    // Partial position management
-    let remainingPosition = 1.0;                        // Fraction of original position
-    let totalPnL = 0.0;                                 // Accumulated PnL from partial exits
+    // Position and PnL tracking
+    let remainingPosition = 1.0;         // Fraction of original position still open
+    let totalPnL = 0.0;                   // Accumulated realized PnL
 
-    // Track last interim update timestamp
+    // Timing configuration
+    const startTime = Date.now();
+    const timeoutMs = 60 * 60 * 1000;                    // 1 hour maximum simulation duration
+    const pollIntervalMs = ExchangeService.toTimeframeMs(config.scanner.primaryTimeframe);
+    const INTERIM_UPDATE_INTERVAL_MS = 5 * 60 * 1000;    // Update recent stats every 5 minutes
     let lastInterimUpdateTime = startTime;
 
-    // === Prepare TP levels for DB storage ===
+    // =========================================================================
+    // 1. Prepare TP levels for DB storage (if any)
+    // =========================================================================
     const tpLevelsDb: { price: number; weight: number }[] = [];
     if (signal.takeProfit) {
         tpLevelsDb.push({ price: signal.takeProfit, weight: 1.0 });
     }
-    if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
+    if (signal.takeProfitLevels?.length) {
         tpLevelsDb.push(...signal.takeProfitLevels);
     }
 
-    // === DB: Start simulation record ===
+    // =========================================================================
+    // 2. Start simulation record in database
+    // =========================================================================
     const signalId = await dbService.startSimulatedTrade({
         symbol,
-        side: signal.signal,
+        side: signal.signal as 'buy' | 'sell',
         entryPrice: Number(entryPrice.toFixed(8)),
         stopLoss: currentStopLoss ? Number(currentStopLoss.toFixed(8)) : null,
         trailingDist: signal.trailingStopDistance ? Number(signal.trailingStopDistance.toFixed(8)) : null,
         tpLevels: tpLevelsDb.length > 0 ? tpLevelsDb : null,
     });
 
-    logger.info(`[SIM] ${symbol} ${isLong ? 'LONG' : 'SHORT'} @ ${entryPrice.toFixed(8)} | ID: ${signalId}`);
+    logger.info(`[SIM] ${symbol} ${isLong ? 'LONG' : 'SHORT'} started`, {
+        signalId,
+        entryPrice: entryPrice.toFixed(8),
+        stopLoss: currentStopLoss?.toFixed(8) ?? 'none',
+        trailing: hasTrailing,
+    });
+
+    // === ADD THIS: Register in in-memory cache ===
+    activeSimulationsCache.set(signalId, {
+        symbol,
+        direction,
+        currentMfePct: 0,
+        currentMaePct: 0,
+        startedAt: startTime,
+        lastUpdated: startTime,
+    });
 
     // =========================================================================
-    // MAIN SIMULATION LOOP – continues until exit or timeout
+    // 3. Main Simulation Loop – runs until exit or timeout
     // =========================================================================
     while (Date.now() - startTime < timeoutMs && remainingPosition > 0.01) {
         try {
-            // Get latest candle from live cache
+            // Fetch latest cached OHLCV data
             const raw = exchangeService.getPrimaryOhlcvData(symbol);
             if (!raw || raw.length < 2) {
                 await sleep(pollIntervalMs);
                 continue;
             }
 
-            const candle = raw[raw.length - 1];
-            const high = Number(candle[2]);
-            const low = Number(candle[3]);
+            const latestCandle = raw[raw.length - 1];
+            const high = Number(latestCandle[2]);
+            const low = Number(latestCandle[3]);
+
+            // Validate candle integrity – skip corrupted or unrealistic data
+            if (
+                isNaN(high) || isNaN(low) ||
+                high <= 0 || low <= 0 ||
+                low > high ||
+                high > entryPrice * 500 ||   // Prevent absurd pumps (>500x)
+                low < entryPrice / 500        // Prevent absurd dumps
+            ) {
+                logger.warn(`Invalid candle skipped during simulation`, {
+                    symbol,
+                    signalId,
+                    high,
+                    low,
+                    entryPrice,
+                });
+                await sleep(pollIntervalMs);
+                continue;
+            }
 
             // Update excursion extremes
             if (isLong) {
@@ -158,21 +228,25 @@ export async function simulateTrade(
                 maxAdversePrice = Math.max(maxAdversePrice, high);
             }
 
-            // Trailing stop logic – moves SL in favorable direction
+            // Trailing stop movement
             if (hasTrailing && currentStopLoss !== null) {
                 if (isLong && high > bestPrice) {
                     bestPrice = high;
                     const newStop = bestPrice - signal.trailingStopDistance!;
-                    if (newStop > currentStopLoss) currentStopLoss = newStop;
+                    if (newStop > currentStopLoss) {
+                        currentStopLoss = newStop;
+                    }
                 } else if (!isLong && low < bestPrice) {
                     bestPrice = low;
                     const newStop = bestPrice + signal.trailingStopDistance!;
-                    if (newStop < currentStopLoss) currentStopLoss = newStop;
+                    if (newStop < currentStopLoss) {
+                        currentStopLoss = newStop;
+                    }
                 }
             }
 
-            // === Partial Take-Profit Handling ===
-            if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0 && remainingPosition > 0.01) {
+            // Partial Take-Profit Handling
+            if (signal.takeProfitLevels?.length && remainingPosition > 0.01) {
                 const sortedLevels = [...signal.takeProfitLevels].sort((a, b) =>
                     isLong ? a.price - b.price : b.price - a.price
                 );
@@ -181,37 +255,30 @@ export async function simulateTrade(
                 for (const level of sortedLevels) {
                     const tpHit = isLong ? high >= level.price : low <= level.price;
                     if (tpHit && remainingPosition >= level.weight) {
-                        const pnlThis = isLong
+                        const pnlThisLevel = isLong
                             ? (level.price - entryPrice) / entryPrice
                             : (entryPrice - level.price) / entryPrice;
 
-                        totalPnL += pnlThis * level.weight;
+                        totalPnL += pnlThisLevel * level.weight;
                         remainingPosition -= level.weight;
                         partialClosed = true;
 
-                        logger.debug(`[SIM] Partial TP hit at ${level.price} (weight: ${level.weight})`);
-
-                        // Interim excursion update on partial TP – gives fast feedback
-                        const currentMfePct = normalizeExcursion(
-                            isLong ? maxFavorablePrice - entryPrice : entryPrice - maxFavorablePrice,
-                            entryPrice
-                        );
-                        const currentMaePct = normalizeExcursion(
-                            isLong ? entryPrice - maxAdversePrice : maxAdversePrice - entryPrice,
-                            entryPrice
-                        );
-
-                        // Update recent stats immediately on partial exit
-                        await dbService.updateRecentExcursions(
+                        logger.debug(`[SIM] Partial TP hit`, {
                             symbol,
-                            currentMfePct,
-                            currentMaePct,
-                            direction
-                        );
+                            signalId,
+                            level: level.price.toFixed(8),
+                            weight: level.weight,
+                            pnlThis: (pnlThisLevel * 100).toFixed(2),
+                            remaining: remainingPosition.toFixed(3),
+                        });
+
+                        // Optional: interim update on partial close
+                        void triggerInterimUpdate();
                     }
                 }
 
                 if (partialClosed && remainingPosition <= 0.01) {
+                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'partial_tp',
                         totalPnL,
@@ -220,21 +287,21 @@ export async function simulateTrade(
                         entryPrice,
                         isLong,
                         maxFavorablePrice,
-                        maxAdversePrice,
+                        maxAdversePrice
                     );
                 }
             }
-            // === Single Full Take-Profit ===
+            // Single Full Take-Profit
             else if (signal.takeProfit && remainingPosition > 0.01) {
                 const tpHit = isLong ? high >= signal.takeProfit : low <= signal.takeProfit;
                 if (tpHit) {
-                    const pnlThis = isLong
+                    const pnlFull = isLong
                         ? (signal.takeProfit - entryPrice) / entryPrice
                         : (entryPrice - signal.takeProfit) / entryPrice;
 
-                    totalPnL += pnlThis * remainingPosition;
+                    totalPnL += pnlFull * remainingPosition;
                     remainingPosition = 0;
-
+                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'tp',
                         totalPnL,
@@ -243,22 +310,22 @@ export async function simulateTrade(
                         entryPrice,
                         isLong,
                         maxFavorablePrice,
-                        maxAdversePrice,
+                        maxAdversePrice
                     );
                 }
             }
 
-            // === Stop Loss Check ===
+            // Stop-Loss Check
             if (currentStopLoss && remainingPosition > 0.01) {
                 const slHit = isLong ? low <= currentStopLoss : high >= currentStopLoss;
                 if (slHit) {
-                    const pnlThis = isLong
+                    const pnlSL = isLong
                         ? (currentStopLoss - entryPrice) / entryPrice
                         : (entryPrice - currentStopLoss) / entryPrice;
 
-                    totalPnL += pnlThis * remainingPosition;
+                    totalPnL += pnlSL * remainingPosition;
                     remainingPosition = 0;
-
+                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'sl',
                         totalPnL,
@@ -267,62 +334,52 @@ export async function simulateTrade(
                         entryPrice,
                         isLong,
                         maxFavorablePrice,
-                        maxAdversePrice,
+                        maxAdversePrice
                     );
                 }
             }
 
-            // === Interim Excursion Update Every 5 Minutes ===
+            // Interim Excursion Update (every 5 minutes)
             const now = Date.now();
             if (now - lastInterimUpdateTime >= INTERIM_UPDATE_INTERVAL_MS) {
                 lastInterimUpdateTime = now;
-
-                const currentMfePct = normalizeExcursion(
-                    isLong ? maxFavorablePrice - entryPrice : entryPrice - maxFavorablePrice,
-                    entryPrice
-                );
-                const currentMaePct = normalizeExcursion(
-                    isLong ? entryPrice - maxAdversePrice : maxAdversePrice - entryPrice,
-                    entryPrice
-                );
-
-                // Fire-and-forget – doesn't block simulation
-                void dbService.updateRecentExcursions(
-                    symbol,
-                    currentMfePct,
-                    currentMaePct,
-                    direction
-                );
-
-                logger.debug(`[SIM] Interim excursion update`, {
-                    symbol,
-                    mfe: currentMfePct.toFixed(2),
-                    mae: currentMaePct.toFixed(2),
-                });
+                await triggerInterimUpdate();
             }
 
             await sleep(pollIntervalMs);
         } catch (err) {
-            logger.error('Simulation loop error', { symbol, error: err });
+            logger.error('Error in simulation loop', { symbol, signalId, error: err });
             await sleep(pollIntervalMs);
         }
     }
 
     // =========================================================================
-    // TIMEOUT EXIT – forced close after max duration
+    // 4. Timeout Exit – forced close at final candle
     // =========================================================================
     const finalRaw = exchangeService.getPrimaryOhlcvData(symbol);
-    const last = finalRaw?.[finalRaw.length - 1];
-    const exitPrice = last
-        ? isLong ? Number(last[2]) : Number(last[3])  // High for long, low for short
+    const lastCandle = finalRaw?.[finalRaw.length - 1];
+    let exitPrice = lastCandle
+        ? isLong ? Number(lastCandle[2]) : Number(lastCandle[3])  // high for long, low for short
         : entryPrice;
 
-    const finalPnl = isLong
+    // Validate final exit price
+    if (isNaN(exitPrice) || exitPrice <= 0) {
+        logger.warn(`Invalid timeout exit price, using entryPrice`, { symbol, signalId, exitPrice });
+        exitPrice = entryPrice;
+    }
+
+    let timeoutPnl = isLong
         ? (exitPrice - entryPrice) / entryPrice
         : (entryPrice - exitPrice) / entryPrice;
 
-    totalPnL += finalPnl * remainingPosition;
+    // Cap extreme timeout PnL
+    if (timeoutPnl < -1) {
+        logger.warn(`Timeout PnL capped to -100%`, { symbol, signalId, timeoutPnl });
+        timeoutPnl = -1;
+    }
 
+    totalPnL += timeoutPnl * remainingPosition;
+    activeSimulationsCache.delete(signalId);
     return await finalizeSimulation(
         'timeout',
         totalPnL,
@@ -331,13 +388,82 @@ export async function simulateTrade(
         entryPrice,
         isLong,
         maxFavorablePrice,
-        maxAdversePrice,
+        maxAdversePrice
     );
+
+    // =========================================================================
+    // Helper: Update in-memory cache with current interim excursion state
+    // =========================================================================
+    /**
+     * Updates the global in-memory cache with the current MFE/MAE of this running simulation.
+     * Called every ~5 minutes during the simulation loop.
+     * Enables real-time regime awareness for new signals on the same symbol.
+     */
+    async function triggerInterimUpdate(): Promise<void> {
+        // Compute current excursions as percentages
+        const currentMfePct = isLong
+            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100
+            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;
+
+        const rawMaePct = isLong
+            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100
+            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;
+
+        // MAE is negative by convention
+        const currentMaePct = -Math.abs(rawMaePct);
+
+        // Bound extreme values (safety)
+        const boundedMfe = Math.max(0, Math.min(1000, currentMfePct));
+        const boundedMae = Math.max(-1000, Math.min(0, currentMaePct));
+
+        // Update the in-memory cache
+        activeSimulationsCache.set(signalId, {
+            symbol,
+            direction,
+            currentMfePct: boundedMfe,
+            currentMaePct: boundedMae,
+            startedAt: startTime,
+            lastUpdated: Date.now(),
+        });
+
+        logger.debug(`[SIM] Interim excursion cached`, {
+            signalId,
+            symbol,
+            mfePct: boundedMfe.toFixed(2),
+            maePct: boundedMae.toFixed(2),
+        });
+    }
 }
 
 /**
- * Finalizes the simulation: computes label, updates DB, handles recent stats & reverse counts
- * @returns SimulationResult
+ * Finalizes a completed trade simulation.
+ *
+ * Responsibilities:
+ *   • Caps unrealistic PnL values (prevents data corruption from bad candles)
+ *   • Calculates the final R-multiple using a realistic fallback risk distance
+ *   • Determines the 5-tier ML label based on R-multiple
+ *   • Computes final Max Favorable Excursion (MFE) and Max Adverse Excursion (MAE) as percentages
+ *   • Detects strong reversals (profitable in opposite direction → regime change signal)
+ *   • Updates recent (time-bound) excursion stats in the denormalized symbolHistory table
+ *   • Increments recent reverse count if a strong reversal occurred
+ *   • Persists final outcome and metrics to the simulated_trades table
+ *   • Logs a clear, structured summary for monitoring and debugging
+ *   • Returns a clean SimulationResult for ML ingestion
+ *
+ * Important Conventions Used:
+ *   • MFE is always ≥ 0 (best unrealized profit %)
+ *   • MAE is always ≤ 0 (worst unrealized drawdown %, negative by convention)
+ *   • This matches Strategy logic (e.g., checks like recentMae > threshold expect negative values)
+ *
+ * @param outcome - Reason for exit: 'tp', 'partial_tp', 'sl', or 'timeout'
+ * @param totalPnL - Accumulated PnL as decimal (e.g., 0.023 = +2.3%, -0.45 = -45%)
+ * @param signalId - Unique ID from startSimulatedTrade()
+ * @param symbol - Trading pair (e.g., 'TON/USDT')
+ * @param entryPrice - Price at which the simulated position was entered
+ * @param isLong - true for long, false for short
+ * @param maxFavorablePrice - Highest (long) or lowest (short) price seen during trade
+ * @param maxAdversePrice - Lowest (long) or highest (short) price seen during trade
+ * @returns Complete SimulationResult ready for ML training
  */
 async function finalizeSimulation(
     outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
@@ -349,65 +475,89 @@ async function finalizeSimulation(
     maxFavorablePrice: number,
     maxAdversePrice: number,
 ): Promise<SimulationResult> {
-    const riskDistance = entryPrice * 0.015; // fallback if no SL
-    const rMultiple = totalPnL / (riskDistance / entryPrice);
-    const label = computeLabel(rMultiple);
 
-    // Final excursions
-    const finalMfePct = normalizeExcursion(
-        isLong ? maxFavorablePrice - entryPrice : entryPrice - maxFavorablePrice,
-        entryPrice
-    );
-    const finalMaePct = normalizeExcursion(
-        isLong ? entryPrice - maxAdversePrice : maxAdversePrice - entryPrice,
-        entryPrice
-    );
-
-    // Detect strong reversal
-    const isStrongReversal = Math.abs(label) >= 1 && label * (isLong ? 1 : -1) < 0;
-
-    // Update recent excursions (final values)
-    await dbService.updateRecentExcursions(
-        symbol,
-        finalMfePct,
-        finalMaePct,
-        isLong ? 'long' : 'short'
-    );
-
-    // Update reverse count if strong reversal
-    if (isStrongReversal) {
-        await dbService.incrementRecentReverseCount(
-            symbol,
-            isLong ? 'long' : 'short',
-            1
-        );
+    // =========================================================================
+    // 1. Safety: Cap extreme PnL values
+    // =========================================================================
+    if (totalPnL < -1) {
+        logger.warn(`PnL capped from ${(totalPnL * 100).toFixed(4)}% to -100%`, { symbol, signalId });
+        totalPnL = -1;
     }
 
-    // Close simulation record in DB
+    // =========================================================================
+    // 2. Calculate R-multiple
+    // =========================================================================
+    const FALLBACK_RISK_PCT = 0.015; // 1.5%
+    const rMultiple = totalPnL / FALLBACK_RISK_PCT;
+
+    // =========================================================================
+    // 3. Determine 5-tier ML label
+    // =========================================================================
+    const label = computeLabel(rMultiple);
+
+    // =========================================================================
+    // 4. Compute final excursion percentages
+    // =========================================================================
+    const rawMfeDelta = isLong
+        ? maxFavorablePrice - entryPrice
+        : entryPrice - maxFavorablePrice;
+    const finalMfePct = (rawMfeDelta / entryPrice) * 100;
+
+    const rawMaeDelta = isLong
+        ? entryPrice - maxAdversePrice
+        : maxAdversePrice - entryPrice;
+    const finalMaePctRaw = (rawMaeDelta / entryPrice) * 100;
+    const finalMaePct = -Math.abs(finalMaePctRaw); // Always negative or zero
+
+    // Bound extremes
+    const boundedMfePct = Math.max(0, Math.min(1000, finalMfePct));
+    const boundedMaePct = Math.max(-1000, Math.min(0, finalMaePct));
+
+    // =========================================================================
+    // 5. Detect strong reversal
+    // =========================================================================
+    const expectedPositive = isLong ? totalPnL > 0 : totalPnL < 0;
+    const isStrongReversal = Math.abs(label) >= 1 && !expectedPositive;
+
+    // =========================================================================
+    // 6. Final DB update + recent stats + reverse count
+    // =========================================================================
+    // closeSimulatedTrade handles everything: DB row, symbolHistory recalc, reverse increment
     await dbService.closeSimulatedTrade(
         signalId,
         outcome,
-        Math.round(totalPnL * 1e8),           // PnL ×1e8
-        Math.round(rMultiple * 1e4),          // R ×1e4
+        totalPnL,
+        rMultiple,
         label,
-        Math.round(finalMfePct * 1e4),        // MFE % ×1e4
-        Math.round(finalMaePct * 1e4)         // MAE % ×1e4
+        maxFavorablePrice,
+        maxAdversePrice
     );
 
-    // Preserve/update lifetime averages (your existing logic here)
-    // Example placeholder – replace with your actual lifetime update code
-    // await dbService.updateLifetimeAverages(symbol, finalMfePct, finalMaePct, rMultiple, label);
+    // =========================================================================
+    // 7. Comprehensive logging
+    // =========================================================================
+    logger.info(`[SIM] ${symbol} ${outcome.toUpperCase()}`, {
+        signalId,
+        side: isLong ? 'LONG' : 'SHORT',
+        pnlPct: (totalPnL * 100).toFixed(2),
+        rMultiple: rMultiple.toFixed(3),
+        label,
+        mfePct: boundedMfePct.toFixed(2),
+        maePct: boundedMaePct.toFixed(2),
+        reversal: isStrongReversal,
+    });
 
-    logger.info(`[SIM] ${symbol} ${outcome.toUpperCase()} | PnL: ${(totalPnL * 100).toFixed(2)}% | R: ${rMultiple.toFixed(2)} | Label: ${label} | MFE: ${finalMfePct.toFixed(2)}% | MAE: ${finalMaePct.toFixed(2)}% | Reversal: ${isStrongReversal}`);
-
+    // =========================================================================
+    // 8. Return result for ML ingestion
+    // =========================================================================
     return {
         outcome,
         pnl: totalPnL,
         pnlPercent: totalPnL * 100,
         rMultiple,
         label,
-        maxFavorableExcursion: finalMfePct,
-        maxAdverseExcursion: finalMaePct,
+        maxFavorableExcursion: boundedMfePct,
+        maxAdverseExcursion: boundedMaePct,
     };
 }
 
@@ -428,7 +578,7 @@ async function finalizeSimulation(
  * @param rMultiple - Risk-multiple achieved
  * @returns ML label (-2 to +2)
  */
-function computeLabel(rMultiple: number): -2 | -1 | 0 | 1 | 2 {
+export function computeLabel(rMultiple: number): -2 | -1 | 0 | 1 | 2 {
     if (rMultiple >= 3.0) return 2;
     if (rMultiple >= 1.5) return 1;
     if (rMultiple >= -0.5) return 0;

@@ -30,7 +30,6 @@ import { AlertEvaluatorService } from './services/alertEvaluator';
 import { mlService } from './services/mlService';
 import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
-import { getExcursionAdvice } from './utils/excursionUtils';           // ← For enriched Telegram alerts
 
 const logger = createLogger('MarketScanner');
 
@@ -113,7 +112,7 @@ export class MarketScanner {
             mode: 'periodic',
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 4,
-            cooldownMs: 5 * 60_1000,
+            cooldownMs: 5 * 60_000,
             jitterMs: 300,
             retries: 3,
             heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
@@ -415,7 +414,7 @@ export class MarketScanner {
         const shouldRefresh =
             !cached ||
             cached.lastCloseTime < currentCandleStart ||
-            now - cached.lastFetchTime > 5 * 60_1000;
+            now - cached.lastFetchTime > 5 * 60_000;
 
         if (shouldRefresh) {
             // Fetch fresh HTF data
@@ -473,8 +472,8 @@ export class MarketScanner {
             const risk = signal.signal === 'buy' ? price - signal.stopLoss : signal.stopLoss - price;
             const reward = signal.signal === 'buy' ? signal.takeProfit - price : price - signal.takeProfit;
             if (risk <= 0 || reward / risk < config.strategy.riskRewardTarget - 0.1) {
-                logger.debug(`Poor R:R → skipped`, { symbol, rr: reward / risk });
-                return;
+                logger.info(`Poor R:R → skipped`, { symbol, rr: reward / risk });
+                // return;
             }
         }
 
@@ -490,16 +489,9 @@ export class MarketScanner {
             this.lastAlertAt[symbol] = now;
         }
 
-        // Fetch excursion advice for richer alert
-        const excursions = await dbService.getSymbolExcursions(symbol);
-        let excursionText = 'No excursion history';
-        if (excursions && excursions.avgMae > 0) {
-            const { advice } = getExcursionAdvice(excursions.avgMfe, excursions.avgMae);
-            excursionText = `Excursion: ${advice}`;
-        }
-
         // Send Telegram alert with excursion context
-        await this.sendTelegramSignal(symbol, signal, price, excursionText);
+        await this.telegramService?.sendSignalAlert(symbol, signal, price);
+        logger.info(`Signal alert prepared for ${symbol}`, { msg: signal });
 
         // Remember signal for deduplication
         this.lastSignal[symbol] = { signal, price };
@@ -513,53 +505,6 @@ export class MarketScanner {
         if (config.autoTrade) {
             void this.autoTradeService.execute(signal);
         }
-    }
-
-    // =========================================================================
-    // TELEGRAM NOTIFICATIONS: Send formatted signal alert
-    // =========================================================================
-    /**
-     * Sends a richly formatted Telegram alert for a generated trade signal.
-     *
-     * Called from:
-     *   • handleTradeSignal() – after all filters pass
-     *
-     * Features:
-     *   • MarkdownV2 formatting with proper escaping
-     *   • Includes excursion insight for better decision context
-     *   • Shows confidence, SL/TP/trailing, and all reasons
-     *   • Filters out empty lines for clean output
-     *
-     * @param symbol - Trading pair
-     * @param signal - Full TradeSignal from Strategy
-     * @param price - Current market price
-     * @param excursionText - Human-readable excursion advice
-     */
-    private async sendTelegramSignal(
-        symbol: string,
-        signal: TradeSignal,
-        price: number,
-        excursionText: string
-    ): Promise<void> {
-        // Escape special MarkdownV2 characters to prevent formatting errors
-        const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-
-        // Build alert lines dynamically
-        const lines = [
-            `**${signal.signal.toUpperCase()} SIGNAL**`,           // Bold headline
-            `**Symbol:** ${escape(symbol)}`,
-            `**Price:** $${escape(price.toFixed(8))}`,
-            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(0))}%` : '',
-            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
-            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
-            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
-            excursionText,                                          // Excursion insight (new feature)
-            `**Reasons:**`,
-            ...signal.reason.map(r => `• ${escape(r)}`),            // Bullet list of trigger reasons
-        ].filter(Boolean);  // Remove empty strings (e.g., missing confidence)
-
-        // Send via injected Telegram service (null-safe)
-        await this.telegramService?.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
     }
 
     // =========================================================================

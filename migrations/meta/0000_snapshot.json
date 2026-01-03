@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "c4c82d00-e501-49ef-bde9-f50c385c4f1f",
+  "id": "765e254d-57fe-4e2d-ae2c-ff443b7fdae8",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -190,6 +190,105 @@
       "compositePrimaryKeys": {
         "locks_id": {
           "name": "locks_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraint": {}
+    },
+    "ohlcv_history": {
+      "name": "ohlcv_history",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "varchar(30)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "timeframe": {
+          "name": "timeframe",
+          "type": "varchar(10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "timestamp": {
+          "name": "timestamp",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "open": {
+          "name": "open",
+          "type": "decimal(30,10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "high": {
+          "name": "high",
+          "type": "decimal(30,10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "low": {
+          "name": "low",
+          "type": "decimal(30,10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "close": {
+          "name": "close",
+          "type": "decimal(30,10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "volume": {
+          "name": "volume",
+          "type": "decimal(30,8)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "unique_candle": {
+          "name": "unique_candle",
+          "columns": [
+            "symbol",
+            "timeframe",
+            "timestamp"
+          ],
+          "isUnique": true
+        },
+        "idx_symbol_time": {
+          "name": "idx_symbol_time",
+          "columns": [
+            "symbol",
+            "timeframe",
+            "timestamp"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "ohlcv_history_id": {
+          "name": "ohlcv_history_id",
           "columns": [
             "id"
           ]
@@ -462,48 +561,32 @@
           "autoincrement": false,
           "default": "('[]')"
         },
-        "avg_r": {
-          "name": "avg_r",
+        "recent_avg_r": {
+          "name": "recent_avg_r",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "win_rate": {
-          "name": "win_rate",
+        "recent_win_rate": {
+          "name": "recent_win_rate",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "reverse_count": {
-          "name": "reverse_count",
+        "recent_reverse_count": {
+          "name": "recent_reverse_count",
           "type": "int",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "avg_mae": {
-          "name": "avg_mae",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "avg_mfe": {
-          "name": "avg_mfe",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "avg_excursion_ratio": {
-          "name": "avg_excursion_ratio",
+        "recent_mae": {
+          "name": "recent_mae",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
@@ -518,8 +601,8 @@
           "autoincrement": false,
           "default": 0
         },
-        "recent_mae": {
-          "name": "recent_mae",
+        "recent_excursion_ratio": {
+          "name": "recent_excursion_ratio",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
@@ -534,48 +617,24 @@
           "autoincrement": false,
           "default": 0
         },
-        "avg_mfe_long": {
-          "name": "avg_mfe_long",
+        "recent_mfe_long": {
+          "name": "recent_mfe_long",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "avg_mae_long": {
-          "name": "avg_mae_long",
+        "recent_mae_long": {
+          "name": "recent_mae_long",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
           "default": 0
         },
-        "avg_mfe_short": {
-          "name": "avg_mfe_short",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "avg_mae_short": {
-          "name": "avg_mae_short",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "win_rate_long": {
-          "name": "win_rate_long",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "win_rate_short": {
-          "name": "win_rate_short",
+        "recent_win_rate_long": {
+          "name": "recent_win_rate_long",
           "type": "float",
           "primaryKey": false,
           "notNull": true,
@@ -590,6 +649,38 @@
           "autoincrement": false,
           "default": 0
         },
+        "recent_sample_count_long": {
+          "name": "recent_sample_count_long",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_mfe_short": {
+          "name": "recent_mfe_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_mae_short": {
+          "name": "recent_mae_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "recent_win_rate_short": {
+          "name": "recent_win_rate_short",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "recent_reverse_count_short": {
           "name": "recent_reverse_count_short",
           "type": "int",
@@ -598,8 +689,8 @@
           "autoincrement": false,
           "default": 0
         },
-        "recent_reverse_count": {
-          "name": "recent_reverse_count",
+        "recent_sample_count_short": {
+          "name": "recent_sample_count_short",
           "type": "int",
           "primaryKey": false,
           "notNull": true,
@@ -627,13 +718,13 @@
         "idx_symbol_history_excursions": {
           "name": "idx_symbol_history_excursions",
           "columns": [
-            "avg_mae",
-            "avg_mfe"
+            "recent_mae",
+            "recent_mfe"
           ],
           "isUnique": false
         },
-        "idx_symbol_history_recent": {
-          "name": "idx_symbol_history_recent",
+        "idx_symbol_history_updated_at": {
+          "name": "idx_symbol_history_updated_at",
           "columns": [
             "updated_at"
           ],

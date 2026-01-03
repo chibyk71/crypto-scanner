@@ -8,7 +8,7 @@ import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
 import { Condition, type TradeSignal } from '../../types';
 import { closeAndCleanUp } from '../..';
-import { computeExcursionRatio, getExcursionAdvice, isHighMaeRisk } from '../utils/excursionUtils';
+import { getExcursionAdvice } from '../utils/excursionUtils';
 
 const logger = createLogger('TelegramBot');
 
@@ -55,14 +55,14 @@ export class TelegramBotController {
 
     /**
  * Initializes the Telegram bot in polling mode.
- * 
+ *
  * Responsibilities:
  *   • Validates required Telegram configuration
  *   • Stores dependencies (exchange, mlService)
  *   • Creates the TelegramBot instance with optimized polling settings
  *   • Registers all command and event listeners
  *   • Starts periodic cleanup of stale user interaction states
- * 
+ *
  * @param exchange - ExchangeService instance for fetching market data and executing trades
  * @param mlService - MLService instance for model status and training control
  * @throws {Error} If required Telegram credentials are missing
@@ -85,9 +85,25 @@ export class TelegramBotController {
         // === 3. Initialize the TelegramBot client ===
         this.bot = new TelegramBot(config.telegram.token, {
             polling: {
-                interval: 300,     // Check for updates every 300ms
-                params: { timeout: 30 }, // Long-poll timeout
+                interval: 2000,      // or 1 – immediate retry after response (true long polling)
+                autoStart: true,  // optional, default is true
+                params: {
+                    timeout: 30,  // Keep 30s – Telegram holds the connection up to ~30-60s if no updates
+                    limit: 100,   // default, fine
+                },
             },
+        });
+
+        this.bot.on('polling_error', (error: any) => {
+            // Log the error using your custom logger instead of letting it crash
+            logger.warn('Telegram Polling Error (Connection dropped)', {
+                code: error.code,
+                message: error.message
+            });
+        });
+
+        this.bot.on('error', (error: any) => {
+            logger.error('General Telegram Bot Error', { error });
         });
 
         logger.info('Telegram Bot client initialized', {
@@ -123,13 +139,13 @@ export class TelegramBotController {
 
     /**
      * Registers all command handlers, regex-based commands, and global event listeners.
-     * 
+     *
      * Design:
      *   • Uses node-telegram-bot-api's onText() for exact and regex commands
      *   • Groups commands logically for readability
      *   • Centralizes all listener registration in one place
      *   • Ensures no duplicate registrations
-     * 
+     *
      * @private
      */
     private registerListeners(): void {
@@ -201,16 +217,16 @@ export class TelegramBotController {
 
     /**
  * Handles free-text messages during multi-step alert configuration workflows.
- * 
+ *
  * Supported steps:
  *   • enter_period  → Parses integer period (1–500) for indicators like RSI/EMA
  *   • select_target → Parses number, range (min-max), or indicator reference
- * 
+ *
  * Features:
  *   • Strict validation with helpful error messages
  *   • Automatic state progression on success
  *   • Ignores non-stateful messages (commands handled separately)
- * 
+ *
  * @param msg - Incoming Telegram message
  * @private
  */
@@ -312,7 +328,9 @@ export class TelegramBotController {
             await this.bot.sendMessage(
                 chatId,
                 '⚠️ Unexpected input. Use the buttons or follow the current prompt.'
-            );
+            ).catch((e) => {
+                logger.error('', { error: e })
+            });
         } catch (error: any) {
             logger.warn('Invalid input in alert workflow', {
                 chatId,
@@ -363,17 +381,17 @@ export class TelegramBotController {
 
     /**
  * Handles all callback queries from inline keyboards.
- * 
+ *
  * Routes actions based on callback_data prefix:
  *   • Symbol/timeframe/indicator/operator selection
  *   • Pagination (alerts, positions, trades)
  *   • Alert CRUD actions (save, cancel, delete)
- * 
+ *
  * Features:
  *   • Full state management
  *   • Comprehensive error handling with user feedback
  *   • Always acknowledges query (prevents "loading" spinner)
- * 
+ *
  * @param query - Incoming callback query
  * @private
  */
@@ -579,13 +597,13 @@ export class TelegramBotController {
     };
     /**
      * Sends a paginated symbol selection keyboard.
-     * 
+     *
      * Features:
      *   • Alphabetically sorted symbols for easier navigation
      *   • Clear page indicator
      *   • Responsive Next/Previous buttons
      *   • Graceful handling of empty symbol list
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @param page - Current page (0-based)
      * @private
@@ -637,12 +655,12 @@ export class TelegramBotController {
 
     /**
      * Sends a compact timeframe selection keyboard.
-     * 
+     *
      * Features:
      *   • 2-column layout for better mobile experience
      *   • Clear labels with full names
      *   • Consistent with common crypto timeframes
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @private
      */
@@ -681,12 +699,12 @@ export class TelegramBotController {
 
     /**
      * Sends an indicator selection keyboard with grouped layout.
-     * 
+     *
      * Features:
      *   • Logical grouping (price, volume, oscillators, bands)
      *   • Clean uppercase labels
      *   • 2–3 column layout for density
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @private
      */
@@ -733,12 +751,12 @@ export class TelegramBotController {
 
     /**
  * Sends an operator selection keyboard tailored to the chosen indicator.
- * 
+ *
  * Features:
  *   • Human-readable operator labels (e.g., "Crosses Above" instead of "crosses_above")
  *   • Logical grouping in 3-column layout for faster selection
  *   • Clear prompt with context
- * 
+ *
  * @param chatId - Target Telegram chat ID
  * @param indicator - The currently selected indicator
  * @private
@@ -783,13 +801,13 @@ export class TelegramBotController {
 
     /**
  * Sends the main conditions menu with live preview and action buttons.
- * 
+ *
  * Features:
  *   • Clean, formatted current configuration summary
  *   • Logical condition display with periods and targets
  *   • Dynamic action buttons (only show relevant ones)
  *   • Professional layout with status indicators
- * 
+ *
  * @param chatId - Target Telegram chat ID
  * @param data - Current alert configuration state
  * @private
@@ -861,13 +879,13 @@ export class TelegramBotController {
 
     /**
  * Sends a paginated list of all active custom alerts.
- * 
+ *
  * Features:
  *   • Clear formatting with ID, symbol, timeframe, conditions
  *   • Human-readable last trigger time
  *   • Responsive pagination with page counter
  *   • Empty state handling
- * 
+ *
  * @param chatId - Target Telegram chat ID
  * @param page - Current page (0-based)
  * @private
@@ -949,7 +967,7 @@ export class TelegramBotController {
 
     /**
      * Sends a paginated selection menu for editing an existing alert.
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @param page - Current page (0-based)
      * @private
@@ -1003,7 +1021,7 @@ export class TelegramBotController {
 
     /**
      * Sends a paginated selection menu for deleting an alert (with confirmation step).
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @param page - Current page (0-based)
      * @private
@@ -1057,13 +1075,13 @@ export class TelegramBotController {
 
     /**
      * Sends a paginated list of currently open positions.
-     * 
+     *
      * Features:
      *   • Clean, structured formatting with key metrics
      *   • Page counter and responsive navigation
      *   • Handles empty states and exchange errors gracefully
      *   • Optimized for readability on mobile
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @param page - Current page (0-based)
      * @private
@@ -1144,13 +1162,13 @@ export class TelegramBotController {
 
     /**
      * Sends a paginated list of recently closed trades (last 24 hours).
-     * 
+     *
      * Features:
      *   • Shows profit/loss with color indicators
      *   • Human-readable timestamps
      *   • Handles partial failures per symbol
      *   • Clear empty state
-     * 
+     *
      * @param chatId - Target Telegram chat ID
      * @param page - Current page (0-based)
      * @private
@@ -1241,15 +1259,15 @@ export class TelegramBotController {
 
     /**
  * Handles the /start and /help commands.
- * 
+ *
  * Displays a comprehensive, up-to-date command reference with:
  *   • Clear categories
  *   • Emojis for visual hierarchy
  *   • Accurate descriptions
  *   • Professional formatting
- * 
+ *
  * This is the primary onboarding and reference point for users.
- * 
+ *
  * @param msg - Incoming Telegram message
  * @private
  */
@@ -1294,14 +1312,14 @@ export class TelegramBotController {
 
     /**
  * Handles the /status command.
- * 
+ *
  * Provides a comprehensive real-time health report including:
  *   • Worker lock status
  *   • Last heartbeat timestamp
  *   • Exchange connection state
  *   • Account balance
  *   • Trading mode indicator
- * 
+ *
  * @param msg - Incoming Telegram message
  * @private
  */
@@ -1343,10 +1361,10 @@ export class TelegramBotController {
 
     /**
  * Handles the /alerts command.
- * 
+ *
  * Initiates the paginated view of all active custom alerts.
  * Sets workflow state and jumps directly to the list.
- * 
+ *
  * @param msg - Incoming Telegram message
  * @private
  */
@@ -1368,14 +1386,14 @@ export class TelegramBotController {
 
     /**
      * Handles the /create_alert command.
-     * 
+     *
      * Starts the multi-step alert creation wizard:
      *   1. Symbol selection
      *   2. Timeframe
      *   3. Conditions
-     * 
+     *
      * Validates exchange readiness before beginning.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1420,10 +1438,10 @@ export class TelegramBotController {
 
     /**
      * Handles the /edit_alert command.
-     * 
+     *
      * Initiates selection of an existing alert for modification.
      * Sets edit mode state and shows paginated selection menu.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1448,10 +1466,10 @@ export class TelegramBotController {
 
     /**
      * Handles the /delete_alert command.
-     * 
+     *
      * Initiates deletion workflow with confirmation.
      * Shows paginated list with delete buttons.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1478,12 +1496,12 @@ export class TelegramBotController {
 
     /**
  * Handles the /ml_status command.
- * 
+ *
  * Displays comprehensive ML model status:
  *   • Training paused/resumed state
  *   • Model loaded or fresh
  *   • Sample counts and readiness
- * 
+ *
  * @param msg - Incoming Telegram message
  * @private
  */
@@ -1508,10 +1526,10 @@ export class TelegramBotController {
 
     /**
      * Handles the /ml_pause command.
-     * 
+     *
      * Pauses ongoing ML model training.
      * Provides confirmation and logs action.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1534,9 +1552,9 @@ export class TelegramBotController {
 
     /**
      * Handles the /ml_resume command.
-     * 
+     *
      * Resumes paused ML model training.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1559,9 +1577,9 @@ export class TelegramBotController {
 
     /**
      * Handles the /ml_train command.
-     * 
+     *
      * Forces an immediate retraining of the ML model regardless of sample threshold.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1586,9 +1604,9 @@ export class TelegramBotController {
 
     /**
      * Handles the /ml_samples command.
-     * 
+     *
      * Shows a detailed breakdown of training samples by symbol.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1613,9 +1631,9 @@ export class TelegramBotController {
 
     /**
      * Handles the /ml_performance command.
-     * 
+     *
      * Displays overall strategy performance metrics derived from simulations.
-     * 
+     *
      * @param msg - Incoming Telegram message
      * @private
      */
@@ -1664,14 +1682,14 @@ export class TelegramBotController {
 
     /**
  * Updates (or creates) a user's workflow state and refreshes activity timestamp.
- * 
+ *
  * Purpose:
  *   • Centralizes all state mutations
  *   • Ensures `lastActivity` is always current (critical for stale cleanup)
  *   • Provides safe defaults for new users
- * 
+ *
  * Used throughout multi-step workflows (alert creation, editing, pagination).
- * 
+ *
  * @param chatId - Telegram chat ID of the user
  * @param newState - Partial state updates to merge
  * @private
@@ -1716,21 +1734,16 @@ export class TelegramBotController {
         });
     }
 
-        /**
-     * Handles the /excursions [symbol] command.
-     * 
-     * Displays comprehensive excursion statistics for a symbol:
-     *   • Lifetime averages (MFE/MAE/Ratio)
-     *   • Recent regime (last ~3h): samples, reversals, MFE/MAE
-     *   • Directional asymmetry (long vs short)
-     *   • Risk assessment and visual indicators
-     * 
-     * Falls back gracefully if only partial data available.
-     * 
-     * @param msg - Incoming Telegram message
-     * @param match - Regex match from onText (symbol captured)
-     * @private
-     */
+    /**
+  * Handles the /excursions [symbol] command.
+  *
+  * Displays real-time excursion statistics for a symbol:
+  *   • Current regime (last ~3h closed + live active simulations)
+  *   • Samples, active sims, reversals
+  *   • MFE/MAE/Ratio with live updates
+  *   • Directional bias from recent closed data
+  *   • Risk assessment and visual indicators
+  */
     private handleExcursions = async (msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
 
@@ -1740,77 +1753,72 @@ export class TelegramBotController {
         if (!symbolInput) {
             await this.bot.sendMessage(
                 chatId,
-                '*Usage:* `/excursions BTC/USDT`\n\nShows detailed excursion (MFE/MAE) statistics for a symbol, including recent regime behavior.',
+                '*Usage:* `/excursions BTC/USDT`\n\nShows real-time excursion stats (including live simulations) for a symbol.',
                 { parse_mode: 'Markdown' }
             );
             return;
         }
 
         try {
-            const history = await dbService.getEnrichedSymbolHistory(symbolInput);
+            // Get real-time regime: closed recent + all live active simulations
+            const regime = await dbService.getCurrentRegime(symbolInput);
 
-            if (!history || (history.avgMfe === 0 && history.recentMfe === 0)) {
+            // Optional: fallback to closed-only history for directional stats
+            const closedHistory = await dbService.getEnrichedSymbolHistory(symbolInput);
+
+            if (regime.sampleCount === 0) {
                 await this.bot.sendMessage(
                     chatId,
-                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nSimulations must run first to collect MFE/MAE stats.`,
+                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nWaiting for first simulation to complete or run.`,
                     { parse_mode: 'Markdown' }
                 );
                 return;
             }
 
-            const lines: string[] = [`**Excursion Analysis: ${symbolInput}** 📊`];
+            const lines: string[] = [`**Live Excursion Analysis: ${symbolInput}** 📊`];
 
-            // === Lifetime Stats ===
-            const lifetimeRatio = history.avgExcursionRatio || computeExcursionRatio(history.avgMfe, history.avgMae);
-            const lifetimeColor = lifetimeRatio > 1.8 ? '🟢' : lifetimeRatio < 1.2 ? '🔴' : '🟡';
+            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} active sim${regime.activeCount > 1 ? 's' : ''})` : '';
+            const ratioColor = regime.excursionRatio > 2.0 ? '🟢' : regime.excursionRatio < 1.0 ? '🔴' : '🟡';
 
             lines.push('');
-            lines.push('*Lifetime Averages*');
-            lines.push(`MFE: ${history.avgMfe.toFixed(2)}%`);
-            lines.push(`MAE: ${history.avgMae.toFixed(2)}% ${history.avgMae > (config.strategy.maxMaePct ?? 3.0) ? '🔴' : '🟢'}`);
-            lines.push(`Ratio: ${lifetimeRatio.toFixed(2)} ${lifetimeColor}`);
+            lines.push(`*Current Regime (last ~3h + live)${liveNote}*`);
+            lines.push(`Samples: ${regime.sampleCount}`);
+            lines.push(`Reversals: ${regime.reverseCount} ${regime.reverseCount >= 3 ? '⚠️ High' : regime.reverseCount >= 2 ? '🟡 Moderate' : ''}`);
+            lines.push(`MFE: ${regime.mfe.toFixed(2)}%`);
+            lines.push(`MAE: ${regime.mae.toFixed(2)}%`);
+            lines.push(`Ratio: ${regime.excursionRatio.toFixed(2)} ${ratioColor}`);
 
-            // === Recent Regime (if available) ===
-            if (history.recentSampleCount > 0) {
-                const recentRatio = computeExcursionRatio(history.recentMfe, history.recentMae);
-                const recentColor = recentRatio > 1.8 ? '🟢' : recentRatio < 1.0 ? '🔴' : '🟡';
-                const totalRev = history.recentReverseCount;
-
-                lines.push('');
-                lines.push(`*Recent Regime (last ~${config.strategy.recentWindowHours}h)*`);
-                lines.push(`Samples: ${history.recentSampleCount}`);
-                lines.push(`Reversals: ${totalRev} (Long: ${history.recentReverseCountLong} | Short: ${history.recentReverseCountShort}) ${totalRev >= 3 ? '⚠️ High' : totalRev >= 2 ? '🟡 Moderate' : ''}`);
-                lines.push(`Recent MFE: ${history.recentMfe.toFixed(2)}%`);
-                lines.push(`Recent MAE: ${history.recentMae.toFixed(2)}%`);
-                lines.push(`Recent Ratio: ${recentRatio.toFixed(2)} ${recentColor}`);
-
-                if (totalRev >= 3 && recentRatio < 1.0) {
-                    lines.push('→ *Mean-reversion regime detected* – consider fading or reducing targets');
-                } else if (recentRatio > 2.0) {
-                    lines.push('→ *Strong trending reward* – favorable excursions');
-                } else if (recentRatio < 1.0) {
-                    lines.push('→ *Low reward phase* – consider early profit taking');
-                }
+            if (regime.excursionRatio < 1.0) {
+                lines.push('→ *Low reward phase* – consider fading or early exits');
+            } else if (regime.excursionRatio > 2.0) {
+                lines.push('→ *Strong reward phase* – favorable excursions');
+            } else {
+                lines.push('→ *Balanced regime* – standard risk management');
             }
 
-            // === Directional Asymmetry ===
-            if (history.avgMfeLong > 0 || history.avgMfeShort > 0) {
-                const longRatio = computeExcursionRatio(history.avgMfeLong, history.avgMaeLong);
-                const shortRatio = computeExcursionRatio(history.avgMfeShort, history.avgMaeShort);
+            if (regime.reverseCount >= 3) {
+                lines.push('⚠️ *Mean-reversion likely* – high reversal activity detected');
+            }
+
+            // === Directional Bias (from recent closed simulations) ===
+            if (closedHistory.recentSampleCountLong > 0 || closedHistory.recentSampleCountShort > 0) {
+                const longRatio = closedHistory.recentMfeLong / Math.max(Math.abs(closedHistory.recentMaeLong), 1e-6);
+                const shortRatio = closedHistory.recentMfeShort / Math.max(Math.abs(closedHistory.recentMaeShort), 1e-6);
 
                 lines.push('');
-                lines.push('*Directional Bias*');
-                lines.push(`Long MFE/MAE: ${history.avgMfeLong.toFixed(2)}% / ${history.avgMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
-                lines.push(`Short MFE/MAE: ${history.avgMfeShort.toFixed(2)}% / ${history.avgMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
+                lines.push('*Directional Bias (recent closed)*');
+                lines.push(`Long:  MFE ${closedHistory.recentMfeLong.toFixed(2)}% | MAE ${closedHistory.recentMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
+                lines.push(`Short: MFE ${closedHistory.recentMfeShort.toFixed(2)}% | MAE ${closedHistory.recentMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
             }
 
             // === Final Risk Assessment ===
             lines.push('');
-            const overallRisk = isHighMaeRisk(history, 'long') || isHighMaeRisk(history, 'short')
+            const highMaeRisk = Math.abs(regime.mae) > (config.strategy.maxMaePct ?? 3.0);
+            const overallRisk = highMaeRisk
                 ? '🔴 High drawdown risk'
-                : lifetimeRatio > 1.8
-                ? '🟢 Low risk – strong reward profile'
-                : '🟡 Moderate risk';
+                : regime.excursionRatio > 2.0
+                    ? '🟢 Low risk – strong reward profile'
+                    : '🟡 Moderate risk';
 
             lines.push(`**Assessment:** ${overallRisk}`);
 
@@ -1857,7 +1865,7 @@ export class TelegramBotController {
      *   - Auto-reversal info if applicable
      *   - All original reasons from Strategy
      * Sends a detailed signal alert with full context.
-     * 
+     *
      * @param symbol - Trading pair
      * @param signal - Original TradeSignal from Strategy
      * @param price - Current market price
@@ -1870,7 +1878,7 @@ export class TelegramBotController {
         signal: TradeSignal,
         price: number,
         excursionAdvice?: string,
-        history?: EnrichedSymbolHistory,
+        _history?: EnrichedSymbolHistory,  // Optional fallback (e.g., from cache)
         reversalInfo?: {
             wasReversed: boolean;
             originalSignal: 'buy' | 'sell';
@@ -1889,55 +1897,61 @@ export class TelegramBotController {
             signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
         ].filter(Boolean);
 
-        // === Auto-reversal header (only if triggered by AutoTrade) ===
+        // === Auto-reversal header ===
         if (reversalInfo?.wasReversed) {
             lines.unshift('');
             lines.unshift(`⚠️ **AUTO-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
             lines.unshift(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
-            lines.unshift(`**New TP:** halfway to original SL (mean-reversion target)`);
+            lines.unshift(escape(`**New TP:** halfway to original SL (mean-reversion target)`));
         }
 
-        // === Recent regime summary ===
-        let regimeHistory = history;
-        if (!regimeHistory) {
-            regimeHistory = await dbService.getEnrichedSymbolHistory(symbol) ?? undefined;
-        }
+        // === Real-time regime summary (closed + live active simulations) ===
+        const regime = await dbService.getCurrentRegime(symbol);
 
-        if (regimeHistory && regimeHistory.recentSampleCount > 0) {
-            const recentSamples = regimeHistory.recentSampleCount;
-            const recentMfe = regimeHistory.recentMfe.toFixed(2);
-            const recentMae = regimeHistory.recentMae.toFixed(2);
-            const recentRatio = (regimeHistory.recentMfe / Math.max(regimeHistory.recentMae, 1e-6)).toFixed(2);
-
-            const longRev = regimeHistory.recentReverseCountLong;
-            const shortRev = regimeHistory.recentReverseCountShort;
-            const totalRev = regimeHistory.recentReverseCount;
-
+        if (regime.sampleCount > 0) {
+            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
             lines.push('');
-            lines.push('**Recent Regime (last ~3h)** 📊');
-            lines.push(`• Samples: ${recentSamples} | Reversals: ${totalRev} (long: ${longRev}, short: ${shortRev})`);
-            lines.push(`• Recent MFE: ${recentMfe}% | MAE: ${recentMae}% → Ratio: ${recentRatio}`);
+            lines.push(`**Current Regime \\(last \\~3h + live\\)${liveNote}** 📊`);
+            lines.push(escape(`• Samples: ${regime.sampleCount} | Reversals: ${regime.reverseCount}`));
+            lines.push(escape(`• MFE: ${regime.mfe.toFixed(2)}% | MAE: ${regime.mae.toFixed(2)}% → Ratio: ${regime.excursionRatio.toFixed(2)}`));
 
-            if (parseFloat(recentRatio) < 1.0) {
-                lines.push('→ Low reward phase – consider early profit taking or fading');
-            } else if (parseFloat(recentRatio) > 2.0) {
-                lines.push('→ Strong reward phase – favorable excursions');
+            if (regime.excursionRatio < 1.0) {
+                lines.push('→ Low reward phase — consider early profit taking or fading');
+            } else if (regime.excursionRatio > 2.0) {
+                lines.push('→ Strong reward phase — favorable excursions');
             } else {
-                lines.push('→ Balanced regime – standard risk management');
+                lines.push('→ Balanced regime — standard risk management');
             }
 
-            if (totalRev >= 3) {
-                lines.push('⚠️ High reversal risk – possible mean-reversion detected');
-            } else if (totalRev >= 2) {
-                lines.push('🟡 Moderate reversal activity – monitor closely');
+            if (regime.reverseCount >= 3) {
+                lines.push('⚠️ High reversal risk — possible mean-reversion detected');
+            } else if (regime.reverseCount >= 2) {
+                lines.push('🟡 Moderate reversal activity — monitor closely');
             }
+        } else {
+            lines.push('');
+            lines.push('**No recent regime data** — first signal for this symbol');
         }
 
-        // === Excursion insight (fallback if not provided) ===
+        // === Excursion insight fallback ===
         let finalExcursionAdvice = excursionAdvice;
-        if (!finalExcursionAdvice && regimeHistory) {
+        if (!finalExcursionAdvice && regime.sampleCount > 0) {
             const direction = signal.signal === 'buy' ? 'long' : 'short';
-            finalExcursionAdvice = getExcursionAdvice(regimeHistory, direction).advice;
+            // Pass a minimal mock object with needed fields
+            finalExcursionAdvice = getExcursionAdvice(
+                {
+                    recentMfe: regime.mfe,
+                    recentMae: regime.mae,
+                    recentSampleCount: regime.sampleCount,
+                    recentReverseCount: regime.reverseCount,
+                    // Add directional if needed by your utils
+                    recentMfeLong: regime.mfeLong,
+                    recentMaeLong: regime.maeLong,
+                    recentMfeShort: regime.mfeShort,
+                    recentMaeShort: regime.maeShort,
+                } as any,
+                direction
+            ).advice;
         }
 
         if (finalExcursionAdvice) {
@@ -1952,7 +1966,10 @@ export class TelegramBotController {
             signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
         }
 
-        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' });
+        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' })
+            .catch((e) => {
+                logger.error('Error sending signal alert to Telegram', { symbol, error: e });
+            });
     }
 
     /**
@@ -1971,18 +1988,18 @@ export class TelegramBotController {
 
     /**
  * Sends a message to the pre-configured authorized chat.
- * 
+ *
  * Used throughout the bot for:
  *   • Trade signal alerts
  *   • Custom alert triggers
  *   • Command responses and confirmations
  *   • System notifications
- * 
+ *
  * All messages are routed through this method to ensure:
  *   • Consistent logging
  *   • Centralized error handling
  *   • Single point of truth for the target chat ID
- * 
+ *
  * @param message - The message content (supports MarkdownV2 if parse_mode is set)
  * @param options - Optional Telegram sendMessage options (e.g., parse_mode, reply_markup)
  * @throws {Error} Re-throws any Telegram API error for upstream handling

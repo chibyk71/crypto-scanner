@@ -12,6 +12,7 @@
 //   • Excursion-based strategy adjustments (MAE/MFE)
 // =============================================================================
 
+import { exchanges } from 'ccxt';
 import { config as dotenvConfig } from 'dotenv';
 import { z } from 'zod';
 
@@ -38,7 +39,7 @@ const ConfigSchema = z.object({
     // Exchange & Trading Mode
     // ──────────────────────────────────────────────────────────────
     AUTO_TRADE: z.coerce.boolean().default(false),
-    EXCHANGE: z.enum(['bybit', 'gate', 'binance']).default('bybit'),
+    EXCHANGE: z.enum(Object.values(exchanges) as unknown as string[]).default('bybit'),
     EXCHANGE_API_KEY: z.string().optional(),
     EXCHANGE_API_SECRET: z.string().optional(),
 

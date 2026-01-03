@@ -16,8 +16,8 @@ import type { EnrichedSymbolHistory } from '../db';
  * Higher ratio = historically more favorable excursions (good for widening TP)
  */
 export function computeExcursionRatio(mfe: number, mae: number): number {
-    // Avoid division by zero – treat zero MAE as perfect
-    return mfe / Math.max(mae, 1e-6);
+    // MAE is negative → use absolute value
+    return mfe / Math.max(Math.abs(mae), 1e-6);
 }
 
 /**
@@ -31,12 +31,11 @@ export function normalizeExcursion(value: number, entryPrice: number): number {
 }
 
 /**
- * Analyze historical average MFE & MAE and return actionable advice + adjustments
+ * Analyze recent MFE & MAE and return actionable advice + adjustments
  *
- * Priority order:
- *   1. Recent time-bound data (if enough samples) → detects current regime
- *   2. Directional lifetime stats → handles long/short asymmetry
- *   3. Overall lifetime stats → baseline
+ * Uses only recent data (~3h + live):
+ *   1. Recent overall
+ *   2. Recent directional (long/short)
  *
  * Adjustments are multipliers applied to:
  *   • SL distance (e.g., 0.9 = tighten stop by 10%)
@@ -71,41 +70,40 @@ export function getExcursionAdvice(
 
     let selectedMfe = 0;
     let selectedMae = 0;
-    let source = 'lifetime';
+    let source = 'none';
 
-    // === 1. Prioritize RECENT data if sufficient ===
+    // === 1. Prioritize RECENT overall data ===
     if (history.recentSampleCount >= minRecentSamples && history.recentMfe > 0) {
         selectedMfe = history.recentMfe;
         selectedMae = history.recentMae;
         source = 'recent';
 
-        // High recent MAE → high immediate drawdown risk
-        if (selectedMae > maxMaePct) {
+        // High recent drawdown risk (MAE is negative)
+        if (Math.abs(selectedMae) > maxMaePct) {
             advice = '🔴 High recent drawdown risk';
             adjustments = {
-                slMultiplier: 0.8,     // Tighten SL aggressively
-                tpMultiplier: 0.9,     // Be conservative on TP
+                slMultiplier: 0.8,
+                tpMultiplier: 0.9,
                 confidenceBoost: -0.15,
             };
             return { advice, adjustments };
         }
     }
-    // === 2. Fall back to DIRECTIONAL lifetime stats ===
-    else if (direction === 'long') {
-        selectedMfe = history.avgMfeLong || history.avgMfe;
-        selectedMae = history.avgMaeLong || history.avgMae;
-        source = 'directional-long';
-    } else {
-        selectedMfe = history.avgMfeShort || history.avgMfe;
-        selectedMae = history.avgMaeShort || history.avgMae;
-        source = 'directional-short';
+    // === 2. Fall back to RECENT directional data ===
+    else if (direction === 'long' && history.recentSampleCountLong > 0) {
+        selectedMfe = history.recentMfeLong;
+        selectedMae = history.recentMaeLong;
+        source = 'recent-long';
+    } else if (direction === 'short' && history.recentSampleCountShort > 0) {
+        selectedMfe = history.recentMfeShort;
+        selectedMae = history.recentMaeShort;
+        source = 'recent-short';
     }
 
-    // If still no meaningful data, use overall lifetime as last resort
+    // If no recent data at all
     if (selectedMfe === 0 && selectedMae === 0) {
-        selectedMfe = history.avgMfe;
-        selectedMae = history.avgMae;
-        source = 'overall-lifetime';
+        advice = 'ℹ️ No recent excursion data';
+        return { advice, adjustments };
     }
 
     const ratio = computeExcursionRatio(selectedMfe, selectedMae);
@@ -114,33 +112,33 @@ export function getExcursionAdvice(
     if (ratio >= minExcursionRatio) {
         advice = `🟢 Strong reward potential (${source})`;
         adjustments = {
-            slMultiplier: 1.15,                     // Give more room to breathe
-            tpMultiplier: 1.25,                     // Aggressively capture upside
+            slMultiplier: 1.15,
+            tpMultiplier: 1.25,
             confidenceBoost: excursionConfidenceBoost,
         };
     }
-    // === Poor reward profile (high drawdown relative to gain) ===
-    else if (ratio < 1.0 || selectedMae > maxMaePct * 0.9) {
+    // === Poor reward profile ===
+    else if (ratio < 1.0 || Math.abs(selectedMae) > maxMaePct * 0.9) {
         advice = `🔴 Poor reward-to-risk (${source})`;
         adjustments = {
-            slMultiplier: 0.85,                     // Cut losses faster
+            slMultiplier: 0.85,
             tpMultiplier: 0.9,
             confidenceBoost: -0.1,
         };
     }
-    // === Moderate but below strong threshold ===
-    else if (ratio < minExcursionRatio) {
+    // === Moderate ===
+    else {
         advice = `🟡 Moderate excursions (${source})`;
         adjustments = {
             slMultiplier: 1.0,
-            tpMultiplier: 1.1,                      // Modest TP expansion
+            tpMultiplier: 1.1,
             confidenceBoost: 0.05,
         };
     }
 
-    // Add recent sample context if available
+    // Add context
     if (history.recentSampleCount > 0) {
-        advice += ` | Recent samples: ${history.recentSampleCount}`;
+        advice += ` | Samples: ${history.recentSampleCount}`;
         if (history.recentReverseCount > 0) {
             advice += ` | Reversals: ${history.recentReverseCount}`;
         }
@@ -150,7 +148,7 @@ export function getExcursionAdvice(
 }
 
 /**
- * Determine if a symbol has unacceptable recent or directional drawdown risk
+ * Determine if a symbol has unacceptable recent drawdown risk
  */
 export function isHighMaeRisk(
     history: EnrichedSymbolHistory,
@@ -158,17 +156,16 @@ export function isHighMaeRisk(
 ): boolean {
     const maxMaePct = config.strategy.maxMaePct ?? 3.0;
 
-    // Prioritize recent MAE
-    if (history.recentSampleCount >= 3 && history.recentMae > maxMaePct) {
+    // Prioritize recent overall
+    if (history.recentSampleCount >= 3 && Math.abs(history.recentMae) > maxMaePct) {
         return true;
     }
 
-    // Then directional
-    const directionalMae = direction === 'long' ? history.avgMaeLong : history.avgMaeShort;
-    if (directionalMae > maxMaePct) {
+    // Then recent directional
+    const directionalMae = direction === 'long' ? history.recentMaeLong : history.recentMaeShort;
+    if (directionalMae !== 0 && Math.abs(directionalMae) > maxMaePct) {
         return true;
     }
 
-    // Finally overall
-    return history.avgMae > maxMaePct;
+    return false;
 }

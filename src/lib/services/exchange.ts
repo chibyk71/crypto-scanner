@@ -4,6 +4,7 @@ import { config } from '../config/settings';
 import ccxt, { type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
 import { createLogger } from '../logger';
 import type { OhlcvData } from '../../types';
+import { dbService } from '../db';
 
 /**
  * Logger instance for ExchangeService operations.
@@ -48,8 +49,6 @@ export class ExchangeService {
         if (config.exchange.apiKey && config.exchange.apiSecret) {
             this.exchange.apiKey = config.exchange.apiKey;
             this.exchange.secret = config.exchange.apiSecret;
-
-            logger.info(`ExchangeService configured in ${config.autoTrade ? 'live' : 'testnet'} mode`, { exchange });
         }
     }
 
@@ -147,7 +146,7 @@ export class ExchangeService {
      * @throws {Error} If initialization fails (e.g., market loading error).
      */
     public async initialize(): Promise<void> {
-        logger.info('Initializing ExchangeService...', { exchange: 'gate', liveMode: config.autoTrade });
+        logger.info('Initializing ExchangeService...');
         await this.loadMarkets();
         this.startPolling();
     }
@@ -301,28 +300,76 @@ export class ExchangeService {
         return this.primaryOhlcvData[symbol];
     }
 
+    /**
+ * Polls OHLCV data for a single symbol at regular intervals.
+ * - Updates live in-memory primary data for strategy/scanner use.
+ * - Persists to database: full history on first poll, only new candles on subsequent polls.
+ * - Uses per-symbol tracking of last persisted timestamp to avoid duplicates and overload.
+ * @param symbol Trading symbol
+ * @param timeframe Candlestick timeframe
+ * @private
+ */
     private async pollSymbol(symbol: string, timeframe: string): Promise<void> {
         const ms = ExchangeService.toTimeframeMs(timeframe);
-        const historyLength = config.historyLength; // ← Use config
+        const historyLength = config.historyLength;
+
+        // Per-symbol tracker: last timestamp successfully persisted to DB
+        let lastPersistedTimestamp = 0;
+
         const poll = async () => {
             try {
+                // Fetch latest candles from exchange
                 const candles = await this.exchange.fetchOHLCV(symbol, timeframe, undefined, historyLength);
 
-                if (candles.length > 0) {
-                    this.primaryOhlcvData[symbol] = candles;
-                    const latest = candles.at(-1)!;
-                    logger.info(`[${symbol}:${timeframe}] Updated OHLCV`, {
-                        latestClose: latest[4],
-                        candleCount: candles.length,
+                if (candles.length === 0) {
+                    logger.warn(`No candles received during poll for ${symbol}`);
+                    return;
+                }
+
+                // Update live in-memory data (used by strategy, scanner, alerts)
+                this.primaryOhlcvData[symbol] = candles;
+
+                const latest = candles.at(-1)!;
+                logger.info(`[${symbol}:${timeframe}] Updated OHLCV`, {
+                    latestClose: latest[4],
+                    candleCount: candles.length,
+                });
+
+                // === Smart Incremental Persistence ===
+                // Filter only candles newer than what we've already persisted
+                const newCandles = candles.filter(candle => {
+                    const ts = candle[0] as number;
+                    return ts > lastPersistedTimestamp;
+                });
+
+                if (newCandles.length > 0) {
+                    // Fire-and-forget persistence
+                    void this.persistOhlcvToDb(symbol, timeframe, newCandles).catch(err => {
+                        logger.error(`Async failure persisting ${newCandles.length} new candles for ${symbol}`, {
+                            error: err,
+                        });
                     });
+
+                    // Update tracker to newest persisted timestamp
+                    lastPersistedTimestamp = newCandles.at(-1)![0] as number;
+
+                    logger.debug(`Persisted ${newCandles.length} new candle(s) for ${symbol} ${timeframe}`, {
+                        fromTs: newCandles[0][0],
+                        toTs: lastPersistedTimestamp,
+                    });
+                } else {
+                    logger.debug(`No new candles to persist for ${symbol} (up to date)`);
                 }
             } catch (error) {
-                logger.error(`Polling failed for ${symbol}`, { error });
+                logger.error(`Polling failed for ${symbol} ${timeframe}`, { error });
             }
         };
 
+        // Initial poll: bootstraps full history if DB is empty
         await poll();
-        setInterval(poll, ms);
+
+        // Schedule recurring polls
+        this.pollingIntervals[symbol] = setInterval(poll, ms);
     }
 
 
@@ -513,6 +560,41 @@ export class ExchangeService {
             volumes: candles.map(c => c[5] as number),
             length: candles.length,
         };
+    }
+
+    /**
+     * NEW: Persists fetched OHLCV data to the database for historical backtesting.
+     * - Assumes a table `ohlcv_history` exists in the schema (e.g., with columns: symbol, timeframe, timestamp, open, high, low, close, volume).
+     * - Uses batch insert or upsert to avoid duplicates (based on symbol + timeframe + timestamp unique key).
+     * - Fire-and-forget: Non-blocking, logs errors but doesn't throw to avoid disrupting fetching.
+     * @param symbol - Trading symbol.
+     * @param timeframe - Timeframe string.
+     * @param candles - Array of OHLCV data to store.
+     * @private
+     */
+    private async persistOhlcvToDb(symbol: string, timeframe: string, candles: OHLCV[]): Promise<void> {
+        try {
+            // Prepare batch data for insertion (convert to DB-friendly format)
+            const records = candles.map(candle => ({
+                symbol,
+                timeframe,
+                timestamp: Number(candle[0]),  // Unix ms
+                open: Number(candle[1]),
+                high: Number(candle[2]),
+                low: Number(candle[3]),
+                close: Number(candle[4]),
+                volume: Number(candle[5]),
+            }));
+
+            // Use dbService to batch insert/upsert (assuming a method like batchInsertOhlcv exists in dbService)
+            // If not, implement it in db/index.ts with Drizzle's batch insert on duplicate key update.
+            await dbService.batchInsertOhlcv(records);
+
+            logger.debug(`Persisted ${records.length} OHLCV candles for ${symbol} on ${timeframe} to DB`);
+        } catch (error) {
+            logger.error(`Failed to persist OHLCV for ${symbol} on ${timeframe} to DB`, { error });
+            // Non-fatal: Continue without throwing
+        }
     }
 
     /**

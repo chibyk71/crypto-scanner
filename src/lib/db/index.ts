@@ -41,11 +41,14 @@ import {
     type SimulatedTrade,
     type NewSimulatedTrade,
     coolDownTable,
-    type SymbolHistory,
+    type NewOhlcvHistory,
+    ohlcvHistory,
 } from './schema';
 
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
+import type { SimulationHistoryEntry } from '../../types/signalHistory';
+import { activeSimulationsCache } from '../services/activeSimulationsCache';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -53,22 +56,34 @@ const logger = createLogger('db');
 // ===========================================================================
 // ENRICHED SYMBOL HISTORY TYPE
 // ===========================================================================
-export interface EnrichedSymbolHistory extends SymbolHistory {
-    // Recent time-bound fields (already in schema)
-    recentMfe: number;
-    recentMae: number;
-    recentSampleCount: number;
-    recentReverseCount: number;
-    recentReverseCountLong: number;
-    recentReverseCountShort: number;
+// Replace the old EnrichedSymbolHistory with this
+export interface EnrichedSymbolHistory {
+    symbol: string;
+    historyJson: SimulationHistoryEntry[];
 
-    // Directional lifetime
-    avgMfeLong: number;
-    avgMaeLong: number;
-    avgMfeShort: number;
-    avgMaeShort: number;
-    winRateLong: number;
-    winRateShort: number;
+    // Recent-only aggregates (last ~3 hours)
+    recentAvgR: number;
+    recentWinRate: number;
+    recentReverseCount: number;
+    recentMae: number;           // negative or zero
+    recentMfe: number;           // positive
+    recentExcursionRatio: number;
+    recentSampleCount: number;
+
+    // Recent directional
+    recentMfeLong: number;
+    recentMaeLong: number;
+    recentWinRateLong: number;
+    recentReverseCountLong: number;
+    recentSampleCountLong: number;
+
+    recentMfeShort: number;
+    recentMaeShort: number;
+    recentWinRateShort: number;
+    recentReverseCountShort: number;
+    recentSampleCountShort: number;
+
+    updatedAt: Date;
 }
 
 // ===========================================================================
@@ -156,6 +171,7 @@ class DatabaseService {
                         simulatedTrades,
                         coolDownTable,
                         symbolHistory, // ← Important for fast excursion stats
+                        ohlcvHistory,
                     },
                     mode: 'default',
                     logger: config.env === 'dev',
@@ -930,18 +946,16 @@ class DatabaseService {
     // SIMULATED TRADES: Close simulation and store final results
     // =========================================================================
     /**
-     * Finalizes a simulated trade with full outcome data and updates excursion stats.
+     * Finalizes a simulated trade and updates the recent-only symbolHistory table.
      *
-     * Called from:
-     *   • simulateTrade() – when TP, SL, partial TP, or timeout occurs
-     *
-     * What it does:
-     *   • Calculates normalized MFE/MAE as percentage of entry price
-     *   • Stores values with high precision (×1e4 for percentages)
-     *   • Updates closedAt timestamp
-     *   • Triggers symbolHistory excursion recalculation
-     *   • Comprehensive logging for ML readiness
-     *
+     * New behavior (recent-only regime):
+     * - Adds the completed simulation to historyJson with current timestamp
+     * - Prunes historyJson to only entries from the last 3 hours
+     * - Recomputes ALL recent aggregates from the filtered recent simulations
+     * - Supports directional long/short stats
+     * - Detects strong reversals using rMultiple sign and increments counters
+     * - No lifetime data is stored or updated
+     * *
      * @param signalId - UUID from startSimulatedTrade()
      * @param outcome - Final outcome type
      * @param pnl - Realized PnL (as decimal, e.g., 0.023 = +2.3%)
@@ -959,64 +973,194 @@ class DatabaseService {
         maxFavorablePrice: number,
         maxAdversePrice: number
     ): Promise<void> {
-        // Fetch original trade to get entry price and side
+        const now = Date.now();
+        const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+        const cutoffTime = now - THREE_HOURS_MS;
+
+        // Fetch original trade details
         const [trade] = await this.db
             .select({
                 entryPrice: simulatedTrades.entryPrice,
                 side: simulatedTrades.side,
                 symbol: simulatedTrades.symbol,
+                openedAt: simulatedTrades.openedAt,
             })
             .from(simulatedTrades)
             .where(eq(simulatedTrades.signalId, signalId))
             .execute();
 
-        // Safety check – should never happen
         if (!trade) {
             logger.error('Cannot close simulated trade – signalId not found', { signalId });
             return;
         }
 
         const isLong = trade.side === 'buy';
-        const entryPrice = Number(trade.entryPrice) / 1e8;  // Convert from stored ×1e8
+        const entryPrice = Number(trade.entryPrice) / 1e8; // Unscale from ×1e8
 
-        // Normalize MFE/MAE to percentage of entry price (for cross-symbol comparison)
-        const mfe = isLong
-            ? (maxFavorablePrice - entryPrice) / entryPrice * 100
-            : (entryPrice - maxFavorablePrice) / entryPrice * 100;
+        // Compute final MFE/MAE as percentages
+        const mfePct = isLong
+            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100
+            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;
 
-        const mae = isLong
-            ? (entryPrice - maxAdversePrice) / entryPrice * 100
-            : (maxAdversePrice - entryPrice) / entryPrice * 100;
+        const maePctRaw = isLong
+            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100
+            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;
 
-        // Update row with final results
+        // Negative MAE by convention
+        const maePctNegative = -Math.abs(maePctRaw);
+
+        // Update the simulatedTrades row with final results
         await this.db
             .update(simulatedTrades)
             .set({
-                closedAt: Date.now(),
+                closedAt: now,
                 outcome,
-                pnl: Number(Math.round(pnl * 1e8)),                    // Store ×1e8
-                rMultiple: rMultiple === null ? null : Number(Math.round(rMultiple * 1e4)), // ×1e4
+                pnl: Math.round(pnl * 1e8),
+                rMultiple: rMultiple === null ? null : Math.round(rMultiple * 1e4),
                 label,
-                maxFavorableExcursion: Number(Math.round(mfe * 1e4)),   // Store as ×1e4
-                maxAdverseExcursion: Number(Math.round(mae * 1e4)),
+                maxFavorableExcursion: Math.round(mfePct * 1e4),
+                maxAdverseExcursion: Math.round(maePctNegative * 1e4), // Store negative
             })
             .where(eq(simulatedTrades.signalId, signalId))
             .execute();
 
-        // Rich log – confirms ML label is ready
         logger.info('SIMULATED TRADE CLOSED – ML LABEL READY', {
             signalId,
             symbol: trade.symbol,
+            side: isLong ? 'LONG' : 'SHORT',
             outcome: outcome.toUpperCase(),
-            pnlPercent: `${(pnl * 100).toFixed(2)}%`,
+            pnlPct: (pnl * 100).toFixed(2),
             rMultiple: rMultiple.toFixed(3),
             label,
-            mfePct: mfe.toFixed(2),
-            maePct: mae.toFixed(2),
+            mfePct: mfePct.toFixed(2),
+            maePct: maePctNegative.toFixed(2),
         });
 
-        // Update denormalized averages in symbolHistory for fast excursion queries
-        await this.updateSymbolHistoryExcursions(trade.symbol);
+        // === UPDATE RECENT-ONLY symbolHistory ===
+        const symbol = trade.symbol;
+
+        // Detect strong reversal for current trade (using pnl or rMultiple sign)
+        const expectedPositiveR = isLong; // long expects positive R, short expects negative
+        const actualPositiveR = rMultiple > 0;
+        const isStrongReversal = Math.abs(label) >= 1 && actualPositiveR !== expectedPositiveR;
+
+        // New simulation entry
+        const newEntry: SimulationHistoryEntry = {
+            timestamp: now,
+            direction: trade.side,
+            outcome,
+            rMultiple,
+            label,
+            durationMs: now - trade.openedAt,
+            mfe: mfePct,
+            mae: maePctNegative,
+        };
+
+        // Fetch current symbolHistory row (if exists)
+        const [existing] = await this.db
+            .select()
+            .from(symbolHistory)
+            .where(eq(symbolHistory.symbol, symbol))
+            .execute();
+
+        let recentEntries: SimulationHistoryEntry[] = [];
+
+        if (existing && Array.isArray(existing.historyJson)) {
+            recentEntries = existing.historyJson.filter(
+                (e: any) => typeof e.timestamp === 'number' && e.timestamp >= cutoffTime
+            );
+        }
+
+        // Add the new closed entry
+        recentEntries.push(newEntry);
+
+        // Sort newest first
+        recentEntries.sort((a, b) => b.timestamp - a.timestamp);
+
+        // === Recalculate all recent aggregates ===
+        const sampleCount = recentEntries.length;
+        if (sampleCount === 0) return;
+
+        const recentAvgR = recentEntries.reduce((sum, e) => sum + e.rMultiple, 0) / sampleCount;
+        const recentWinRate = recentEntries.filter(e => e.label >= 1).length / sampleCount;
+
+        // Reverse count using rMultiple sign
+        const recentReverseCount = recentEntries.filter(e => {
+            const expectedPositive = e.direction === 'buy';
+            const actualPositive = e.rMultiple > 0;
+            return Math.abs(e.label) >= 1 && actualPositive !== expectedPositive;
+        }).length;
+
+        const recentMfe = recentEntries.reduce((sum, e) => sum + e.mfe, 0) / sampleCount;
+        const recentMae = recentEntries.reduce((sum, e) => sum + e.mae, 0) / sampleCount;
+        const recentExcursionRatio = recentMae >= -1e-6 ? recentMfe / Math.abs(recentMae) : 999999;
+
+        // Directional stats
+        const longEntries = recentEntries.filter(e => e.direction === 'buy');
+        const shortEntries = recentEntries.filter(e => e.direction === 'sell');
+
+        const recentMfeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mfe, 0) / longEntries.length : 0;
+        const recentMaeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mae, 0) / longEntries.length : 0;
+        const recentWinRateLong = longEntries.length ? longEntries.filter(e => e.label >= 1).length / longEntries.length : 0;
+        const recentReverseCountLong = longEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple <= 0).length;
+        const recentSampleCountLong = longEntries.length;
+
+        const recentMfeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mfe, 0) / shortEntries.length : 0;
+        const recentMaeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mae, 0) / shortEntries.length : 0;
+        const recentWinRateShort = shortEntries.length ? shortEntries.filter(e => e.label >= 1).length / shortEntries.length : 0;
+        const recentReverseCountShort = shortEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple >= 0).length;
+        const recentSampleCountShort = shortEntries.length;
+
+        // === UPSERT into symbolHistory ===
+        const updateData = {
+            historyJson: recentEntries,
+            recentAvgR,
+            recentWinRate,
+            recentReverseCount: recentReverseCount + (isStrongReversal ? 1 : 0),
+            recentMae,
+            recentMfe,
+            recentExcursionRatio,
+            recentSampleCount: sampleCount,
+
+            recentMfeLong,
+            recentMaeLong,
+            recentWinRateLong,
+            recentReverseCountLong: recentReverseCountLong + (isLong && isStrongReversal ? 1 : 0),
+            recentSampleCountLong,
+
+            recentMfeShort,
+            recentMaeShort,
+            recentWinRateShort,
+            recentReverseCountShort: recentReverseCountShort + (!isLong && isStrongReversal ? 1 : 0),
+            recentSampleCountShort,
+
+            updatedAt: new Date(),
+        };
+
+        if (existing) {
+            await this.db
+                .update(symbolHistory)
+                .set(updateData)
+                .where(eq(symbolHistory.symbol, symbol))
+                .execute();
+        } else {
+            await this.db
+                .insert(symbolHistory)
+                .values({
+                    symbol,
+                    ...updateData,
+                })
+                .execute();
+        }
+
+        logger.debug('Updated recent-only symbolHistory', {
+            symbol,
+            recentSampleCount: sampleCount,
+            recentMfe: recentMfe.toFixed(2),
+            recentMae: recentMae.toFixed(2),
+            recentExcursionRatio: recentExcursionRatio.toFixed(2),
+            recentReverseCount: recentReverseCount + (isStrongReversal ? 1 : 0),
+        });
     }
 
     // =========================================================================
@@ -1037,117 +1181,87 @@ class DatabaseService {
      * @param symbol - Trading pair
      * @returns Object with avgMfe, avgMae, ratio or null if no data
      */
-    public async getSymbolExcursions(symbol: string): Promise<{ avgMfe: number; avgMae: number; ratio: number } | null> {
-        // Single-row lookup from denormalized table
-        const [result] = await this.db
-            .select({
-                avgMfe: symbolHistory.avgMfe,
-                avgMae: symbolHistory.avgMae,
-                ratio: symbolHistory.avgExcursionRatio,
-            })
-            .from(symbolHistory)
-            .where(eq(symbolHistory.symbol, symbol))
-            .limit(1)
-            .execute();
+    // public async getSymbolExcursions(symbol: string): Promise<{ avgMfe: number; avgMae: number; ratio: number } | null> {
+    //     // Single-row lookup from denormalized table
+    //     const [result] = await this.db
+    //         .select({
+    //             avgMfe: symbolHistory.avgMfe,
+    //             avgMae: symbolHistory.avgMae,
+    //             ratio: symbolHistory.avgExcursionRatio,
+    //         })
+    //         .from(symbolHistory)
+    //         .where(eq(symbolHistory.symbol, symbol))
+    //         .limit(1)
+    //         .execute();
 
-        // Return null if symbol has no history yet
-        return result || null;
-    }
+    //     // Return null if symbol has no history yet
+    //     return result || null;
+    // }
 
-    // =========================================================================
-    // SYMBOL EXCURSION STATS: Recalculate and update denormalized averages
-    // =========================================================================
     /**
-     * Recomputes average MFE and MAE for a symbol from all its closed simulations
-     * and updates the denormalized symbolHistory table.
-     *
-     * Called from:
-     *   • closeSimulatedTrade() – every time a simulation finishes
-     *
-     * Why denormalized?
-     *   • getSymbolExcursions() is called frequently (strategy, autotrade, alerts)
-     *   • Computing AVG on thousands of rows in real-time would be too slow
-     *   • This method keeps pre-computed values fresh with minimal overhead
-     *
-     * Calculation details:
-     *   • MFE/MAE are stored ×1e4 → divide by 1e4 to get percentages
-     *   • Handles long/short correctly (direction doesn't affect magnitude here)
-     *   • Ratio = avgMfe / avgMae (0 if no MAE to avoid division by zero)
-     *   • Uses COALESCE to preserve other fields (historyJson, avgR, etc.)
-     *
-     * @param symbol - Trading pair to update
-     * @private – only called internally after simulation close
-     */
-    private async updateSymbolHistoryExcursions(symbol: string): Promise<void> {
-        // Compute average MFE and MAE from all closed simulations for this symbol
-        // Values are stored ×1e4 → divide by 1e4 to convert back to percentage
-        const result = await this.db
-            .select({
-                avgMfe: sql<number>`
-                AVG(
-                    CASE
-                        WHEN ${simulatedTrades.side} = 'buy'
-                        THEN ${simulatedTrades.maxFavorableExcursion} / 1e4
-                        ELSE ${simulatedTrades.maxFavorableExcursion} / 1e4
-                    END
-                )
-            `.mapWith(Number),
-                avgMae: sql<number>`
-                AVG(
-                    CASE
-                        WHEN ${simulatedTrades.side} = 'buy'
-                        THEN ${simulatedTrades.maxAdverseExcursion} / 1e4
-                        ELSE ${simulatedTrades.maxAdverseExcursion} / 1e4
-                    END
-                )
-            `.mapWith(Number),
-            })
-            .from(simulatedTrades)
-            .where(
-                and(
-                    eq(simulatedTrades.symbol, symbol),
-                    not(isNull(simulatedTrades.closedAt)),                 // Only closed trades
-                    not(isNull(simulatedTrades.maxFavorableExcursion)),    // Valid data
-                    not(isNull(simulatedTrades.maxAdverseExcursion))
-                )
-            )
-            .execute();
+ * NEW: Batch insert OHLCV candles into historical table.
+ *
+ * Uses ON DUPLICATE KEY UPDATE to skip existing candles (idempotent).
+ * Fire-and-forget: logs errors but does not throw (safe for ExchangeService polling).
+ *
+ * @param records Array of OHLCV records from CCXT fetchOHLCV
+ */
+    public async batchInsertOhlcv(
+        records: {
+            symbol: string;
+            timeframe: string;
+            timestamp: number;
+            open: number | string;
+            high: number | string;
+            low: number | string;
+            close: number | string;
+            volume: number | string;
+        }[]
+    ): Promise<void> {
+        if (records.length === 0) {
+            return;
+        }
 
-        // Extract averages (default to 0 if no data)
-        const avgMfe = result[0]?.avgMfe ?? 0;
-        const avgMae = result[0]?.avgMae ?? 0;
-        const ratio = avgMae === 0 ? 0 : avgMfe / avgMae;  // Avoid division by zero
+        try {
+            // Convert to Drizzle-compatible format (decimal as string)
+            const values: NewOhlcvHistory[] = records.map(r => ({
+                symbol: r.symbol,
+                timeframe: r.timeframe,
+                timestamp: r.timestamp,
+                open: r.open.toString(),
+                high: r.high.toString(),
+                low: r.low.toString(),
+                close: r.close.toString(),
+                volume: r.volume.toString(),
+            }));
 
-        // UPSERT into denormalized symbolHistory table
-        // Preserves other fields using COALESCE
-        await this.db
-            .insert(symbolHistory)
-            .values({
-                symbol,
-                avgMae,
-                avgMfe,
-                avgExcursionRatio: ratio,
-                historyJson: sql`COALESCE(historyJson, '[]')`,
-                avgR: sql`COALESCE(avgR, 0)`,
-                winRate: sql`COALESCE(winRate, 0)`,
-                reverseCount: sql`COALESCE(reverseCount, 0)`,
-            })
-            .onDuplicateKeyUpdate({
-                set: {
-                    avgMae,
-                    avgMfe,
-                    avgExcursionRatio: ratio,
-                },
-            })
-            .execute();
+            // Batch upsert — efficient and safe
+            await this.db
+                .insert(ohlcvHistory)
+                .values(values)
+                .onDuplicateKeyUpdate({
+                    set: {
+                        open: sql`VALUES(${ohlcvHistory.open})`,
+                        high: sql`VALUES(${ohlcvHistory.high})`,
+                        low: sql`VALUES(${ohlcvHistory.low})`,
+                        close: sql`VALUES(${ohlcvHistory.close})`,
+                        volume: sql`VALUES(${ohlcvHistory.volume})`,
+                    },
+                });
 
-        // Debug log – useful for monitoring excursion quality per symbol
-        logger.debug('Updated symbolHistory excursions', {
-            symbol,
-            avgMfe: avgMfe.toFixed(2),
-            avgMae: avgMae.toFixed(2),
-            ratio: ratio.toFixed(2),
-        });
+            logger.debug(`Persisted ${values.length} OHLCV candles to history table`, {
+                symbol: records[0].symbol,
+                timeframe: records[0].timeframe,
+                count: values.length,
+            });
+        } catch (err) {
+            logger.error('Failed to batch insert OHLCV data', {
+                count: records.length,
+                symbol: records[0]?.symbol || 'unknown',
+                error: err instanceof Error ? err.message : err,
+            });
+            // Do NOT throw — this should never break live polling or simulation
+        }
     }
 
     // =========================================================================
@@ -1278,113 +1392,52 @@ class DatabaseService {
     }
 
     // ===========================================================================
-    // NEW: Update recent excursions (time-bound rolling average)
+    // Increment recent reverse count (only for closed simulations)
     // ===========================================================================
     /**
-     * Updates the recent MFE/MAE averages using a simple rolling mechanism.
-     * We maintain a fixed-time-window average by blending new values.
+     * Increments the recent reverse counters when a strong reversal is detected.
+     * Called only from closeSimulatedTrade() after a simulation finishes.
      *
-     * Strategy:
-     *   - If recentSampleCount == 0 → initialize with current values
-     *   - Else → weighted blend favoring recent data
-     *   - Called on both interim updates and final close
+     * +1 on strong reversal (wrong direction profit/loss)
+     * Safe UPSERT pattern — works even if symbol row doesn't exist yet
      *
      * @param symbol
-     * @param mfePct - normalized MFE in percent (e.g., 3.45)
-     * @param maePct - normalized MAE in percent (e.g., 1.82)
-     * @param direction - 'long' or 'short'
-     * @param windowHours - configurable lookback (default 3)
-     */
-    public async updateRecentExcursions(
-        symbol: string,
-        mfePct: number,
-        maePct: number,
-        direction: 'long' | 'short',
-        _windowHours = 3
-    ): Promise<void> {
-        const history = await this.db
-            .select()
-            .from(symbolHistory)
-            .where(eq(symbolHistory.symbol, symbol))
-            .limit(1)
-            .then(rows => rows[0]);
-
-        let updates: Partial<SymbolHistory> = {};
-
-        if (!history) {
-            // First time seeing this symbol – initialize all
-            updates = {
-                recentMfe: mfePct,
-                recentMae: maePct,
-                recentSampleCount: 1,
-                ...(direction === 'long' ? { avgMfeLong: mfePct, avgMaeLong: maePct } : { avgMfeShort: mfePct, avgMaeShort: maePct }),
-            };
-
-            await this.db.insert(symbolHistory).values({
-                symbol,
-                recentMfe: mfePct,
-                recentMae: maePct,
-                recentSampleCount: 1,
-                // Initialize other defaults implicitly via schema
-            } as any);
-        } else {
-            const newCount = history.recentSampleCount + 1;
-            const blendFactor = 1 / newCount; // Gives more weight to recent
-
-            updates = {
-                recentMfe: history.recentMfe * (1 - blendFactor) + mfePct * blendFactor,
-                recentMae: history.recentMae * (1 - blendFactor) + maePct * blendFactor,
-                recentSampleCount: newCount,
-            };
-
-            // Also update directional lifetime averages (simple running avg)
-            if (direction === 'long') {
-                const longCount = (history.avgMfeLong > 0 || history.avgMaeLong > 0) ? history.recentSampleCount + 1 : 1; // rough proxy
-                updates.avgMfeLong = history.avgMfeLong * (1 - blendFactor) + mfePct * blendFactor;
-                updates.avgMaeLong = history.avgMaeLong * (1 - blendFactor) + maePct * blendFactor;
-            } else {
-                const shortCount = (history.avgMfeShort > 0 || history.avgMaeShort > 0) ? history.recentSampleCount + 1 : 1;
-                updates.avgMfeShort = history.avgMfeShort * (1 - blendFactor) + mfePct * blendFactor;
-                updates.avgMaeShort = history.avgMaeShort * (1 - blendFactor) + maePct * blendFactor;
-            }
-
-            await this.db
-                .update(symbolHistory)
-                .set(updates)
-                .where(eq(symbolHistory.symbol, symbol));
-        }
-    }
-
-    // ===========================================================================
-    // NEW: Increment time-bound recent reverse count
-    // ===========================================================================
-    /**
-     * Increments (or decrements) the recent reverse count.
-     * +1 if strong reversal, -1 if trade followed signal direction (to decay old reversals).
-     * We cap at reasonable bounds and let natural decay handle time window.
-     *
-     * @param symbol
-     * @param direction
-     * @param delta +1 for reversal, -1 for normal outcome
+     * @param direction 'long' or 'short'
+     * @param delta +1 for reversal (default), could support -1 for decay later
      */
     public async incrementRecentReverseCount(
         symbol: string,
         direction: 'long' | 'short',
-        delta: 1 | -1
+        delta: 1 | -1 = 1
     ): Promise<void> {
-        const field = direction === 'long' ? 'recentReverseCountLong' : 'recentReverseCountShort';
+        const longField = 'recentReverseCountLong';
+        const shortField = 'recentReverseCountShort';
         const totalField = 'recentReverseCount';
 
-        await this.db
-            .update(symbolHistory)
-            .set({
-                [field]: sql`${symbolHistory[field]} + ${delta}`,
-                [totalField]: sql`${symbolHistory[totalField]} + ${delta}`,
-            } as any)
-            .where(eq(symbolHistory.symbol, symbol));
+        const fieldToIncrement = direction === 'long' ? longField : shortField;
 
-        // Optional: enforce bounds to prevent drift
-        // You can add a cleanup job later if needed
+        // UPSERT: insert default row if missing, then increment
+        await this.db
+            .insert(symbolHistory)
+            .values({
+                symbol,
+                // All defaults from schema will apply
+            })
+            .onDuplicateKeyUpdate({
+                set: {
+                    [fieldToIncrement]: sql`${symbolHistory[fieldToIncrement]} + ${delta}`,
+                    [totalField]: sql`${symbolHistory[totalField]} + ${delta}`,
+                    updatedAt: new Date(),
+                },
+            })
+            .execute();
+
+        logger.debug('Incremented recent reverse count', {
+            symbol,
+            direction,
+            delta,
+            field: fieldToIncrement,
+        });
     }
 
     // ===========================================================================
@@ -1397,65 +1450,221 @@ class DatabaseService {
      *   - AutoTradeService.execute()
      *   - TelegramBotController for rich alerts
      */
-    public async getEnrichedSymbolHistory(symbol: string): Promise<EnrichedSymbolHistory | null> {
-        const row = await this.db
+    /**
+ * Returns the full recent-only history for a symbol.
+ * Used by Strategy, AutoTradeService, and Telegram alerts.
+ * All data reflects only the last ~3 hours.
+ */
+    public async getEnrichedSymbolHistory(symbol: string): Promise<EnrichedSymbolHistory> {
+        const [row] = await this.db
             .select()
             .from(symbolHistory)
             .where(eq(symbolHistory.symbol, symbol))
-            .limit(1)
-            .then(rows => rows[0]);
+            .execute();
+
+        // Default object if no row exists yet
+        const defaults: EnrichedSymbolHistory = {
+            symbol,
+            historyJson: [],
+            recentAvgR: 0,
+            recentWinRate: 0,
+            recentReverseCount: 0,
+            recentMae: 0,
+            recentMfe: 0,
+            recentExcursionRatio: 0,
+            recentSampleCount: 0,
+            recentMfeLong: 0,
+            recentMaeLong: 0,
+            recentWinRateLong: 0,
+            recentReverseCountLong: 0,
+            recentSampleCountLong: 0,
+            recentMfeShort: 0,
+            recentMaeShort: 0,
+            recentWinRateShort: 0,
+            recentReverseCountShort: 0,
+            recentSampleCountShort: 0,
+            updatedAt: new Date(),
+        };
 
         if (!row) {
-            // Return a clean default object so callers don't have to null-check everything
-            return {
-                symbol,
-                historyJson: [],
-                avgR: 0,
-                winRate: 0,
-                reverseCount: 0,
-                avgMae: 0,
-                avgMfe: 0,
-                avgExcursionRatio: 0,
-                recentMfe: 0,
-                recentMae: 0,
-                recentSampleCount: 0,
-                avgMfeLong: 0,
-                avgMaeLong: 0,
-                avgMfeShort: 0,
-                avgMaeShort: 0,
-                winRateLong: 0,
-                winRateShort: 0,
-                recentReverseCountLong: 0,
-                recentReverseCountShort: 0,
-                recentReverseCount: 0,
-                updatedAt: new Date(),
-            };
+            return defaults;
         }
 
+        // Type assertion is safe because row matches the schema
         return row as EnrichedSymbolHistory;
     }
 
+    /**
+ * Returns the REAL-TIME regime for a symbol:
+ * - All closed simulations from last 3 hours (accurate, from DB)
+ * - PLUS all currently running simulations (live interim MFE/MAE from memory)
+ *
+ * This is the method your Strategy should use before generating a new signal.
+ */
+    public async getCurrentRegime(symbol: string): Promise<{
+        mfe: number;
+        mae: number;
+        excursionRatio: number;
+        avgR: number;
+        winRate: number;
+        reverseCount: number;
+        sampleCount: number;
+        activeCount: number; // how many sims running now
+        mfeLong: number;
+        maeLong: number;
+        winRateLong: number;
+        sampleCountLong: number;
+        mfeShort: number;
+        maeShort: number;
+        winRateShort: number;
+        sampleCountShort: number;
+    }> {
+        // 1. Get closed recent data
+        const closedHistory = await this.getEnrichedSymbolHistory(symbol);
+        const closedEntries = closedHistory.historyJson;
+
+        // 2. Get live active simulations from memory
+        const activeStates = activeSimulationsCache.getBySymbol(symbol);
+
+        // 3. Combine into temporary entries for calculation
+        const liveEntries = activeStates.map(state => ({
+            mfe: state.currentMfePct,
+            mae: state.currentMaePct,
+            rMultiple: 0, // not meaningful yet
+            label: 0,
+            direction: state.direction === 'long' ? 'buy' : 'sell' as 'buy' | 'sell',
+        }));
+
+        const allMfe = [...closedEntries.map(e => e.mfe), ...liveEntries.map(e => e.mfe)];
+        const allMae = [...closedEntries.map(e => e.mae), ...liveEntries.map(e => e.mae)];
+        const allR = [...closedEntries.map(e => e.rMultiple), ...liveEntries.map(() => 0)];
+        const allLabels = [...closedEntries.map(e => e.label), ...liveEntries.map(() => 0)];
+        const allDirections = [...closedEntries.map(e => e.direction), ...liveEntries.map(e => e.direction)];
+
+        const totalCount = allMfe.length;
+
+        if (totalCount === 0) {
+            return {
+                mfe: 0,
+                mae: 0,
+                excursionRatio: 0,
+                avgR: 0,
+                winRate: 0,
+                reverseCount: 0,
+                sampleCount: 0,
+                activeCount: 0,
+                mfeLong: 0,
+                maeLong: 0,
+                winRateLong: 0,
+                sampleCountLong: 0,
+                mfeShort: 0,
+                maeShort: 0,
+                winRateShort: 0,
+                sampleCountShort: 0,
+            };
+        }
+
+        const mfe = allMfe.reduce((a, b) => a + b, 0) / totalCount;
+        const mae = allMae.reduce((a, b) => a + b, 0) / totalCount;
+        const avgR = allR.reduce((a, b) => a + b, 0) / totalCount;
+        const winRate = allLabels.filter(l => l >= 1).length / totalCount;
+        const excursionRatio = mae >= -1e-6 ? mfe / Math.abs(mae) : 999999;
+
+        // Directional (including live)
+        const longAll = allDirections.filter((_, i) => allDirections[i] === 'buy');
+        const shortAll = allDirections.filter((_, i) => allDirections[i] === 'sell');
+
+        const mfeLong = longAll.length ? longAll.reduce((s, _, i) => s + allMfe[i], 0) / longAll.length : 0;
+        const maeLong = longAll.length ? longAll.reduce((s, _, i) => s + allMae[i], 0) / longAll.length : 0;
+        const winRateLong = longAll.length ? longAll.filter((_, i) => allLabels[i] >= 1).length / longAll.length : 0;
+
+        const mfeShort = shortAll.length ? shortAll.reduce((s, _, i) => s + allMfe[i], 0) / shortAll.length : 0;
+        const maeShort = shortAll.length ? shortAll.reduce((s, _, i) => s + allMae[i], 0) / shortAll.length : 0;
+        const winRateShort = shortAll.length ? shortAll.filter((_, i) => allLabels[i] >= 1).length / shortAll.length : 0;
+
+        // Reverse count from closed only (live ones not finished)
+        const reverseCount = closedHistory.recentReverseCount;
+
+        return {
+            mfe,
+            mae,
+            excursionRatio,
+            avgR,
+            winRate,
+            reverseCount,
+            sampleCount: totalCount,
+            activeCount: activeStates.length,
+            mfeLong,
+            maeLong,
+            winRateLong,
+            sampleCountLong: longAll.length,
+            mfeShort,
+            maeShort,
+            winRateShort,
+            sampleCountShort: shortAll.length,
+        };
+    }
+
     // ===========================================================================
-    // OPTIONAL: Periodic cleanup of stale recent stats (run daily via cron)
+    // Periodic cleanup of stale recent stats
     // ===========================================================================
     /**
-     * Resets recent fields if no activity in the last window + buffer.
-     * Prevents stale data from lingering.
+     * Resets all recent fields for symbols that have had no simulation activity
+     * in the last `windowHours` (default 6 hours).
+     *
+     * Why this is still useful:
+     *   • Prevents stale data from lingering on inactive symbols
+     *   • Keeps database clean and aggregates accurate
+     *   • Runs safely via cron (e.g., every hour)
+     *
+     * Behavior:
+     *   • If updatedAt is older than cutoff → full reset of recent fields
+     *   • historyJson is cleared (pruned to empty)
+     *   • All counters and averages reset to 0
+     *
+     * @param windowHours - Inactivity threshold in hours (default 6)
      */
     public async cleanupStaleRecentStats(windowHours = 6): Promise<void> {
-        const cutoff = Date.now() - windowHours * 60 * 60 * 1000;
+        const cutoffMs = Date.now() - windowHours * 60 * 60 * 1000;
+        const cutoffDate = new Date(cutoffMs);
 
-        await this.db
+        const result = await this.db
             .update(symbolHistory)
             .set({
-                recentMfe: 0,
-                recentMae: 0,
-                recentSampleCount: 0,
+                historyJson: [],
+                recentAvgR: 0,
+                recentWinRate: 0,
                 recentReverseCount: 0,
+                recentMae: 0,
+                recentMfe: 0,
+                recentExcursionRatio: 0,
+                recentSampleCount: 0,
+
+                recentMfeLong: 0,
+                recentMaeLong: 0,
+                recentWinRateLong: 0,
                 recentReverseCountLong: 0,
+                recentSampleCountLong: 0,
+
+                recentMfeShort: 0,
+                recentMaeShort: 0,
+                recentWinRateShort: 0,
                 recentReverseCountShort: 0,
+                recentSampleCountShort: 0,
+
+                updatedAt: new Date(), // Touch to prevent immediate re-cleanup
             })
-            .where(sql`${symbolHistory.updatedAt} < ${new Date(cutoff)}`);
+            .where(sql`${symbolHistory.updatedAt} < ${cutoffDate}`)
+            .execute();
+
+        const affected = result[0].affectedRows;
+
+        if (affected > 0) {
+            logger.info('Cleaned up stale recent stats', {
+                inactiveSymbols: affected,
+                cutoffHours: windowHours,
+            });
+        }
     }
 
     // =========================================================================

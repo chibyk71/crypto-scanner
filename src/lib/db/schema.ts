@@ -1,5 +1,5 @@
 // src/lib/db/schema.ts
-import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float } from 'drizzle-orm/mysql-core';
+import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, decimal, uniqueIndex } from 'drizzle-orm/mysql-core';
 import type { Condition } from '../../types';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
 
@@ -119,6 +119,25 @@ export const heartbeat = mysqlTable('heartbeat', {
     /** Unix millisecond timestamp of last completed cycle */
     lastHeartbeatAt: bigint('last_heartbeat_at', { mode: 'number' }).notNull().default(0),
 });
+
+export const ohlcvHistory = mysqlTable('ohlcv_history', {
+    id: bigint('id', { mode: 'number' }).autoincrement().primaryKey(),
+    symbol: varchar('symbol', { length: 30 }).notNull(),
+    timeframe: varchar('timeframe', { length: 10 }).notNull(),
+    timestamp: bigint('timestamp', { mode: 'number' }).notNull(), // Unix ms
+    open: decimal('open', { precision: 30, scale: 10 }).notNull(),
+    high: decimal('high', { precision: 30, scale: 10 }).notNull(),
+    low: decimal('low', { precision: 30, scale: 10 }).notNull(),
+    close: decimal('close', { precision: 30, scale: 10 }).notNull(),
+    volume: decimal('volume', { precision: 30, scale: 8 }).notNull(),
+},
+    (table) => ({
+        // Prevent duplicates
+        uniqueIdx: uniqueIndex('unique_candle').on(table.symbol, table.timeframe, table.timestamp),
+        // Fast range queries
+        symbolTimeIdx: index('idx_symbol_time').on(table.symbol, table.timeframe, table.timestamp),
+    })
+);
 
 /**
  * =============================================================================
@@ -243,7 +262,7 @@ export const simulatedTrades = mysqlTable(
         signalId: varchar('signal_id', { length: 36 }).notNull().unique(),
 
         symbol: varchar('symbol', { length: 50 }).notNull(),
-        side: varchar('side', { length: 10 }).notNull(), // 'buy' | 'sell'
+        side: varchar('side', { length: 10 }).$type<'buy' | 'sell'>().notNull(), // 'buy' | 'sell'
 
         /** Entry price ×1e8 */
         entryPrice: float('entry_price').notNull(),
@@ -337,69 +356,55 @@ export const coolDownTable = mysqlTable('cool_down', {
  *
  * NEW: Recent (time-bound) and directional stats for regime-aware trading
  */
-export const symbolHistory = mysqlTable('symbol_history', {
-    /** Primary key and unique identifier – one row per trading pair */
-    symbol: varchar('symbol', { length: 50 }).primaryKey(), // e.g., 'BTC/USDT'
+export const symbolHistory = mysqlTable(
+    'symbol_history',
+    {
+        /** Trading pair – primary key (one row per symbol) */
+        symbol: varchar('symbol', { length: 50 }).primaryKey(),
 
-    /** JSON array of the 10 most recent SimulationHistoryEntry objects (newest first) */
-    historyJson: json('history_json').$type<SimulationHistoryEntry[]>().notNull().default([]),
+        /** JSON array of recent simulation entries (newest first), filtered to last ~3 hours */
+        historyJson: json('history_json')
+            .$type<SimulationHistoryEntry[]>()
+            .notNull()
+            .default([]),
 
-    /** Average R-multiple across all simulations for this symbol */
-    avgR: float('avg_r').notNull().default(0.0),
+        // === RECENT OVERALL STATS (last ~3 hours) ===
+        recentAvgR: float('recent_avg_r').notNull().default(0.0),
+        recentWinRate: float('recent_win_rate').notNull().default(0.0), // % of wins (label >= 1)
+        recentReverseCount: int('recent_reverse_count').notNull().default(0),
+        recentMae: float('recent_mae').notNull().default(0.0), // Negative or zero
+        recentMfe: float('recent_mfe').notNull().default(0.0), // Positive
+        recentExcursionRatio: float('recent_excursion_ratio').notNull().default(0.0),
+        recentSampleCount: int('recent_sample_count').notNull().default(0),
 
-    /** Win rate percentage (label >= 1) – 0.75 = 75% winning simulations */
-    winRate: float('win_rate').notNull().default(0.0),
+        // === RECENT DIRECTIONAL STATS (long only, last ~3 hours) ===
+        recentMfeLong: float('recent_mfe_long').notNull().default(0.0),
+        recentMaeLong: float('recent_mae_long').notNull().default(0.0),
+        recentWinRateLong: float('recent_win_rate_long').notNull().default(0.0),
+        recentReverseCountLong: int('recent_reverse_count_long').notNull().default(0),
+        recentSampleCountLong: int('recent_sample_count_long').notNull().default(0),
 
-    /** Number of recent simulations that went opposite to the latest signal direction */
-    reverseCount: int('reverse_count').notNull().default(0),
+        // === RECENT DIRECTIONAL STATS (short only, last ~3 hours) ===
+        recentMfeShort: float('recent_mfe_short').notNull().default(0.0),
+        recentMaeShort: float('recent_mae_short').notNull().default(0.0),
+        recentWinRateShort: float('recent_win_rate_short').notNull().default(0.0),
+        recentReverseCountShort: int('recent_reverse_count_short').notNull().default(0),
+        recentSampleCountShort: int('recent_sample_count_short').notNull().default(0),
 
-    /** Average Max Adverse Excursion – normalized as % of entry price */
-    avgMae: float('avg_mae').notNull().default(0.0),  // e.g., 1.85% average drawdown
+        /** Last update timestamp – used for stale cleanup */
+        updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
+    },
+    (table) => ({
+        /** Primary key index (auto-created) */
+        symbolIdx: index('idx_symbol_history_symbol').on(table.symbol),
 
-    /** Average Max Favorable Excursion – normalized as % of entry price */
-    avgMfe: float('avg_mfe').notNull().default(0.0),  // e.g., 4.32% average best unrealized profit
+        /** Fast filtering by excursion quality */
+        excursionIdx: index('idx_symbol_history_excursions').on(table.recentMae, table.recentMfe),
 
-    /** MFE / MAE ratio – key indicator of reward-to-risk efficiency */
-    avgExcursionRatio: float('avg_excursion_ratio').notNull().default(0.0), // e.g., 2.33
-
-    // =========================================================================
-    // NEW: RECENT TIME-BOUND EXCURSIONS (last ~3 hours, configurable)
-    // =========================================================================
-    recentMfe: float('recent_mfe').notNull().default(0.0),
-    recentMae: float('recent_mae').notNull().default(0.0),
-    recentSampleCount: int('recent_sample_count').notNull().default(0),
-
-    // =========================================================================
-    // NEW: DIRECTIONAL LIFETIME STATS (long vs short asymmetry)
-    // =========================================================================
-    avgMfeLong: float('avg_mfe_long').notNull().default(0.0),
-    avgMaeLong: float('avg_mae_long').notNull().default(0.0),
-    avgMfeShort: float('avg_mfe_short').notNull().default(0.0),
-    avgMaeShort: float('avg_mae_short').notNull().default(0.0),
-    winRateLong: float('win_rate_long').notNull().default(0.0),
-    winRateShort: float('win_rate_short').notNull().default(0.0),
-
-    // =========================================================================
-    // NEW: RECENT DIRECTIONAL REVERSAL COUNTS (for regime detection)
-    // =========================================================================
-    recentReverseCountLong: int('recent_reverse_count_long').notNull().default(0),
-    recentReverseCountShort: int('recent_reverse_count_short').notNull().default(0),
-
-    /** Optional: combined recent reverse count for quick checks */
-    recentReverseCount: int('recent_reverse_count').notNull().default(0),
-
-    /** Timestamp of last update – automatically set on insert/update */
-    updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
-}, (table) => ({
-    /** Index on symbol – automatically created by primary key, kept for clarity */
-    symbolIdx: index('idx_symbol_history_symbol').on(table.symbol),
-
-    /** Composite index on MAE and MFE for fast filtering of risky/rewarding symbols */
-    excursionIdx: index('idx_symbol_history_excursions').on(table.avgMae, table.avgMfe),
-
-    /** New: Index on updatedAt for efficient time-bound recent queries */
-    recentUpdatedIdx: index('idx_symbol_history_recent').on(table.updatedAt),
-}));
+        /** For periodic cleanup of stale rows */
+        recentUpdatedIdx: index('idx_symbol_history_updated_at').on(table.updatedAt),
+    })
+);
 
 /**
  * =============================================================================
@@ -440,6 +445,10 @@ export type SymbolHistory = typeof symbolHistory.$inferSelect;
 /** Data shape for inserting/updating symbol history */
 export type NewSymbolHistory = typeof symbolHistory.$inferInsert;
 
+export type OhlcvHistory = typeof ohlcvHistory.$inferSelect;
+export type NewOhlcvHistory = typeof ohlcvHistory.$inferInsert;
+
+/** Full simulated trade with all fields */
 export type SimulatedTrade = typeof simulatedTrades.$inferSelect;
 /** Data for starting a new simulation (excludes auto-generated fields) */
 export type NewSimulatedTrade = Omit<

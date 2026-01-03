@@ -77,7 +77,7 @@ export class MLService {
         logger.info('MLService initialized (5-tier labeling + excursion features enabled)');
     }
 
-        // =========================================================================
+    // =========================================================================
     // MODEL PERSISTENCE – Load saved Random Forest model from disk
     // =========================================================================
     /**
@@ -175,7 +175,7 @@ export class MLService {
         }
     }
 
-        // ===========================================================================
+    // ===========================================================================
     // FEATURE EXTRACTION – Build normalized prediction vector
     // ===========================================================================
     /**
@@ -204,65 +204,60 @@ export class MLService {
         const f: number[] = [];
 
         // === 1. Centralized technical indicators (primary + HTF) ===
-        // Ensures identical calculations between live prediction and training
         const indicators = computeIndicators(primaryData, htfData);
         const last = indicators.last;
 
-        // Push most predictive latest indicator values
-        // All normalized to reasonable ranges (0-1 or small numbers)
         f.push(
-            last.rsi / 100,                              // RSI: 0-100 → 0-1
-            last.emaShort ? (price - last.emaShort) / price : 0,  // Distance from fast EMA (%)
-            last.emaMid ? (price - last.emaMid) / price : 0,      // Distance from medium EMA
-            last.emaLong ? (price - last.emaLong) / price : 0,    // Distance from long-term EMA
-            last.macdLine,                               // Raw MACD line
-            last.macdSignal,                             // MACD signal line
-            last.macdHistogram,                          // MACD histogram
-            last.stochasticK / 100,                      // Stochastic %K: 0-100 → 0-1
-            last.stochasticD / 100,                      // Stochastic %D: 0-100 → 0-1
-            last.atr / price,                            // ATR as % of price (volatility)
-            last.htfAdx / 100,                           // HTF ADX: 0-100 → 0-1 (trend strength)
-            last.percentB,                               // Bollinger %B (position in band)
-            last.bbBandwidth / 100,                      // BB bandwidth % normalized
-            last.momentum / price,                       // Momentum relative to price
-            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // Engulfing pattern
+            last.rsi / 100,
+            last.emaShort ? (price - last.emaShort) / price : 0,
+            last.emaMid ? (price - last.emaMid) / price : 0,
+            last.emaLong ? (price - last.emaLong) / price : 0,
+            last.macdLine,
+            last.macdSignal,
+            last.macdHistogram,
+            last.stochasticK / 100,
+            last.stochasticD / 100,
+            last.atr / price,
+            last.htfAdx / 100,
+            last.percentB,
+            last.bbBandwidth / 100,
+            last.momentum / price,
+            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0
         );
 
-        // === 2. Excursion features – historical reward/risk behavior ===
-        // Adds symbol-specific context: does this pair usually run or reverse?
-        const excursions = await dbService.getSymbolExcursions(symbol);
+        // === 2. REAL-TIME Excursion features (live + recent closed) ===
+        const regime = await dbService.getCurrentRegime(symbol);
 
-        if (excursions && excursions.avgMae > 0) {
-            const avgMfePct = excursions.avgMfe;
-            const avgMaePct = excursions.avgMae;
-            const ratio = excursions.ratio;
+        if (regime.sampleCount > 0) {
+            const mfePct = regime.mfe;
+            const maePct = regime.mae; // negative
+            const ratio = regime.excursionRatio;
 
-            // Scale to typical ranges for better learning
+            // Normalize to reasonable ranges
             f.push(
-                avgMfePct / 10,      // Typical MFE: 0-10% → 0-1 range
-                avgMaePct / 10,      // Typical MAE: 0-10%
-                ratio / 5            // Typical ratios: 0-5 → 0-1
+                mfePct / 10,           // e.g., 5% → 0.5
+                Math.abs(maePct) / 10, // MAE magnitude
+                ratio / 5              // e.g., ratio 3 → 0.6
             );
 
-            logger.debug('Added excursion features', {
+            logger.debug('Added real-time excursion features', {
                 symbol,
-                avgMfe: avgMfePct.toFixed(2),
-                avgMae: avgMaePct.toFixed(2),
-                ratio: ratio.toFixed(2),
+                liveMfe: mfePct.toFixed(2),
+                liveMae: maePct.toFixed(2),
+                liveRatio: ratio.toFixed(2),
+                activeSims: regime.activeCount,
             });
         } else {
-            // No simulation history yet → use neutral values
-            // Ratio = 1 means balanced reward/risk
-            f.push(0, 0, 1);
+            // No data yet → neutral
+            f.push(0, 0, 1); // ratio = 1 = balanced
         }
 
         // === 3. Market regime features – volume and price scaling ===
-        // Helps model distinguish high-volume moves and asset price levels
         f.push(
-            last.obv / 1e9,                              // On-Balance Volume scaling
-            last.vwap / 1e6,                             // VWAP scaling
-            last.vwma / 1e6,                             // VWMA scaling
-            price / 1e5                                  // Current price scaling (handles BTC vs altcoins)
+            last.obv / 1e9,
+            last.vwap / 1e6,
+            last.vwma / 1e6,
+            price / 1e5
         );
 
         return f;
@@ -448,7 +443,7 @@ export class MLService {
         }
     }
 
-        // =========================================================================
+    // =========================================================================
     // TRAINING CONTROL: Manually pause ML training
     // =========================================================================
     /**
@@ -546,7 +541,7 @@ export class MLService {
         ].join('\n');
     }
 
-        // =========================================================================
+    // =========================================================================
     // REPORTING: Per-symbol training sample summary (Telegram friendly)
     // =========================================================================
     /**
