@@ -803,45 +803,48 @@ export class Strategy {
             let slMultiplier = 1.0;
             let confidenceBoost = 0;
 
+            // Determine intended direction before any excursion-based reversal
             const intendedDirection: 'long' | 'short' = buyScore > sellScore ? 'long' : 'short';
 
+            // Use new enhanced excursion logic (includes action: take/reverse/skip)
             if (regime.sampleCount > 0) {
-                // Use live regime for advice and adjustments
                 const adviceObj = getExcursionAdvice(regime as any, intendedDirection);
+
                 excursionAdvice = adviceObj.advice;
                 reasons.push(excursionAdvice);
 
+                // Apply adjustments from excursion analysis
                 tpMultiplier *= adviceObj.adjustments.tpMultiplier;
                 slMultiplier *= adviceObj.adjustments.slMultiplier;
                 confidenceBoost += adviceObj.adjustments.confidenceBoost;
 
-                // Live reversal penalty
-                if (regime.reverseCount >= 3) {
-                    reasons.push(`🔴 Strong live reversals (${regime.reverseCount}) – high caution`);
-                    confidenceBoost -= 0.25;
-                    tpMultiplier *= 0.6;
-                    slMultiplier *= 0.9;
-                } else if (regime.reverseCount >= 2) {
-                    reasons.push(`🟡 Live reversals (${regime.reverseCount}) – reducing targets`);
-                    confidenceBoost -= 0.15;
-                    tpMultiplier *= 0.75;
+                // === Critical: Handle explicit action from excursion logic ===
+                if (adviceObj.action === 'skip') {
+                    reasons.push('Skipping due to poor/mixed excursions');
+                    return {
+                        symbol,
+                        signal: 'hold',
+                        confidence: 0,
+                        reason: reasons,
+                        features: [],
+                    };
+                } else if (adviceObj.action === 'reverse') {
+                    // Flip the intended signal direction
+                    reasons.push('Reversing signal based on strong adverse excursions');
+
+                    // Reverse buy/sell scoring for confidence calculation later
+                    [buyScore, sellScore] = [sellScore, buyScore];
+
+                    // Reduce position size for reversal trades (higher uncertainty)
+                    // This will be applied later if signal !== 'hold'
+                    // We'll store it temporarily and apply in final return
                 }
 
-                // Low live MFE
-                if (regime.mfe < 1.8) {
-                    reasons.push(`Live low MFE (${regime.mfe.toFixed(2)}%) – shrinking TP`);
-                    tpMultiplier *= 0.7;
-                }
-
-                // High live MAE
-                if (Math.abs(regime.mae) > (config.strategy.maxMaePct ?? 3.0) * 0.8) {
-                    reasons.push(`Live high MAE (${regime.mae.toFixed(2)}%) – tightening SL`);
-                    slMultiplier *= 0.8;
-                }
-
-                // Critical safety: skip if excessive live drawdown
+                // === Remove old manual adjustments – now fully handled by getExcursionAdvice ===
+                // Previous live reversal, low MFE, high MAE, etc. logic is superseded
+                // Keep only the critical safety check
                 if (isHighMaeRisk(regime as any, intendedDirection)) {
-                    reasons.push(`🚫 Excessive live drawdown risk – skipping signal`);
+                    reasons.push('Excessive live drawdown risk – skipping signal');
                     return {
                         symbol,
                         signal: 'hold',
@@ -854,18 +857,20 @@ export class Strategy {
                 reasons.push(excursionAdvice);
             }
 
-            // === 6. Apply confidence boost ===
+            // === 6. Apply confidence boost (from excursion + ML) ===
             buyScore += confidenceBoost * 20;
             sellScore += confidenceBoost * 20;
 
-            // === 7. Final signal decision ===
-            const { signal, confidence } = this._determineSignal(
+            // === 7. Final signal decision (now respects potential reversal via swapped scores) ===
+            const { signal: finalSignal, confidence } = this._determineSignal(
                 buyScore,
                 sellScore,
                 trendAndVolume.trendBias,
                 this._isRiskEligible(price, indicators.last.atr),
                 reasons
             );
+
+            let signal = finalSignal;
 
             // === 8. Dynamic risk params ===
             const riskParams = this._computeRiskParams(
@@ -881,11 +886,13 @@ export class Strategy {
             // Apply live regime multipliers
             let stopLoss = riskParams.stopLoss;
             let takeProfit = riskParams.takeProfit;
+            let positionSizeMultiplier = riskParams.positionSizeMultiplier;
 
             if (signal !== 'hold') {
                 const baseSlDistance = Math.abs(price - (stopLoss ?? price));
                 const baseTpDistance = Math.abs((takeProfit ?? price) - price);
 
+                // Apply multipliers
                 stopLoss = signal === 'buy'
                     ? price - baseSlDistance * slMultiplier
                     : price + baseSlDistance * slMultiplier;
@@ -893,15 +900,37 @@ export class Strategy {
                 takeProfit = signal === 'buy'
                     ? price + baseTpDistance * tpMultiplier
                     : price - baseTpDistance * tpMultiplier;
+
+                // === Special handling for reversed signals ===
+                // If excursion logic triggered reverse, mirror SL/TP around price and reduce size
+                if (regime.sampleCount > 0) {
+                    const adviceObj = getExcursionAdvice(regime as any, intendedDirection);
+                    if (adviceObj.action === 'reverse') {
+                        // Mirror SL and TP around current price
+                        const mirroredStopLoss = signal === 'buy'
+                            ? price + (price - stopLoss)  // Flip distance above
+                            : price - (stopLoss - price); // Flip distance below
+
+                        const mirroredTakeProfit = signal === 'buy'
+                            ? price - (takeProfit - price)
+                            : price + (price - takeProfit);
+
+                        stopLoss = mirroredStopLoss;
+                        takeProfit = mirroredTakeProfit;
+
+                        // Reduce position size for reversal trades
+                        positionSizeMultiplier = (positionSizeMultiplier ?? 1.0) * 0.7;
+                    }
+                }
             }
 
-            // Summary reasons
+            // Summary reasons for TP/SL adjustments
             if (tpMultiplier < 0.95) reasons.push(`Take-profit reduced (x${tpMultiplier.toFixed(2)})`);
             if (tpMultiplier > 1.05) reasons.push(`Take-profit expanded (x${tpMultiplier.toFixed(2)})`);
             if (slMultiplier < 0.95) reasons.push(`Stop-loss tightened (x${slMultiplier.toFixed(2)})`);
             if (slMultiplier > 1.05) reasons.push(`Stop-loss loosened (x${slMultiplier.toFixed(2)})`);
 
-            // Update cooldown
+            // Update cooldown only on actual signals
             if (signal !== 'hold') {
                 this.lastSignalTimes.set(symbol, now);
             }
@@ -913,9 +942,10 @@ export class Strategy {
                 sellScore: sellScore.toFixed(1),
                 liveSamples: regime.sampleCount,
                 activeSims: regime.activeCount,
-                liveRatio: regime.excursionRatio.toFixed(2),
+                liveRatio: regime.excursionRatio?.toFixed(2) ?? 'N/A',
                 TPx: tpMultiplier.toFixed(2),
                 SLx: slMultiplier.toFixed(2),
+                excursionAction: regime.sampleCount > 0 ? getExcursionAdvice(regime as any, intendedDirection).action : 'none',
             });
 
             return {
@@ -926,7 +956,7 @@ export class Strategy {
                 stopLoss: signal !== 'hold' ? Number(stopLoss?.toFixed(8)) : undefined,
                 takeProfit: signal !== 'hold' ? Number(takeProfit?.toFixed(8)) : undefined,
                 trailingStopDistance: signal !== 'hold' ? riskParams.trailingStopDistance : undefined,
-                positionSizeMultiplier: signal !== 'hold' ? riskParams.positionSizeMultiplier : undefined,
+                positionSizeMultiplier: signal !== 'hold' ? positionSizeMultiplier : undefined,
                 mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
                 features,
             };

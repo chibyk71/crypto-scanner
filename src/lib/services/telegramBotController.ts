@@ -1910,7 +1910,7 @@ export class TelegramBotController {
         const regime = await dbService.getCurrentRegime(symbol);
 
         if (regime.sampleCount > 0) {
-            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
+            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
             lines.push('');
             lines.push(`**Current Regime \\(last \\~3h \\+ live\\)${liveNote}** 📊`);
             lines.push(escape(`• Samples: ${regime.sampleCount} | Reversals: ${regime.reverseCount}`));

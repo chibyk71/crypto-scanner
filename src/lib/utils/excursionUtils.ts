@@ -31,6 +31,11 @@ export function normalizeExcursion(value: number, entryPrice: number): number {
 }
 
 /**
+ * Possible actions returned by excursion analysis
+ */
+export type ExcursionAction = 'take' | 'reverse' | 'skip';
+
+/**
  * Analyze recent MFE & MAE and return actionable advice + adjustments
  *
  * Uses only recent data (~3h + live):
@@ -41,6 +46,10 @@ export function normalizeExcursion(value: number, entryPrice: number): number {
  *   • SL distance (e.g., 0.9 = tighten stop by 10%)
  *   • TP levels (e.g., 1.2 = widen take-profit by 20%)
  *   • Confidence score (e.g., +0.1 = +10% boost)
+ *
+ * New behavior:
+ *   • Returns an explicit action: 'take' (original direction), 'reverse' (flip buy/sell), or 'skip'
+ *   • Decision based on MFE, MAE, ratio, gap, reversals, and sample count
  */
 export interface ExcursionAdvice {
     advice: string; // Human-readable summary with emoji
@@ -49,6 +58,7 @@ export interface ExcursionAdvice {
         tpMultiplier: number;     // Apply to all take-profit levels
         confidenceBoost: number;  // Add to final confidence (0.0 to 1.0)
     };
+    action: ExcursionAction;      // Core decision: take, reverse, or skip
 }
 
 export function getExcursionAdvice(
@@ -62,89 +72,112 @@ export function getExcursionAdvice(
         tpMultiplier: 1.0,
         confidenceBoost: 0,
     };
+    let action: ExcursionAction = 'skip';
 
-    const minRecentSamples = 1;
-    const minExcursionRatio = config.strategy.minExcursionRatio ?? 1.8;
     const maxMaePct = config.strategy.maxMaePct ?? 3.0;
-    const excursionConfidenceBoost = config.strategy.excursionConfidenceBoost ?? 0.1;
 
-    let selectedMfe = 0;
-    let selectedMae = 0;
-    let source = 'none';
+    // === Tunable thresholds (hardcoded for now – can be moved to config later) ===
+    const minSamples = 2;
+    const minMfe = 0.30;           // Minimum MFE % to consider "strong reward"
+    const maxMae = 0.30;           // Maximum |MAE| % for reversal trigger
+    const minRatio = 1.5;          // Minimum MFE/|MAE| ratio for clean reward phase
+    const minGap = 0.25;           // Minimum (MFE - |MAE|) % buffer to avoid whipsaw
+    const maxReversals = 1;        // Max reversals allowed for "take"
+    const minReversalsForReverse = 2; // Minimum reversals needed to trigger reversal
 
-    // === 1. Prioritize RECENT overall data ===
-    if (history.recentSampleCount >= minRecentSamples && history.recentMfe > 0) {
-        selectedMfe = history.recentMfe;
-        selectedMae = history.recentMae;
-        source = 'recent';
+    // === Select metrics: prioritize overall recent, then directional ===
+    let selectedMfe = history.recentMfe;
+    let selectedMae = history.recentMae;
+    let selectedSamples = history.recentSampleCount;
+    let selectedReversals = history.recentReverseCount;
+    let source = 'recent';
 
-        // High recent drawdown risk (MAE is negative)
-        if (Math.abs(selectedMae) > maxMaePct) {
-            advice = '🔴 High recent drawdown risk';
-            adjustments = {
-                slMultiplier: 0.8,
-                tpMultiplier: 0.9,
-                confidenceBoost: -0.15,
-            };
-            return { advice, adjustments };
-        }
-    }
-    // === 2. Fall back to RECENT directional data ===
-    else if (direction === 'long' && history.recentSampleCountLong > 0) {
+    if (direction === 'long' && history.recentSampleCountLong > 0) {
         selectedMfe = history.recentMfeLong;
         selectedMae = history.recentMaeLong;
+        selectedSamples = history.recentSampleCountLong;
+        selectedReversals = history.recentReverseCountLong ?? history.recentReverseCount;
         source = 'recent-long';
     } else if (direction === 'short' && history.recentSampleCountShort > 0) {
         selectedMfe = history.recentMfeShort;
         selectedMae = history.recentMaeShort;
+        selectedSamples = history.recentSampleCountShort;
+        selectedReversals = history.recentReverseCountShort ?? history.recentReverseCount;
         source = 'recent-short';
     }
 
-    // If no recent data at all
+    // === Early high drawdown guard (unchanged from original logic) ===
+    if (Math.abs(selectedMae) > maxMaePct) {
+        advice = '🔴 High recent drawdown risk';
+        adjustments = {
+            slMultiplier: 0.8,
+            tpMultiplier: 0.9,
+            confidenceBoost: -0.15,
+        };
+        action = 'skip';
+        return { advice, adjustments, action };
+    }
+
+    // === No recent data at all ===
     if (selectedMfe === 0 && selectedMae === 0) {
         advice = 'ℹ️ No recent excursion data';
-        return { advice, adjustments };
+        action = 'take'; // Fallback: allow original signal but no boost
+        adjustments.confidenceBoost -= 0.05;
+        return { advice, adjustments, action };
     }
 
+    // === Compute derived metrics ===
+    const absMae = Math.abs(selectedMae);
     const ratio = computeExcursionRatio(selectedMfe, selectedMae);
+    const gap = selectedMfe - absMae; // Positive = clean upside buffer
 
-    // === Strong reward profile ===
-    if (ratio >= minExcursionRatio) {
-        advice = `🟢 Strong reward potential (${source})`;
-        adjustments = {
-            slMultiplier: 1.15,
-            tpMultiplier: 1.25,
-            confidenceBoost: excursionConfidenceBoost,
-        };
-    }
-    // === Poor reward profile ===
-    else if (ratio < 1.0 || Math.abs(selectedMae) > maxMaePct * 0.9) {
-        advice = `🔴 Poor reward-to-risk (${source})`;
-        adjustments = {
-            slMultiplier: 0.85,
-            tpMultiplier: 0.9,
-            confidenceBoost: -0.1,
-        };
-    }
-    // === Moderate ===
-    else {
-        advice = `🟡 Moderate excursions (${source})`;
-        adjustments = {
-            slMultiplier: 1.0,
-            tpMultiplier: 1.1,
-            confidenceBoost: 0.05,
-        };
+    // === Decision tree ===
+    if (selectedSamples < minSamples) {
+        // Not enough data → be cautious but don't block entirely
+        advice = `ℹ️ Insufficient recent samples (${selectedSamples}) – neutral`;
+        action = 'take';
+        adjustments.confidenceBoost -= 0.1;
+    } else if (
+        selectedMfe >= minMfe &&
+        ratio >= minRatio &&
+        gap >= minGap &&
+        selectedReversals <= maxReversals
+    ) {
+        // Strong, clean reward phase → take original direction with boost
+        advice = `🟢 Strong reward phase (${source}) | Samples: ${selectedSamples} | Ratio: ${ratio.toFixed(2)} | Gap: ${gap.toFixed(2)}%`;
+        action = 'take';
+        adjustments.tpMultiplier *= 1.2;
+        adjustments.slMultiplier *= 1.1;   // Loosen SL slightly – low risk
+        adjustments.confidenceBoost += 0.15;
+    } else if (
+        absMae >= maxMae &&
+        ratio <= 0.8 &&
+        gap <= -0.2 &&
+        selectedReversals >= minReversalsForReverse
+    ) {
+        // Strong adverse excursions + reversals → reverse the signal
+        advice = `🔴 Strong reversal potential (${source}) | Samples: ${selectedSamples} | High MAE: -${absMae.toFixed(2)}% | Reversals: ${selectedReversals}`;
+        action = 'reverse';
+        adjustments.tpMultiplier *= 1.1;
+        adjustments.slMultiplier *= 0.9;   // Tighten SL – reversal is riskier
+        adjustments.confidenceBoost += 0.1;
+    } else {
+        // Everything else: mixed, weak, or unclear regime
+        advice = `🟡 Poor/mixed excursions (${source}) | Samples: ${selectedSamples} | Ratio: ${ratio.toFixed(2)} | Gap: ${gap.toFixed(2)}% – skipping`;
+        action = 'skip';
     }
 
-    // Add context
-    if (history.recentSampleCount > 0) {
-        advice += ` | Samples: ${history.recentSampleCount}`;
-        if (history.recentReverseCount > 0) {
-            advice += ` | Reversals: ${history.recentReverseCount}`;
+    // === Add context to advice string (preserve original behavior) ===
+    if (history.recentSampleCount > 0 && action !== 'skip') {
+        if (!advice.includes('Samples:')) {
+            advice += ` | Samples: ${selectedSamples}`;
+        }
+        if (selectedReversals > 0 && !advice.includes('Reversals:')) {
+            advice += ` | Reversals: ${selectedReversals}`;
         }
     }
 
-    return { advice, adjustments };
+    return { advice, adjustments, action };
 }
 
 /**
@@ -157,7 +190,7 @@ export function isHighMaeRisk(
     const maxMaePct = config.strategy.maxMaePct ?? 3.0;
 
     // Prioritize recent overall
-    if (history.recentSampleCount >= 3 && Math.abs(history.recentMae) > maxMaePct) {
+    if (history.recentSampleCount >= 2 && Math.abs(history.recentMae) > maxMaePct) {
         return true;
     }
 

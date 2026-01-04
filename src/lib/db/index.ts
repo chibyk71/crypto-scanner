@@ -1608,7 +1608,7 @@ class DatabaseService {
         const mae = allMae.reduce((a, b) => a + b, 0) / totalCount;
         const avgR = allR.reduce((a, b) => a + b, 0) / totalCount;
         const winRate = allLabels.filter(l => l >= 1).length / totalCount;
-        const excursionRatio = mae >= -1e-6 ? mfe / Math.abs(mae) : 999999;
+        const excursionRatio = mfe / Math.max(Math.abs(mae), 0.01);
 
         // Directional (including live)
         const longAll = allDirections.filter((_, i) => allDirections[i] === 'buy');
