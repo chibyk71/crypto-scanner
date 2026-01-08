@@ -51,42 +51,42 @@ export interface OhlcvData {
 export interface Condition {
     /** Base indicator name – must match keys in AlertEvaluator series map */
     indicator:
-        | 'close'
-        | 'high'
-        | 'low'
-        | 'open'
-        | 'volume'
-        | 'rsi'
-        | 'ema'
-        | 'sma'
-        | 'macd_line'
-        | 'macd_signal'
-        | 'macd_histogram'
-        | 'bb_upper'
-        | 'bb_middle'
-        | 'bb_lower'
-        | 'atr'
-        | 'obv'
-        | 'vwma'
-        | 'vwap'
-        | 'momentum'
-        | 'adx'
-        | 'engulfing';
+    | 'close'
+    | 'high'
+    | 'low'
+    | 'open'
+    | 'volume'
+    | 'rsi'
+    | 'ema'
+    | 'sma'
+    | 'macd_line'
+    | 'macd_signal'
+    | 'macd_histogram'
+    | 'bb_upper'
+    | 'bb_middle'
+    | 'bb_lower'
+    | 'atr'
+    | 'obv'
+    | 'vwma'
+    | 'vwap'
+    | 'momentum'
+    | 'adx'
+    | 'engulfing';
 
     /** Optional period – becomes part of the key (e.g., 'rsi_14', 'ema_50') */
     period?: number;
 
     /** Comparison operator – determines how target is evaluated */
     operator:
-        | 'crosses_above'
-        | 'crosses_below'
-        | '>'
-        | '<'
-        | '>='
-        | '<='
-        | 'is_equal'
-        | 'is_not_equal'
-        | 'is_in_range';
+    | 'crosses_above'
+    | 'crosses_below'
+    | '>'
+    | '<'
+    | '>='
+    | '<='
+    | 'is_equal'
+    | 'is_not_equal'
+    | 'is_in_range';
 
     /**
      * Target value to compare against:
@@ -175,6 +175,17 @@ export interface TradeSignal {
 
     /** Max Adverse Excursion – worst unrealized drawdown */
     mae?: number;
+
+    /**
+     * NEW CHANGE: Pre-excursion potential signal direction
+     *   - Set in strategy.generateSignal based on raw scores/ML before applying excursion checks.
+     *   - Used by scanner.processSymbol to trigger simulations even if the final signal is 'hold'
+     *     due to excursion criteria not being met (e.g., low samples, poor ratio/gap).
+     *   - Allows continuous simulation and history population for better future excursion decisions.
+     *   - Value: 'buy'|'sell'|'hold' – mirrors the would-be signal without excursion filtering.
+     *   - If 'hold', no simulation is triggered (no potential detected).
+     */
+    potentialSignal: 'buy' | 'sell' | 'hold';
 }
 
 /**

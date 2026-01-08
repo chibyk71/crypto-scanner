@@ -21,7 +21,7 @@ import { dbService } from '../db';
 import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
-import { activeSimulationsCache } from './activeSimulationsCache';
+import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('simulateTrade');
 
@@ -120,7 +120,7 @@ export async function simulateTrade(
     }
 
     const isLong = signal.signal === 'buy';
-    const direction: 'long' | 'short' = isLong ? 'long' : 'short';
+    const direction: 'buy' | 'sell' = signal.signal === 'buy' ? 'buy' : 'sell';
     const hasTrailing = !!signal.trailingStopDistance;
 
     // Current stop-loss (updated dynamically if trailing)
@@ -175,14 +175,12 @@ export async function simulateTrade(
     });
 
     // === ADD THIS: Register in in-memory cache ===
-    activeSimulationsCache.set(signalId, {
-        symbol,
+    excursionCache.updateOrAdd(symbol, signalId, {
         direction,
-        currentMfePct: 0,
-        currentMaePct: 0,
-        startedAt: startTime,
-        lastUpdated: startTime,
-    });
+        mfe: 0,
+        mae: 0,
+        timestamp: startTime,
+    }, true);
 
     // =========================================================================
     // 3. Main Simulation Loop – runs until exit or timeout
@@ -278,9 +276,9 @@ export async function simulateTrade(
                 }
 
                 if (partialClosed && remainingPosition <= 0.01) {
-                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'partial_tp',
+                        startTime,
                         totalPnL,
                         signalId,
                         symbol,
@@ -301,9 +299,9 @@ export async function simulateTrade(
 
                     totalPnL += pnlFull * remainingPosition;
                     remainingPosition = 0;
-                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'tp',
+                        startTime,
                         totalPnL,
                         signalId,
                         symbol,
@@ -325,9 +323,9 @@ export async function simulateTrade(
 
                     totalPnL += pnlSL * remainingPosition;
                     remainingPosition = 0;
-                    activeSimulationsCache.delete(signalId);
                     return await finalizeSimulation(
                         'sl',
+                        startTime,
                         totalPnL,
                         signalId,
                         symbol,
@@ -379,9 +377,9 @@ export async function simulateTrade(
     }
 
     totalPnL += timeoutPnl * remainingPosition;
-    activeSimulationsCache.delete(signalId);
     return await finalizeSimulation(
         'timeout',
+        startTime,
         totalPnL,
         signalId,
         symbol,
@@ -417,14 +415,10 @@ export async function simulateTrade(
         const boundedMae = Math.max(-1000, Math.min(0, currentMaePct));
 
         // Update the in-memory cache
-        activeSimulationsCache.set(signalId, {
-            symbol,
-            direction,
-            currentMfePct: boundedMfe,
-            currentMaePct: boundedMae,
-            startedAt: startTime,
-            lastUpdated: Date.now(),
-        });
+        excursionCache.updateOrAdd(symbol, signalId, {
+            mfe: boundedMfe,
+            mae: boundedMae,
+        }, true);
 
         logger.debug(`[SIM] Interim excursion cached`, {
             signalId,
@@ -467,6 +461,7 @@ export async function simulateTrade(
  */
 async function finalizeSimulation(
     outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
+    startTime: number,
     totalPnL: number,
     signalId: string,
     symbol: string,
@@ -533,6 +528,16 @@ async function finalizeSimulation(
         maxAdversePrice
     );
 
+    // === ADD THIS: Update cache with final values and complete ===
+    excursionCache.updateOrAdd(symbol, signalId, {
+        outcome,
+        rMultiple,
+        label,
+        durationMs: Date.now() - startTime,  // Assuming startTime from outer scope
+        mfe: boundedMfePct,
+        mae: boundedMaePct,
+    }, false);
+
     // =========================================================================
     // 7. Comprehensive logging
     // =========================================================================
@@ -542,6 +547,9 @@ async function finalizeSimulation(
         pnlPct: (totalPnL * 100).toFixed(2),
         rMultiple: rMultiple.toFixed(3),
         label,
+        startTime: new Date(startTime).toISOString(),
+        endTime: new Date().toISOString(),
+        durationMin: ((Date.now() - startTime) / 60000).toFixed(2),
         mfePct: boundedMfePct.toFixed(2),
         maePct: boundedMaePct.toFixed(2),
         reversal: isStrongReversal,

@@ -301,18 +301,18 @@ export class MarketScanner {
     // PER-SYMBOL PROCESSING: Core logic for one trading pair
     // =========================================================================
     /**
-     * Processes a single symbol from end to end:
-     *   • Fetch primary + HTF data
-     *   • Generate signal via Strategy
-     *   • If valid signal → handle alert/simulation/trading
-     *
-     * Called from:
-     *   • processWorker() – concurrent workers
-     *
-     * Error handling:
-     *   • Wrapped in try/catch → individual symbol failure doesn't crash entire scan
-     *   • Logs error and continues with other symbols
-     */
+ * Processes a single symbol from end to end:
+ *   • Fetch primary + HTF data
+ *   • Generate signal via Strategy
+ *   • If valid signal → handle alert/simulation/trading
+ *
+ * Called from:
+ *   • processWorker() – concurrent workers
+ *
+ * Error handling:
+ *   • Wrapped in try/catch → individual symbol failure doesn't crash entire scan
+ *   • Logs error and continues with other symbols
+ */
     private async processSymbol(symbol: string): Promise<void> {
         try {
             // Fetch fast timeframe data (e.g., 3m) – required for signals
@@ -341,6 +341,25 @@ export class MarketScanner {
                 riskRewardTarget: config.strategy.riskRewardTarget,
                 trailingStopPercent: config.strategy.trailingStopPercent,
             });
+
+            // ──────────────────────────────────────────────────────────────
+            // NEW CHANGE: Decoupling simulation from alerting/live trading
+            //   - After generating the signal from strategy, check for the new 'potentialSignal' field
+            //     (set in strategy.ts based on pre-excursion scores/ML, before excursion checks).
+            //   - If 'potentialSignal' is 'buy' or 'sell' (indicating a viable signal before excursion filtering),
+            //     always trigger a background simulation via simulateAndTrain. This ensures simulations run
+            //     even if the final signal is demoted to 'hold' due to excursion criteria not being met.
+            //   - Simulations are fire-and-forget and add to historyJson for future excursion analysis.
+            //   - This decouples data collection (for improving future excursions) from real-time alerting/trading.
+            //   - Only proceed to handleTradeSignal (which may alert/trade) if the *final* signal !== 'hold'.
+            // ──────────────────────────────────────────────────────────────
+            if (config.ml.trainingEnabled && signal.potentialSignal && signal.potentialSignal !== 'hold') {
+                // Temporarily override the signal's 'signal' field with potentialSignal for simulation purposes
+                // (simulate the pre-excursion intent, but use the rest of the signal object for details)
+                const simSignal = { ...signal, signal: signal.potentialSignal };
+                logger.debug(`Triggering simulation for potential signal: ${symbol} (${signal.potentialSignal})`);
+                void this.simulateAndTrain(symbol, simSignal, currentPrice, primaryData, htfData);
+            }
 
             // Only proceed if strategy returned a buy/sell (not hold)
             if (signal.signal !== 'hold') {
@@ -439,24 +458,44 @@ export class MarketScanner {
     // SIGNAL HANDLING: Full pipeline after valid signal
     // =========================================================================
     /**
-     * Handles everything after a buy/sell signal is generated:
-     *   • Deduplication (same signal/price/SL)
-     *   • R:R feasibility check
-     *   • Cooldown enforcement
-     *   • Telegram alert with excursion insight
-     *   • Background simulation + ML training
-     *   • Live trading via AutoTradeService
-     *
-     * @private – central coordination point
-     */
+ * Handles everything after a buy/sell signal is generated:
+ *   • Deduplication (same signal/price/SL)
+ *   • R:R feasibility check
+ *   • Cooldown enforcement
+ *   • Telegram alert with excursion insight (only for final approved signals)
+ *   • Background simulation + ML training (now decoupled – runs even if alert is skipped)
+ *   • Live trading via AutoTradeService (only for approved signals)
+ *
+ * IMPORTANT CHANGE (Decoupling simulation from alerting):
+ *   - Simulation now runs for **any potential signal** (pre-excursion or final), even if
+ *     excursion criteria are not met and we decide not to alert / trade live.
+ *   - This allows the history to be populated continuously so that future excursion
+ *     checks have more recent completed simulation data.
+ *   - Alerts and live execution remain gated behind cooldown, R:R check, and excursion approval.
+ *
+ * @param symbol - Trading pair
+ * @param signal - The final TradeSignal object (may have been demoted to 'hold' by excursion)
+ * @param price - Current market price
+ * @param primaryData - Primary timeframe OHLCV data
+ * @param htf - Higher timeframe OHLCV data
+ * @param isPotentialOnly - NEW: Flag indicating this is a pre-excursion / simulation-only signal
+ *                           (set by processSymbol when potentialSignal exists but final signal is 'hold')
+ * @private – central coordination point
+ */
     private async handleTradeSignal(
         symbol: string,
         signal: TradeSignal,
         price: number,
         primaryData: OhlcvData,
-        htf: OhlcvData
+        htf: OhlcvData,
+        isPotentialOnly: boolean = false   // ← NEW parameter – defaults to false (normal approved signal)
     ): Promise<void> {
-        // Deduplication – ignore exact repeat signals
+        const now = Date.now();
+
+        // ──────────────────────────────────────────────────────────────
+        // 1. Deduplication – still applies to both potential and final signals
+        //    Prevents simulating / alerting the exact same setup repeatedly
+        // ──────────────────────────────────────────────────────────────
         const last = this.lastSignal[symbol];
         if (
             last &&
@@ -464,45 +503,91 @@ export class MarketScanner {
             Math.abs(last.price - price) < 1e-6 &&
             Math.abs((last.signal.stopLoss ?? 0) - (signal.stopLoss ?? 0)) < 1e-6
         ) {
+            // Even if deduped, we log for visibility
+            if (isPotentialOnly) {
+                logger.debug(`Deduped potential simulation for ${symbol}`);
+            }
             return;
         }
 
-        // Optional R:R sanity check
+        // ──────────────────────────────────────────────────────────────
+        // 2. Optional R:R sanity check – only block alerting/live if poor R:R
+        //    For potential-only sims, we still simulate even if R:R is marginal
+        // ──────────────────────────────────────────────────────────────
+        let rrValid = true;
         if (this.opts.requireAtrFeasibility && signal.stopLoss && signal.takeProfit) {
             const risk = signal.signal === 'buy' ? price - signal.stopLoss : signal.stopLoss - price;
             const reward = signal.signal === 'buy' ? signal.takeProfit - price : price - signal.takeProfit;
-            if (risk <= 0 || reward / risk < config.strategy.riskRewardTarget - 0.1) {
-                logger.info(`Poor R:R → skipped`, { symbol, rr: reward / risk });
-                // return;
+            rrValid = risk > 0 && reward / risk >= config.strategy.riskRewardTarget - 0.1;
+
+            if (!rrValid) {
+                logger.info(`Poor R:R → ${isPotentialOnly ? 'simulation only' : 'skipped'}`, {
+                    symbol,
+                    rr: reward / risk,
+                    isPotential: isPotentialOnly
+                });
             }
         }
 
-        const now = Date.now();
+        // ──────────────────────────────────────────────────────────────
+        // 3. Cooldown enforcement – only applies to alerting & live trading
+        //    Simulations are not throttled by cooldown (we want continuous history)
+        // ──────────────────────────────────────────────────────────────
+        let shouldAlertOrTrade = !isPotentialOnly && rrValid;
 
-        // Cooldown enforcement (prevent spam)
-        if (this.opts.cooldownBackend === 'database') {
-            const { lastTradeAt } = await dbService.getCoolDown(symbol);
-            if ((now - lastTradeAt) < this.opts.cooldownMs) return;
-            await dbService.upsertCoolDown(symbol, now);
-        } else {
-            if (now - (this.lastAlertAt[symbol] ?? 0) < this.opts.cooldownMs) return;
-            this.lastAlertAt[symbol] = now;
+        if (shouldAlertOrTrade) {
+            if (this.opts.cooldownBackend === 'database') {
+                const { lastTradeAt } = await dbService.getCoolDown(symbol);
+                if ((now - lastTradeAt) < this.opts.cooldownMs) {
+                    shouldAlertOrTrade = false;
+                    logger.debug(`Cooldown active for ${symbol} – no alert/trade`);
+                } else {
+                    await dbService.upsertCoolDown(symbol, now);
+                }
+            } else {
+                if (now - (this.lastAlertAt[symbol] ?? 0) < this.opts.cooldownMs) {
+                    shouldAlertOrTrade = false;
+                    logger.debug(`Memory cooldown active for ${symbol} – no alert/trade`);
+                } else {
+                    this.lastAlertAt[symbol] = now;
+                }
+            }
         }
 
-        // Send Telegram alert with excursion context
-        await this.telegramService?.sendSignalAlert(symbol, signal, price);
-        logger.info(`Signal alert prepared for ${symbol}`, { msg: signal });
+        // ──────────────────────────────────────────────────────────────
+        // 4. Alerting – only for approved (non-potential, cooldown passed, rr valid) signals
+        // ──────────────────────────────────────────────────────────────
+        if (shouldAlertOrTrade && this.telegramService) {
+            await this.telegramService.sendSignalAlert(symbol, signal, price);
+            logger.info(`Signal alert sent for ${symbol}`, { signal: signal.signal });
+        } else if (isPotentialOnly) {
+            logger.debug(`Skipping alert for potential-only simulation: ${symbol}`);
+        }
 
-        // Remember signal for deduplication
+        // ──────────────────────────────────────────────────────────────
+        // 5. Remember signal for deduplication
+        //    We store even potential simulations so we don't repeat them too often
+        // ──────────────────────────────────────────────────────────────
         this.lastSignal[symbol] = { signal, price };
 
-        // Background simulation for ML training (fire-and-forget)
+        // ──────────────────────────────────────────────────────────────
+        // 6. Background simulation + ML training – ALWAYS run if ML is enabled
+        //    This is the key change: simulation happens regardless of:
+        //      - whether excursion approved the trade
+        //      - cooldown status
+        //      - R:R check
+        //    We want continuous data collection for excursion history
+        // ──────────────────────────────────────────────────────────────
         if (config.ml.trainingEnabled) {
+            logger.debug(`Starting simulation ${isPotentialOnly ? '(potential)' : '(approved)'} for ${symbol}`);
             void this.simulateAndTrain(symbol, signal, price, primaryData, htf);
         }
 
-        // Live trading – delegate to dedicated service (fire-and-forget)
-        if (config.autoTrade) {
+        // ──────────────────────────────────────────────────────────────
+        // 7. Live trading – only for fully approved signals (not potential-only)
+        // ──────────────────────────────────────────────────────────────
+        if (shouldAlertOrTrade && config.autoTrade) {
+            logger.info(`Executing live trade for ${symbol}`);
             void this.autoTradeService.execute(signal);
         }
     }

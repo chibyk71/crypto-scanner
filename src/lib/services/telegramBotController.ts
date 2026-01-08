@@ -2,7 +2,7 @@
 
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config/settings';
-import { dbService, type EnrichedSymbolHistory } from '../db';
+import { dbService } from '../db';
 import { createLogger } from '../logger';
 import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
@@ -1853,32 +1853,10 @@ export class TelegramBotController {
         }, 5 * 60 * 1000);
     }
 
-    // ===========================================================================
-    // SIGNAL ALERTS – Now with rich recent regime insights
-    // ===========================================================================
-    /**
-     * Sends a detailed, actionable signal alert to the authorized chat.
-     * Includes:
-     *   - Signal basics (symbol, price, confidence, SL/TP)
-     *   - Excursion advice (from getExcursionAdvice)
-     *   - Recent regime summary (last ~3h): samples, reversals, MFE/MAE
-     *   - Auto-reversal info if applicable
-     *   - All original reasons from Strategy
-     * Sends a detailed signal alert with full context.
-     *
-     * @param symbol - Trading pair
-     * @param signal - Original TradeSignal from Strategy
-     * @param price - Current market price
-     * @param excursionAdvice - Optional pre-computed excursion advice string
-     * @param history - Optional enriched history (fetched once if provided)
-     * @param reversalInfo - Optional: only used by AutoTradeService when reversing
-     */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
         price: number,
-        excursionAdvice?: string,
-        _history?: EnrichedSymbolHistory,  // Optional fallback (e.g., from cache)
         reversalInfo?: {
             wasReversed: boolean;
             originalSignal: 'buy' | 'sell';
@@ -1898,15 +1876,14 @@ export class TelegramBotController {
             signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
         ].filter(Boolean);
 
-        // === Auto-reversal header ===
+        // Auto-reversal header (from AutoTradeService or Strategy if reversed)
         if (reversalInfo?.wasReversed) {
             lines.unshift('');
             lines.unshift(`⚠️ **AUTO-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
             lines.unshift(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
-            lines.unshift(escape(`**New TP:** halfway to original SL (mean-reversion target)`));
         }
 
-        // === Real-time regime summary (closed + live active simulations) ===
+        // Real-time regime summary
         const regime = await dbService.getCurrentRegime(symbol);
 
         if (regime.sampleCount > 0) {
@@ -1934,25 +1911,11 @@ export class TelegramBotController {
             lines.push('**No recent regime data** — first signal for this symbol');
         }
 
-        // === Excursion insight fallback ===
-        let finalExcursionAdvice = excursionAdvice;
-        if (!finalExcursionAdvice && regime.sampleCount > 0) {
+        // Excursion Insight: Always compute fresh from current regime + final signal direction
+        let finalExcursionAdvice = '';
+        if (regime.sampleCount > 0) {
             const direction = signal.signal === 'buy' ? 'long' : 'short';
-            // Pass a minimal mock object with needed fields
-            finalExcursionAdvice = getExcursionAdvice(
-                {
-                    recentMfe: regime.mfe,
-                    recentMae: regime.mae,
-                    recentSampleCount: regime.sampleCount,
-                    recentReverseCount: regime.reverseCount,
-                    // Add directional if needed by your utils
-                    recentMfeLong: regime.mfeLong,
-                    recentMaeLong: regime.maeLong,
-                    recentMfeShort: regime.mfeShort,
-                    recentMaeShort: regime.maeShort,
-                } as any,
-                direction
-            ).advice;
+            finalExcursionAdvice = getExcursionAdvice(regime as any, direction).advice;
         }
 
         if (finalExcursionAdvice) {
@@ -1960,7 +1923,7 @@ export class TelegramBotController {
             lines.push(`**Excursion Insight:** ${escape(finalExcursionAdvice)}`);
         }
 
-        // === Reasons from Strategy ===
+        // Reasons from Strategy (includes excursion advice if added there)
         if (signal.reason.length > 0) {
             lines.push('');
             lines.push('**Reasons:**');

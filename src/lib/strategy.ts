@@ -25,7 +25,7 @@ import { MLService } from './services/mlService';
 import { config } from './config/settings';
 import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
 import { dbService } from './db';
-import { getExcursionAdvice, isHighMaeRisk } from './utils/excursionUtils';
+import { getExcursionAdvice } from './utils/excursionUtils';
 import { detectEngulfing } from './indicators';
 
 // Dedicated logger – all strategy-related messages tagged 'Strategy'
@@ -60,11 +60,25 @@ interface TrendAndVolume {
 /**
  * Result of technical scoring + ML integration
  */
+/**
+ * Result of technical scoring + ML integration
+ * Updated to include pre-excursion potential direction flag
+ */
 interface ScoresAndML {
     buyScore: number;                // Total points for long direction
     sellScore: number;               // Total points for short direction
     features: number[];              // Feature vector for ML (same as training)
     mlConfidence: number;            // ML probability of profitable outcome (0-1)
+
+    /**
+     * NEW FIELD: Pre-excursion potential direction
+     *   - Determined after all scoring (including ML bonus) but before any excursion-based adjustments/reversals.
+     *   - 'long' if buyScore clearly dominates, 'short' if sellScore dominates, null otherwise.
+     *   - Used in generateSignal() to set the 'potentialSignal' field ('buy'|'sell'|'hold') for triggering simulations
+     *     even when the final signal is demoted to 'hold' due to excursion criteria (low samples, poor ratio/gap, etc.).
+     *   - Helps ensure continuous simulation and history population for better future excursion decisions.
+     */
+    potentialDirection: 'long' | 'short' | null;
 }
 
 // ---------------------------------------------------------------
@@ -123,6 +137,8 @@ const MIN_DI_DIFF = 4;                       // ← Minimum difference between +
 
 const MIN_ADX = 18;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
+
+const MIN_GAP = 0.20;                        // ← Minimum gap between MFE and |MAE| for bullishness
 
 /**
  * Strategy – Core signal generation engine
@@ -495,7 +511,29 @@ export class Strategy {
             sellScore *= ML_CONFIDENCE_DISCOUNT;
         }
 
-        return { buyScore, sellScore, features, mlConfidence: mlWinConfidence };
+        // ──────────────────────────────────────────────────────────────
+        // NEW CHANGE: Identify pre-excursion potential direction
+        //   - Based on raw buyScore vs sellScore (after all technical + ML bonuses).
+        //   - 'long' if buyScore significantly > sellScore, 'short' if vice versa.
+        //   - Used in generateSignal to set 'potentialSignal' ('buy'|'sell') for simulation triggering.
+        //   - If scores are close or both low, return null (no potential) – translates to 'hold'.
+        //   - This helps flag viable signals before excursion may skip/reverse them.
+        // ──────────────────────────────────────────────────────────────
+        let potentialDirection: 'long' | 'short' | null = null;
+        const scoreMargin = SCORE_MARGIN_REQUIRED * 0.5;  // Relaxed margin for potential (pre-excursion)
+        if (buyScore >= CONFIDENCE_THRESHOLD && buyScore - sellScore >= scoreMargin) {
+            potentialDirection = 'long';
+        } else if (sellScore >= CONFIDENCE_THRESHOLD && sellScore - buyScore >= scoreMargin) {
+            potentialDirection = 'short';
+        }
+
+        if (potentialDirection) {
+            reasons.push(`Pre-excursion potential direction: ${potentialDirection} (buy=${buyScore.toFixed(1)}, sell=${sellScore.toFixed(1)})`);
+        } else {
+            reasons.push('No clear pre-excursion potential direction');
+        }
+
+        return { buyScore, sellScore, features, mlConfidence: mlWinConfidence, potentialDirection };
     }
 
     // =========================================================================
@@ -728,17 +766,6 @@ export class Strategy {
      *
      * Full Pipeline:
      *   1. Cooldown check per symbol
-         // =========================================================================
-    // PUBLIC API: Main signal generation entry point
-    // =========================================================================
-    /**
-     * Primary method – generates a complete TradeSignal for a symbol.
-     *
-     * Called from:
-     *   • MarketScanner.processSymbol() – for every symbol on each scan
-     *
-     * Full Pipeline:
-     *   1. Cooldown check per symbol
      *   2. Centralized indicator calculation
      *   3. Trend/volume analysis (liquidity + trend filter)
      *   4. Flat market check (Bollinger Bandwidth)
@@ -767,7 +794,7 @@ export class Strategy {
         const last = this.lastSignalTimes.get(symbol) ?? 0;
         if ((now - last) / (1000 * 60) < this.cooldownMinutes) {
             reasons.push(`Cooldown active (<${this.cooldownMinutes} min since last signal)`);
-            return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
+            return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [], potentialSignal: 'hold' };
         }
 
         try {
@@ -779,13 +806,13 @@ export class Strategy {
             const trendAndVolume = this._analyzeTrendAndVolume(primaryData, indicators, price);
             if (!trendAndVolume.isTrending) {
                 reasons.push('No trending market – holding');
-                return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
+                return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [], potentialSignal: 'hold' };
             }
 
             // === 3. Flat market filter ===
             if (indicators.last.bbBandwidth < MIN_BB_BANDWIDTH_PCT) {
                 reasons.push(`Flat market: BB Bandwidth ${indicators.last.bbBandwidth.toFixed(2)}%`);
-                return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
+                return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [], potentialSignal: 'hold' };
             }
 
             // === 4. Scoring + ML ===
@@ -795,73 +822,115 @@ export class Strategy {
             const features = scoringResult.features;
             const mlConfidence = scoringResult.mlConfidence;
 
+            // ──────────────────────────────────────────────────────────────
+            // NEW CHANGE: Determine pre-excursion 'potentialSignal'
+            //   - After raw scoring + ML (before any excursion adjustments), evaluate if there's a viable
+            //     potential signal based on scores meeting thresholds and margin.
+            //   - This uses the same logic as _determineSignal but without excursion boosts or reversals.
+            //   - potentialSignal is always returned in the TradeSignal object for the scanner to use
+            //     in triggering simulations (even if final signal is 'hold' due to excursion skip/reverse failure).
+            //   - If no potential (scores too low), set 'hold' – no simulation needed.
+            //   - This enables simulations to run on "would-be" signals before excursion filtering,
+            //     populating history for better future excursion decisions.
+            // ──────────────────────────────────────────────────────────────
+            let potentialSignal: 'buy' | 'sell' | 'hold' = 'hold';
+            const preExcursion = this._determineSignal(
+                buyScore,
+                sellScore,
+                trendAndVolume.trendBias,
+                this._isRiskEligible(price, indicators.last.atr),
+                []  // No extra reasons for potential
+            );
+            if (preExcursion.signal !== 'hold') {
+                potentialSignal = preExcursion.signal;
+                reasons.push(`Pre-excursion potential signal detected: ${potentialSignal} (raw scores: buy=${buyScore.toFixed(1)}, sell=${sellScore.toFixed(1)})`);
+            } else {
+                reasons.push('No pre-excursion potential signal – scores below thresholds');
+            }
+
             // === 5. Real-time regime (live + recent closed) ===
             const regime = await dbService.getCurrentRegime(symbol);
 
-            let excursionAdvice = 'ℹ️ No excursion data yet';
             let tpMultiplier = 1.0;
             let slMultiplier = 1.0;
             let confidenceBoost = 0;
+            let excursionAdvice = 'ℹ️ No excursion data yet';
+            let isReversed = false;
 
-            // Determine intended direction before any excursion-based reversal
             const intendedDirection: 'long' | 'short' = buyScore > sellScore ? 'long' : 'short';
 
-            // Use new enhanced excursion logic (includes action: take/reverse/skip)
+            // Single call to centralized excursion logic
             if (regime.sampleCount > 0) {
                 const adviceObj = getExcursionAdvice(regime as any, intendedDirection);
 
                 excursionAdvice = adviceObj.advice;
                 reasons.push(excursionAdvice);
 
-                // Apply adjustments from excursion analysis
                 tpMultiplier *= adviceObj.adjustments.tpMultiplier;
                 slMultiplier *= adviceObj.adjustments.slMultiplier;
                 confidenceBoost += adviceObj.adjustments.confidenceBoost;
 
-                // === Critical: Handle explicit action from excursion logic ===
                 if (adviceObj.action === 'skip') {
-                    reasons.push('Skipping due to poor/mixed excursions');
-                    return {
-                        symbol,
-                        signal: 'hold',
-                        confidence: 0,
-                        reason: reasons,
-                        features: [],
-                    };
-                } else if (adviceObj.action === 'reverse') {
-                    // Flip the intended signal direction
-                    reasons.push('Reversing signal based on strong adverse excursions');
-
-                    // Reverse buy/sell scoring for confidence calculation later
-                    [buyScore, sellScore] = [sellScore, buyScore];
-
-                    // Reduce position size for reversal trades (higher uncertainty)
-                    // This will be applied later if signal !== 'hold'
-                    // We'll store it temporarily and apply in final return
+                    reasons.push('Signal skipped due to excursion analysis');
+                    // Final signal demoted to 'hold' (no alert/trade), but potentialSignal preserved for simulation
+                    return { symbol, signal: 'hold', confidence: 0, reason: reasons, features, potentialSignal };
                 }
 
-                // === Remove old manual adjustments – now fully handled by getExcursionAdvice ===
-                // Previous live reversal, low MFE, high MAE, etc. logic is superseded
-                // Keep only the critical safety check
-                if (isHighMaeRisk(regime as any, intendedDirection)) {
-                    reasons.push('Excessive live drawdown risk – skipping signal');
-                    return {
-                        symbol,
-                        signal: 'hold',
-                        confidence: 0,
-                        reason: reasons,
-                        features: [],
-                    };
+                if (adviceObj.action === 'reverse') {
+                    isReversed = true;
+                    reasons.push('Signal reversed due to excursion analysis');
+
+                    // ──────────────────────────────────────────────────────────────
+                    // NEW CHANGE: Enhanced reversal adjustment and re-validation
+                    //   - For reversals, halve the original score and double the reversed score
+                    //     to aggressively favor the flip (as per suggestion: find best way for results).
+                    //   - Identify original/reversed based on pre-swap dominance.
+                    //   - After adjustment, re-validate: new reversed score must meet threshold
+                    //     and excursion gap >= minGap (using regime's MFE - |MAE|).
+                    //   - If re-validation fails, demote final signal to 'hold' but simulate the
+                    //     attempted reversed (update potentialSignal to reversed for sim).
+                    //   - This ensures we only alert on strong reversals but always simulate to build history.
+                    // ──────────────────────────────────────────────────────────────
+                    const originalWasBuy = buyScore > sellScore;
+                    if (originalWasBuy) {
+                        buyScore /= 2;  // Halve original
+                        sellScore *= 2; // Double reversed
+                    } else {
+                        sellScore /= 2; // Halve original
+                        buyScore *= 2; // Double reversed
+                    }
+                    reasons.push(`Reversal scores adjusted: original halved, reversed doubled (buy=${buyScore.toFixed(1)}, sell=${sellScore.toFixed(1)})`);
+
+                    // Re-validate post-adjustment
+                    const gap = regime.mfe - Math.abs(regime.mae);  // From regime (excursion metrics)
+                    const postAdjust = this._determineSignal(
+                        buyScore,
+                        sellScore,
+                        trendAndVolume.trendBias,
+                        this._isRiskEligible(price, indicators.last.atr),
+                        reasons
+                    );
+                    if (postAdjust.signal === 'hold' || gap < MIN_GAP) {
+                        reasons.push(`Post-reversal validation failed (score/gap too low) – demoting to hold`);
+                        // Simulate the attempted reversed anyway
+                        potentialSignal = originalWasBuy ? 'sell' : 'buy';
+                        return { symbol, signal: 'hold', confidence: 0, reason: reasons, features, potentialSignal };
+                    } else {
+                        // Successful reversal – update potential to reflect reversed for sim consistency
+                        potentialSignal = postAdjust.signal;
+                    }
                 }
             } else {
                 reasons.push(excursionAdvice);
+                // On no data: cautious allow (bootstrap new symbols)
+                confidenceBoost -= 0.05;
             }
 
-            // === 6. Apply confidence boost (from excursion + ML) ===
+            // Apply excursion + ML boost (after potential reverse swap)
             buyScore += confidenceBoost * 20;
             sellScore += confidenceBoost * 20;
 
-            // === 7. Final signal decision (now respects potential reversal via swapped scores) ===
+            // === 6. Final signal decision (respects reverse via swapped scores) ===
             const { signal: finalSignal, confidence } = this._determineSignal(
                 buyScore,
                 sellScore,
@@ -872,7 +941,7 @@ export class Strategy {
 
             let signal = finalSignal;
 
-            // === 8. Dynamic risk params ===
+            // === 7. Dynamic risk params ===
             const riskParams = this._computeRiskParams(
                 signal,
                 price,
@@ -883,7 +952,6 @@ export class Strategy {
                 trendAndVolume.trendBias,
             );
 
-            // Apply live regime multipliers
             let stopLoss = riskParams.stopLoss;
             let takeProfit = riskParams.takeProfit;
             let positionSizeMultiplier = riskParams.positionSizeMultiplier;
@@ -892,7 +960,7 @@ export class Strategy {
                 const baseSlDistance = Math.abs(price - (stopLoss ?? price));
                 const baseTpDistance = Math.abs((takeProfit ?? price) - price);
 
-                // Apply multipliers
+                // Apply excursion multipliers
                 stopLoss = signal === 'buy'
                     ? price - baseSlDistance * slMultiplier
                     : price + baseSlDistance * slMultiplier;
@@ -901,26 +969,10 @@ export class Strategy {
                     ? price + baseTpDistance * tpMultiplier
                     : price - baseTpDistance * tpMultiplier;
 
-                // === Special handling for reversed signals ===
-                // If excursion logic triggered reverse, mirror SL/TP around price and reduce size
-                if (regime.sampleCount > 0) {
-                    const adviceObj = getExcursionAdvice(regime as any, intendedDirection);
-                    if (adviceObj.action === 'reverse') {
-                        // Mirror SL and TP around current price
-                        const mirroredStopLoss = signal === 'buy'
-                            ? price + (price - stopLoss)  // Flip distance above
-                            : price - (stopLoss - price); // Flip distance below
-
-                        const mirroredTakeProfit = signal === 'buy'
-                            ? price - (takeProfit - price)
-                            : price + (price - takeProfit);
-
-                        stopLoss = mirroredStopLoss;
-                        takeProfit = mirroredTakeProfit;
-
-                        // Reduce position size for reversal trades
-                        positionSizeMultiplier = (positionSizeMultiplier ?? 1.0) * 0.7;
-                    }
+                // Reversal-specific: reduce size (no manual SL/TP mirroring needed — direction flipped via score swap)
+                if (isReversed) {
+                    positionSizeMultiplier = (positionSizeMultiplier ?? 1.0) * 0.7;
+                    reasons.push('Position size reduced for reversal trade (x0.7)');
                 }
             }
 
@@ -935,17 +987,18 @@ export class Strategy {
                 this.lastSignalTimes.set(symbol, now);
             }
 
-            // Debug log
+            // Debug log (single advice call)
             logger.info(`Signal: ${signal.toUpperCase()} ${symbol} @ ${price.toFixed(8)}`, {
                 confidence: confidence.toFixed(2),
                 buyScore: buyScore.toFixed(1),
                 sellScore: sellScore.toFixed(1),
                 liveSamples: regime.sampleCount,
-                activeSims: regime.activeCount,
-                liveRatio: regime.excursionRatio?.toFixed(2) ?? 'N/A',
+                activeSims: regime.activeCount ?? 0,
+                excursionRatio: regime.excursionRatio?.toFixed(2) ?? 'N/A',
                 TPx: tpMultiplier.toFixed(2),
                 SLx: slMultiplier.toFixed(2),
                 excursionAction: regime.sampleCount > 0 ? getExcursionAdvice(regime as any, intendedDirection).action : 'none',
+                reversed: isReversed,
             });
 
             return {
@@ -959,11 +1012,12 @@ export class Strategy {
                 positionSizeMultiplier: signal !== 'hold' ? positionSizeMultiplier : undefined,
                 mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
                 features,
+                potentialSignal  // ← NEW: Always include for scanner simulation triggering
             };
         } catch (err) {
-            logger.error(`Signal generation failed for ${symbol}`, { error: err });
+            logger.error(`Signal generation failed for ${symbol}`, { error: (err as Error).stack });
             reasons.push(`Exception: ${(err as Error).message}`);
-            return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [] };
+            return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [], potentialSignal: 'hold' };
         }
     }
 }

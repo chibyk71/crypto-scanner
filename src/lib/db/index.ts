@@ -48,7 +48,7 @@ import {
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
-import { activeSimulationsCache } from '../services/activeSimulationsCache';
+import { excursionCache } from '../services/excursionHistoryCache';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -946,306 +946,69 @@ class DatabaseService {
     // SIMULATED TRADES: Close simulation and store final results
     // =========================================================================
     /**
-     * Finalizes a simulated trade and updates the recent-only symbolHistory table.
-     *
-     * New behavior (recent-only regime):
-     * - Adds the completed simulation to historyJson with current timestamp
-     * - Prunes historyJson to only entries from the last 3 hours
-     * - Recomputes ALL recent aggregates from the filtered recent simulations
-     * - Supports directional long/short stats
-     * - Detects strong reversals using rMultiple sign and increments counters
-     * - No lifetime data is stored or updated
-     * *
-     * @param signalId - UUID from startSimulatedTrade()
-     * @param outcome - Final outcome type
-     * @param pnl - Realized PnL (as decimal, e.g., 0.023 = +2.3%)
-     * @param rMultiple - Risk-multiple achieved
-     * @param label - Final 5-tier ML label (-2 to +2)
-     * @param maxFavorablePrice - Best price reached in favorable direction
-     * @param maxAdversePrice - Worst price reached against position
-     */
+ * Simplified closeSimulatedTrade – persists only raw closing data to simulated_trades
+ *
+ * All recent regime aggregates, historyJson, reversal counting, and directional stats
+ * are now handled exclusively in-memory by excursionCache.
+ *
+ * This method only:
+ *   • Updates the simulated_trades row with closing timestamp, outcome, PnL, etc.
+ *   • Stores bounded MFE (positive %) and MAE (negative %) with scaled precision
+ *   • Logs success/error
+ *
+ * No DB fetches, no recomputation, no symbolHistory updates.
+ *
+ * @param signalId - UUID from startSimulatedTrade()
+ * @param outcome - Final outcome type
+ * @param pnl - Realized PnL as decimal (e.g., 0.023 = +2.3%)
+ * @param rMultiple - Risk-multiple achieved
+ * @param label - 5-tier ML label (-2 to +2)
+ * @param mfePct - Bounded Max Favorable Excursion % (positive, pre-computed in finalizeSimulation)
+ * @param maePct - Bounded Max Adverse Excursion % (negative, pre-computed in finalizeSimulation)
+ */
     public async closeSimulatedTrade(
         signalId: string,
         outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
-        pnl: number,                  // PnL as decimal (e.g., 0.05 = +5%)
-        rMultiple: number,            // R-multiple of the trade (can be null if not applicable)
-        label: -2 | -1 | 0 | 1 | 2,   // ML label: -2 strong loser, -1 weak loser, 0 breakeven-ish, 1 weak winner, 2 strong winner
-        maxFavorablePrice: number,    // Best price reached in favor of the trade direction
-        maxAdversePrice: number       // Worst price reached against the trade direction
+        pnl: number,
+        rMultiple: number,
+        label: -2 | -1 | 0 | 1 | 2,
+        mfePct: number,     // Positive bounded %
+        maePct: number      // Negative bounded %
     ): Promise<void> {
-        // Current timestamp in milliseconds
         const now = Date.now();
 
-        // We only keep trade history from the last 3 hours for "recent" statistics
-        const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
-        const cutoffTime = now - THREE_HOURS_MS;
-
-        // ===================================================================
-        // 1. Fetch the original simulated trade details from the database
-        // ===================================================================
-        // We need entry price, side (buy/sell), symbol, and when it was opened
-        const [trade] = await this.db
-            .select({
-                entryPrice: simulatedTrades.entryPrice,
-                side: simulatedTrades.side,
-                symbol: simulatedTrades.symbol,
-                openedAt: simulatedTrades.openedAt,
-            })
-            .from(simulatedTrades)
-            .where(eq(simulatedTrades.signalId, signalId))
-            .execute();
-
-        // If no trade found with this signalId, log error and exit early
-        if (!trade) {
-            logger.error('Cannot close simulated trade – signalId not found', { signalId });
-            return;
-        }
-
-        // Determine trade direction
-        const isLong = trade.side === 'buy';
-
-        // Entry price is stored scaled by 1e8 for precision – unscale it here
-        const entryPrice = Number(trade.entryPrice);
-
-        // ===================================================================
-        // 2. Calculate final MFE and MAE as percentages
-        // ===================================================================
-        // MFE = Max Favorable Excursion (how much the trade went in our favor)
-        // MAE = Max Adverse Excursion (how much the trade went against us)
-        const mfePct = isLong
-            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100    // Long: higher price = favorable
-            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;   // Short: lower price = favorable
-
-        // Raw MAE percentage (always positive for now)
-        const maePctRaw = isLong
-            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100      // Long: lower price = adverse
-            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;     // Short: higher price = adverse
-
-        // By convention, MAE is stored as a negative number
-        const maePctNegative = -Math.abs(maePctRaw);
-
-        // ===================================================================
-        // 3. Update the simulatedTrades row with closing information
-        // ===================================================================
-        await this.db
-            .update(simulatedTrades)
-            .set({
-                closedAt: now,
-                outcome,                                          // tp, partial_tp, sl, timeout
-                pnl: Math.round(pnl * 1e8),                       // Store PnL scaled by 1e8
-                rMultiple: rMultiple === null ? null : Math.round(rMultiple * 1e4), // Scale R by 1e4 for precision
-                label,                                            // ML label
-                maxFavorableExcursion: Math.round(mfePct * 1e4),   // Store MFE scaled by 1e4
-                maxAdverseExcursion: Math.round(maePctNegative * 1e4), // Store negative MAE scaled
-            })
-            .where(eq(simulatedTrades.signalId, signalId))
-            .execute();
-
-        // Log a clear summary of the closed trade for monitoring / debugging
-        logger.info('SIMULATED TRADE CLOSED – ML LABEL READY', {
-            signalId,
-            symbol: trade.symbol,
-            side: isLong ? 'LONG' : 'SHORT',
-            outcome: outcome.toUpperCase(),
-            pnlPct: (pnl * 100).toFixed(2),
-            rMultiple: rMultiple?.toFixed(3),
-            label,
-            mfePct: mfePct.toFixed(2),
-            maePct: maePctNegative.toFixed(2),
-        });
-
-        // ===================================================================
-        // 4. Update the rolling "recent-only" history for this symbol
-        // ===================================================================
-        const symbol = trade.symbol;
-
-        // Detect if this trade was a "strong reversal"
-        // Strong reversal = labeled as meaningful move (|label| >= 1) but R-multiple went opposite to expected direction
-        const expectedPositiveR = isLong; // Long should have positive R, Short should have negative R
-        const actualPositiveR = rMultiple > 0;
-        const isStrongReversal = Math.abs(label) >= 1 && actualPositiveR !== expectedPositiveR;
-
-        // Create a new history entry for this just-closed trade
-        const newEntry: SimulationHistoryEntry = {
-            timestamp: now,
-            direction: trade.side,
-            outcome,
-            rMultiple,
-            label,
-            durationMs: now - trade.openedAt,         // How long the trade was open
-            mfe: mfePct,
-            mae: maePctNegative,
-        };
-
-        // ===================================================================
-        // 5. Load existing recent history for this symbol (if any)
-        // ===================================================================
-        const [existing] = await this.db
-            .select()
-            .from(symbolHistory)
-            .where(eq(symbolHistory.symbol, symbol))
-            .execute();
-
-        // Start with empty array; if we have existing history, filter to only last 3 hours
-        let recentEntries: SimulationHistoryEntry[] = [];
-
-        if (existing && Array.isArray(existing.historyJson)) {
-            recentEntries = existing.historyJson.filter(
-                (e: any) => typeof e.timestamp === 'number' && e.timestamp >= cutoffTime
-            );
-        }
-
-        // Add the freshly closed trade
-        recentEntries.push(newEntry);
-
-        // Sort newest first (most recent at index 0)
-        recentEntries.sort((a, b) => b.timestamp - a.timestamp);
-
-        // ===================================================================
-        // 6. Recalculate all aggregate statistics based on recent entries only
-        // ===================================================================
-        const sampleCount = recentEntries.length;
-        if (sampleCount === 0) return; // Safety check (should never happen)
-
-        // Overall recent averages
-        const recentAvgR = recentEntries.reduce((sum, e) => sum + e.rMultiple, 0) / sampleCount;
-        const recentWinRate = recentEntries.filter(e => e.label >= 1).length / sampleCount;
-
-        // Count of strong reversals in recent history
-        const recentReverseCount = recentEntries.filter(e => {
-            const expectedPositive = e.direction === 'buy';
-            const actualPositive = e.rMultiple > 0;
-            return Math.abs(e.label) >= 1 && actualPositive !== expectedPositive;
-        }).length;
-
-        // Average MFE / MAE across all recent trades
-        const recentMfe = recentEntries.reduce((sum, e) => sum + e.mfe, 0) / sampleCount;
-        const recentMae = recentEntries.reduce((sum, e) => sum + e.mae, 0) / sampleCount;
-        // Excursion ratio = how much favorable movement vs adverse (higher = better risk/reward behavior)
-        const recentExcursionRatio = recentMae >= -1e-6 ? recentMfe / Math.abs(recentMae) : 999999;
-
-        // ===================================================================
-        // 7. Directional (long vs short) statistics
-        // ===================================================================
-        const longEntries = recentEntries.filter(e => e.direction === 'buy');
-        const shortEntries = recentEntries.filter(e => e.direction === 'sell');
-
-        // Long-specific stats
-        const recentMfeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mfe, 0) / longEntries.length : 0;
-        const recentMaeLong = longEntries.length ? longEntries.reduce((s, e) => s + e.mae, 0) / longEntries.length : 0;
-        const recentWinRateLong = longEntries.length ? longEntries.filter(e => e.label >= 1).length / longEntries.length : 0;
-        const recentReverseCountLong = longEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple <= 0).length;
-        const recentSampleCountLong = longEntries.length;
-
-        // Short-specific stats
-        const recentMfeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mfe, 0) / shortEntries.length : 0;
-        const recentMaeShort = shortEntries.length ? shortEntries.reduce((s, e) => s + e.mae, 0) / shortEntries.length : 0;
-        const recentWinRateShort = shortEntries.length ? shortEntries.filter(e => e.label >= 1).length / shortEntries.length : 0;
-        const recentReverseCountShort = shortEntries.filter(e => Math.abs(e.label) >= 1 && e.rMultiple >= 0).length;
-        const recentSampleCountShort = shortEntries.length;
-
-        // ===================================================================
-        // 8. Upsert the updated recent statistics back into symbolHistory table
-        // ===================================================================
-        const updateData = {
-            historyJson: recentEntries,                     // Full array of recent entries (newest first)
-            recentAvgR,
-            recentWinRate,
-            // Add 1 if the current trade was a strong reversal
-            recentReverseCount: recentReverseCount + (isStrongReversal ? 1 : 0),
-            recentMae,
-            recentMfe,
-            recentExcursionRatio,
-            recentSampleCount: sampleCount,
-
-            // Long directional stats
-            recentMfeLong,
-            recentMaeLong,
-            recentWinRateLong,
-            recentReverseCountLong: recentReverseCountLong + (isLong && isStrongReversal ? 1 : 0),
-            recentSampleCountLong,
-
-            // Short directional stats
-            recentMfeShort,
-            recentMaeShort,
-            recentWinRateShort,
-            recentReverseCountShort: recentReverseCountShort + (!isLong && isStrongReversal ? 1 : 0),
-            recentSampleCountShort,
-
-            updatedAt: new Date(),
-        };
-
-        // If row already exists → UPDATE, otherwise → INSERT
-        if (existing) {
+        try {
             await this.db
-                .update(symbolHistory)
-                .set(updateData)
-                .where(eq(symbolHistory.symbol, symbol))
-                .execute();
-        } else {
-            await this.db
-                .insert(symbolHistory)
-                .values({
-                    symbol,
-                    ...updateData,
+                .update(simulatedTrades)
+                .set({
+                    closedAt: now,
+                    outcome,
+                    pnl: Math.round(pnl * 1e8),                       // Scaled for precision
+                    rMultiple: Math.round(rMultiple * 1e4),
+                    label,
+                    maxFavorableExcursion: Math.round(mfePct * 1e4),
+                    maxAdverseExcursion: Math.round(maePct * 1e4),
                 })
+                .where(eq(simulatedTrades.signalId, signalId))
                 .execute();
-        }
 
-        // Debug log showing key recent metrics after update
-        logger.debug('Updated recent-only symbolHistory', {
-            symbol,
-            recentSampleCount: sampleCount,
-            recentMfe: recentMfe.toFixed(2),
-            recentMae: recentMae.toFixed(2),
-            recentExcursionRatio: recentExcursionRatio.toFixed(2),
-            recentReverseCount: recentReverseCount + (isStrongReversal ? 1 : 0),
-        });
+            logger.debug('Closed simulated trade in DB (raw data only)', { signalId, outcome });
+        } catch (err) {
+            logger.error('Failed to close simulated trade in DB', {
+                signalId,
+                error: (err as Error).message,
+            });
+        }
     }
 
-    // =========================================================================
-    // SYMBOL EXCURSION STATS: Fast read of pre-computed averages
-    // =========================================================================
     /**
-     * Retrieves pre-computed average MFE, MAE, and ratio for a symbol.
+     * NEW: Batch insert OHLCV candles into historical table.
      *
-     * Used heavily by:
-     *   • Strategy – dynamic SL/TP and confidence adjustments
-     *   • AutoTradeService – risk filtering
-     *   • Telegram /excursions command
+     * Uses ON DUPLICATE KEY UPDATE to skip existing candles (idempotent).
+     * Fire-and-forget: logs errors but does not throw (safe for ExchangeService polling).
      *
-     * Why denormalized?
-     *   • Avoid expensive real-time AVG calculations on thousands of simulations
-     *   • Updated only when simulation closes (via updateSymbolHistoryExcursions)
-     *
-     * @param symbol - Trading pair
-     * @returns Object with avgMfe, avgMae, ratio or null if no data
+     * @param records Array of OHLCV records from CCXT fetchOHLCV
      */
-    // public async getSymbolExcursions(symbol: string): Promise<{ avgMfe: number; avgMae: number; ratio: number } | null> {
-    //     // Single-row lookup from denormalized table
-    //     const [result] = await this.db
-    //         .select({
-    //             avgMfe: symbolHistory.avgMfe,
-    //             avgMae: symbolHistory.avgMae,
-    //             ratio: symbolHistory.avgExcursionRatio,
-    //         })
-    //         .from(symbolHistory)
-    //         .where(eq(symbolHistory.symbol, symbol))
-    //         .limit(1)
-    //         .execute();
-
-    //     // Return null if symbol has no history yet
-    //     return result || null;
-    // }
-
-    /**
- * NEW: Batch insert OHLCV candles into historical table.
- *
- * Uses ON DUPLICATE KEY UPDATE to skip existing candles (idempotent).
- * Fire-and-forget: logs errors but does not throw (safe for ExchangeService polling).
- *
- * @param records Array of OHLCV records from CCXT fetchOHLCV
- */
     public async batchInsertOhlcv(
         records: {
             symbol: string;
@@ -1302,26 +1065,6 @@ class DatabaseService {
             });
             // Do NOT throw — this should never break live polling or simulation
         }
-    }
-
-    // =========================================================================
-    // SIMULATION QUERY HELPERS: Get currently running simulations
-    // =========================================================================
-    /**
-     * Returns all simulated trades that are still open (not yet closed).
-     *
-     * Used by:
-     *   • Monitoring tools or admin commands
-     *   • Potential cleanup of stuck simulations
-     *
-     * @returns Array of open SimulatedTrade objects
-     */
-    public async getOpenSimulatedTrades(): Promise<SimulatedTrade[]> {
-        return await this.db
-            .select()
-            .from(simulatedTrades)
-            .where(isNull(simulatedTrades.closedAt))  // closedAt is null → still running
-            .execute();
     }
 
     // =========================================================================
@@ -1432,69 +1175,14 @@ class DatabaseService {
     }
 
     // ===========================================================================
-    // Increment recent reverse count (only for closed simulations)
-    // ===========================================================================
-    /**
-     * Increments the recent reverse counters when a strong reversal is detected.
-     * Called only from closeSimulatedTrade() after a simulation finishes.
-     *
-     * +1 on strong reversal (wrong direction profit/loss)
-     * Safe UPSERT pattern — works even if symbol row doesn't exist yet
-     *
-     * @param symbol
-     * @param direction 'long' or 'short'
-     * @param delta +1 for reversal (default), could support -1 for decay later
-     */
-    public async incrementRecentReverseCount(
-        symbol: string,
-        direction: 'long' | 'short',
-        delta: 1 | -1 = 1
-    ): Promise<void> {
-        const longField = 'recentReverseCountLong';
-        const shortField = 'recentReverseCountShort';
-        const totalField = 'recentReverseCount';
-
-        const fieldToIncrement = direction === 'long' ? longField : shortField;
-
-        // UPSERT: insert default row if missing, then increment
-        await this.db
-            .insert(symbolHistory)
-            .values({
-                symbol,
-                // All defaults from schema will apply
-            })
-            .onDuplicateKeyUpdate({
-                set: {
-                    [fieldToIncrement]: sql`${symbolHistory[fieldToIncrement]} + ${delta}`,
-                    [totalField]: sql`${symbolHistory[totalField]} + ${delta}`,
-                    updatedAt: new Date(),
-                },
-            })
-            .execute();
-
-        logger.debug('Incremented recent reverse count', {
-            symbol,
-            direction,
-            delta,
-            field: fieldToIncrement,
-        });
-    }
-
-    // ===========================================================================
     // NEW: Get full enriched history for strategy decisions
     // ===========================================================================
     /**
-     * Returns the complete symbol history with all recent + directional fields.
-     * Used by:
-     *   - Strategy.generateSignal()
-     *   - AutoTradeService.execute()
-     *   - TelegramBotController for rich alerts
-     */
-    /**
- * Returns the full recent-only history for a symbol.
- * Used by Strategy, AutoTradeService, and Telegram alerts.
- * All data reflects only the last ~3 hours.
- */
+     * *
+    * Returns the full recent-only history for a symbol.
+    * Used by Strategy, AutoTradeService, and Telegram alerts.
+    * All data reflects only the last ~3 hours.
+    */
     public async getEnrichedSymbolHistory(symbol: string): Promise<EnrichedSymbolHistory> {
         const [row] = await this.db
             .select()
@@ -1535,12 +1223,15 @@ class DatabaseService {
     }
 
     /**
- * Returns the REAL-TIME regime for a symbol:
- * - All closed simulations from last 3 hours (accurate, from DB)
- * - PLUS all currently running simulations (live interim MFE/MAE from memory)
- *
- * This is the method your Strategy should use before generating a new signal.
- */
+     * Returns the REAL-TIME regime for a symbol:
+     * - All closed simulations from last ~3-6 hours (accurate, completed outcomes)
+     * - PLUS all currently running simulations (live interim MFE/MAE)
+     *
+     * This is the method your Strategy and AutoTradeService should use before generating/executing a signal.
+     *
+     * Now fully backed by in-memory excursionCache – no DB queries in hot path.
+     * Aggregates computed on-the-fly for freshness and speed.
+     */
     public async getCurrentRegime(symbol: string): Promise<{
         mfe: number;
         mae: number;
@@ -1549,7 +1240,7 @@ class DatabaseService {
         winRate: number;
         reverseCount: number;
         sampleCount: number;
-        activeCount: number; // how many sims running now
+        activeCount: number;
         mfeLong: number;
         maeLong: number;
         winRateLong: number;
@@ -1559,31 +1250,9 @@ class DatabaseService {
         winRateShort: number;
         sampleCountShort: number;
     }> {
-        // 1. Get closed recent data
-        const closedHistory = await this.getEnrichedSymbolHistory(symbol);
-        const closedEntries = closedHistory.historyJson;
+        const regime = excursionCache.getRegime(symbol);
 
-        // 2. Get live active simulations from memory
-        const activeStates = activeSimulationsCache.getBySymbol(symbol);
-
-        // 3. Combine into temporary entries for calculation
-        const liveEntries = activeStates.map(state => ({
-            mfe: state.currentMfePct,
-            mae: state.currentMaePct,
-            rMultiple: 0, // not meaningful yet
-            label: 0,
-            direction: state.direction === 'long' ? 'buy' : 'sell' as 'buy' | 'sell',
-        }));
-
-        const allMfe = [...closedEntries.map(e => e.mfe), ...liveEntries.map(e => e.mfe)];
-        const allMae = [...closedEntries.map(e => e.mae), ...liveEntries.map(e => e.mae)];
-        const allR = [...closedEntries.map(e => e.rMultiple), ...liveEntries.map(() => 0)];
-        const allLabels = [...closedEntries.map(e => e.label), ...liveEntries.map(() => 0)];
-        const allDirections = [...closedEntries.map(e => e.direction), ...liveEntries.map(e => e.direction)];
-
-        const totalCount = allMfe.length;
-
-        if (totalCount === 0) {
+        if (!regime) {
             return {
                 mfe: 0,
                 mae: 0,
@@ -1604,44 +1273,29 @@ class DatabaseService {
             };
         }
 
-        const mfe = allMfe.reduce((a, b) => a + b, 0) / totalCount;
-        const mae = allMae.reduce((a, b) => a + b, 0) / totalCount;
-        const avgR = allR.reduce((a, b) => a + b, 0) / totalCount;
-        const winRate = allLabels.filter(l => l >= 1).length / totalCount;
-        const excursionRatio = mfe / Math.max(Math.abs(mae), 0.01);
+        // activeCount exposed by cache (live sims)
+        const activeCount = regime.activeCount ?? 0;
 
-        // Directional (including live)
-        const longAll = allDirections.filter((_, i) => allDirections[i] === 'buy');
-        const shortAll = allDirections.filter((_, i) => allDirections[i] === 'sell');
-
-        const mfeLong = longAll.length ? longAll.reduce((s, _, i) => s + allMfe[i], 0) / longAll.length : 0;
-        const maeLong = longAll.length ? longAll.reduce((s, _, i) => s + allMae[i], 0) / longAll.length : 0;
-        const winRateLong = longAll.length ? longAll.filter((_, i) => allLabels[i] >= 1).length / longAll.length : 0;
-
-        const mfeShort = shortAll.length ? shortAll.reduce((s, _, i) => s + allMfe[i], 0) / shortAll.length : 0;
-        const maeShort = shortAll.length ? shortAll.reduce((s, _, i) => s + allMae[i], 0) / shortAll.length : 0;
-        const winRateShort = shortAll.length ? shortAll.filter((_, i) => allLabels[i] >= 1).length / shortAll.length : 0;
-
-        // Reverse count from closed only (live ones not finished)
-        const reverseCount = closedHistory.recentReverseCount;
+        // Total sampleCount = completed + live (for blended averages)
+        const totalSampleCount = regime.recentSampleCount + activeCount;
 
         return {
-            mfe,
-            mae,
-            excursionRatio,
-            avgR,
-            winRate,
-            reverseCount,
-            sampleCount: totalCount,
-            activeCount: activeStates.length,
-            mfeLong,
-            maeLong,
-            winRateLong,
-            sampleCountLong: longAll.length,
-            mfeShort,
-            maeShort,
-            winRateShort,
-            sampleCountShort: shortAll.length,
+            mfe: regime.recentMfe,
+            mae: regime.recentMae,
+            excursionRatio: regime.recentExcursionRatio,
+            avgR: regime.recentAvgR,
+            winRate: regime.recentWinRate,          // completed only
+            reverseCount: regime.recentReverseCount, // completed only
+            sampleCount: totalSampleCount,
+            activeCount,
+            mfeLong: regime.recentMfeLong,
+            maeLong: regime.recentMaeLong,
+            winRateLong: regime.recentWinRateLong,
+            sampleCountLong: regime.recentSampleCountLong,
+            mfeShort: regime.recentMfeShort,
+            maeShort: regime.recentMaeShort,
+            winRateShort: regime.recentWinRateShort,
+            sampleCountShort: regime.recentSampleCountShort,
         };
     }
 
