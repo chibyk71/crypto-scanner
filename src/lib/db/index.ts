@@ -32,7 +32,6 @@ import {
     trainingSamples,
     trades,
     simulatedTrades,
-    symbolHistory,           // ← Denormalized table for fast symbol stats + excursions
     type Alert,
     type NewAlert,
     type TrainingSample,
@@ -170,7 +169,6 @@ class DatabaseService {
                         trades,
                         simulatedTrades,
                         coolDownTable,
-                        symbolHistory, // ← Important for fast excursion stats
                         ohlcvHistory,
                     },
                     mode: 'default',
@@ -1174,64 +1172,24 @@ class DatabaseService {
             .execute();
     }
 
-    // ===========================================================================
-    // NEW: Get full enriched history for strategy decisions
-    // ===========================================================================
     /**
-     * *
-    * Returns the full recent-only history for a symbol.
-    * Used by Strategy, AutoTradeService, and Telegram alerts.
-    * All data reflects only the last ~3 hours.
-    */
-    public async getEnrichedSymbolHistory(symbol: string): Promise<EnrichedSymbolHistory> {
-        const [row] = await this.db
-            .select()
-            .from(symbolHistory)
-            .where(eq(symbolHistory.symbol, symbol))
-            .execute();
-
-        // Default object if no row exists yet
-        const defaults: EnrichedSymbolHistory = {
-            symbol,
-            historyJson: [],
-            recentAvgR: 0,
-            recentWinRate: 0,
-            recentReverseCount: 0,
-            recentMae: 0,
-            recentMfe: 0,
-            recentExcursionRatio: 0,
-            recentSampleCount: 0,
-            recentMfeLong: 0,
-            recentMaeLong: 0,
-            recentWinRateLong: 0,
-            recentReverseCountLong: 0,
-            recentSampleCountLong: 0,
-            recentMfeShort: 0,
-            recentMaeShort: 0,
-            recentWinRateShort: 0,
-            recentReverseCountShort: 0,
-            recentSampleCountShort: 0,
-            updatedAt: new Date(),
-        };
-
-        if (!row) {
-            return defaults;
-        }
-
-        // Type assertion is safe because row matches the schema
-        return row as EnrichedSymbolHistory;
-    }
-
-    /**
-     * Returns the REAL-TIME regime for a symbol:
-     * - All closed simulations from last ~3-6 hours (accurate, completed outcomes)
-     * - PLUS all currently running simulations (live interim MFE/MAE)
-     *
-     * This is the method your Strategy and AutoTradeService should use before generating/executing a signal.
-     *
-     * Now fully backed by in-memory excursionCache – no DB queries in hot path.
-     * Aggregates computed on-the-fly for freshness and speed.
-     */
+ * Returns the **real-time excursion regime** for a given symbol.
+ *
+ * This is the **recommended entry point** for any part of the system that needs
+ * current MFE/MAE statistics, sample counts, win rates, etc. before making
+ * trading decisions (Strategy.generateSignal, AutoTradeService.execute, alerts, etc.).
+ *
+ * Features:
+ * - Fully backed by the in-memory `excursionCache` — **zero database queries** in hot path
+ * - Uses lightweight `getRegimeLite()` version (no history array)
+ * - Blends completed + live simulations for current MFE/MAE
+ * - Win rate, avgR, reverse count → completed simulations only (most reliable)
+ * - Returns safe zeroed-out defaults when no data exists
+ * - Maintains **exact same shape** as previous implementation → no call-site changes required
+ *
+ * @param symbol - Trading symbol (e.g. 'BTC/USDT')
+ * @returns Promise resolving to flat regime object with backward-compatible field names
+ */
     public async getCurrentRegime(symbol: string): Promise<{
         mfe: number;
         mae: number;
@@ -1250,8 +1208,10 @@ class DatabaseService {
         winRateShort: number;
         sampleCountShort: number;
     }> {
-        const regime = excursionCache.getRegime(symbol);
+        // ── 1. Fetch lightweight regime from cache (fast path) ───────────────────────
+        const regime = excursionCache.getRegimeLite(symbol);
 
+        // ── 2. Early return with safe defaults when no data exists ───────────────────
         if (!regime) {
             return {
                 mfe: 0,
@@ -1273,92 +1233,52 @@ class DatabaseService {
             };
         }
 
-        // activeCount exposed by cache (live sims)
+        // ── 3. Extract & blend key counts ────────────────────────────────────────────
         const activeCount = regime.activeCount ?? 0;
 
-        // Total sampleCount = completed + live (for blended averages)
+        // Total sampleCount exposed to callers is **completed + live**
+        // → useful for callers who want total simulation activity
         const totalSampleCount = regime.recentSampleCount + activeCount;
 
-        return {
+        // ── 4. Map internal recent* fields → flat public names (compatibility layer) ─
+        const result = {
+            // Overall metrics
             mfe: regime.recentMfe,
             mae: regime.recentMae,
             excursionRatio: regime.recentExcursionRatio,
             avgR: regime.recentAvgR,
-            winRate: regime.recentWinRate,          // completed only
-            reverseCount: regime.recentReverseCount, // completed only
+            winRate: regime.recentWinRate ?? 0,              // completed only
+            reverseCount: regime.recentReverseCount ?? 0,    // completed only
             sampleCount: totalSampleCount,
             activeCount,
-            mfeLong: regime.recentMfeLong,
-            maeLong: regime.recentMaeLong,
-            winRateLong: regime.recentWinRateLong,
-            sampleCountLong: regime.recentSampleCountLong,
-            mfeShort: regime.recentMfeShort,
-            maeShort: regime.recentMaeShort,
-            winRateShort: regime.recentWinRateShort,
-            sampleCountShort: regime.recentSampleCountShort,
+
+            // Directional long (buy)
+            mfeLong: regime.recentMfeLong ?? 0,
+            maeLong: regime.recentMaeLong ?? 0,
+            winRateLong: regime.recentWinRateLong ?? 0,
+            sampleCountLong: regime.recentSampleCountLong ?? 0,
+
+            // Directional short (sell)
+            mfeShort: regime.recentMfeShort ?? 0,
+            maeShort: regime.recentMaeShort ?? 0,
+            winRateShort: regime.recentWinRateShort ?? 0,
+            sampleCountShort: regime.recentSampleCountShort ?? 0,
         };
-    }
 
-    // ===========================================================================
-    // Periodic cleanup of stale recent stats
-    // ===========================================================================
-    /**
-     * Resets all recent fields for symbols that have had no simulation activity
-     * in the last `windowHours` (default 6 hours).
-     *
-     * Why this is still useful:
-     *   • Prevents stale data from lingering on inactive symbols
-     *   • Keeps database clean and aggregates accurate
-     *   • Runs safely via cron (e.g., every hour)
-     *
-     * Behavior:
-     *   • If updatedAt is older than cutoff → full reset of recent fields
-     *   • historyJson is cleared (pruned to empty)
-     *   • All counters and averages reset to 0
-     *
-     * @param windowHours - Inactivity threshold in hours (default 6)
-     */
-    public async cleanupStaleRecentStats(windowHours = 6): Promise<void> {
-        const cutoffMs = Date.now() - windowHours * 60 * 60 * 1000;
-        const cutoffDate = new Date(cutoffMs);
-
-        const result = await this.db
-            .update(symbolHistory)
-            .set({
-                historyJson: [],
-                recentAvgR: 0,
-                recentWinRate: 0,
-                recentReverseCount: 0,
-                recentMae: 0,
-                recentMfe: 0,
-                recentExcursionRatio: 0,
-                recentSampleCount: 0,
-
-                recentMfeLong: 0,
-                recentMaeLong: 0,
-                recentWinRateLong: 0,
-                recentReverseCountLong: 0,
-                recentSampleCountLong: 0,
-
-                recentMfeShort: 0,
-                recentMaeShort: 0,
-                recentWinRateShort: 0,
-                recentReverseCountShort: 0,
-                recentSampleCountShort: 0,
-
-                updatedAt: new Date(), // Touch to prevent immediate re-cleanup
-            })
-            .where(sql`${symbolHistory.updatedAt} < ${cutoffDate}`)
-            .execute();
-
-        const affected = result[0].affectedRows;
-
-        if (affected > 0) {
-            logger.info('Cleaned up stale recent stats', {
-                inactiveSymbols: affected,
-                cutoffHours: windowHours,
+        // ── 5. Optional debug logging (helps monitoring hot symbols) ─────────────────
+        if (logger.isDebugEnabled()) {
+            logger.debug('getCurrentRegime fetched regime data', {
+                symbol,
+                activeCount,
+                completedCount: regime.recentSampleCount,
+                totalSamples: totalSampleCount,
+                overallRatio: regime.recentExcursionRatio.toFixed(2),
+                hasLongData: regime.recentMfeLong !== undefined,
+                hasShortData: regime.recentMfeShort !== undefined,
             });
         }
+
+        return result;
     }
 
     // =========================================================================

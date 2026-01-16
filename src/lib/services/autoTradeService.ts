@@ -23,6 +23,7 @@ import type { TradeSignal } from '../../types';
 import { getExcursionAdvice, isHighMaeRisk } from '../utils/excursionUtils';
 import type { TelegramBotController } from './telegramBotController';
 import { computeLabel } from './simulateTrade';
+import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('AutoTradeService');
 
@@ -53,9 +54,9 @@ export class AutoTradeService {
             // =================================================================
             // 1. Get real-time regime (closed recent + all live simulations)
             // =================================================================
-            const regime = await dbService.getCurrentRegime(symbol);
+            const regime = excursionCache.getRegime(symbol);
 
-            if (regime.sampleCount === 0) {
+            if (regime == null || regime?.recentSampleCount === 0) {
                 logger.warn(`NO simulation history yet for ${symbol} – refusing live trade`);
                 return;
             }
@@ -69,7 +70,7 @@ export class AutoTradeService {
             let reversalReason = '';
 
             // Use the new centralized excursion logic (includes explicit action)
-            const adviceObj = getExcursionAdvice(regime as any, direction);
+            const adviceObj = getExcursionAdvice(regime, direction);
 
             logger.info(`Excursion advice: ${adviceObj.advice}`, { symbol });
 
@@ -94,10 +95,10 @@ export class AutoTradeService {
             // =================================================================
             // 3. High drawdown risk filter (using live MAE)
             // =================================================================
-            if (isHighMaeRisk(regime as any, direction)) {
+            if (isHighMaeRisk(regime, direction)) {
                 logger.warn(`SKIPPING trade: High live drawdown risk`, {
                     symbol,
-                    liveMae: regime.mae.toFixed(2),
+                    liveMae: regime.recentMae.toFixed(2),
                     threshold: config.strategy.maxMaePct,
                     activeSims: regime.activeCount,
                 });
@@ -199,7 +200,7 @@ export class AutoTradeService {
                 confidence: finalConfidence.toFixed(1),
                 reversed: wasReversed,
                 excursionAdvice: adviceObj.advice,
-                liveSamples: regime.sampleCount,
+                liveSamples: regime.recentSampleCount,
                 activeSims: regime.activeCount,
             });
 
@@ -243,7 +244,7 @@ export class AutoTradeService {
                 stopLoss ? `• SL: $${stopLoss.toFixed(8)}` : '',
                 takeProfit ? `• TP: $${takeProfit.toFixed(8)}${wasReversed ? ' (reduced)' : ''}` : '',
                 `• Excursion: ${adviceObj.advice}`,
-                `• Live Regime: ${regime.sampleCount} samples (${regime.activeCount} active) | Ratio ${regime.excursionRatio.toFixed(2)}`,
+                `• Live Regime: ${regime.recentSampleCount} samples (${regime.activeCount} active) | Ratio ${regime.recentExcursionRatio.toFixed(2)}`,
             ];
 
             if (wasReversed) {

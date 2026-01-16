@@ -1,7 +1,6 @@
 // src/lib/db/schema.ts
 import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, decimal, uniqueIndex } from 'drizzle-orm/mysql-core';
 import type { Condition } from '../../types';
-import type { SimulationHistoryEntry } from '../../types/signalHistory';
 
 /**
  * =============================================================================
@@ -330,84 +329,6 @@ export const coolDownTable = mysqlTable('cool_down', {
 
 /**
  * =============================================================================
- * SYMBOL HISTORY – DENORMALIZED FAST-LOOKUP TABLE
- * =============================================================================
- *
- * Purpose:
- *   • Provides **instant access** to per-symbol performance and excursion stats
- *   • Eliminates expensive real-time calculations during every scan
- *   • Powers:
- *       - Strategy: dynamic SL/TP and confidence adjustments
- *       - AutoTradeService: risk filtering (high MAE skip)
- *       - Telegram: /excursions command and signal alerts
- *       - Future dashboard or analytics
- *
- * Why denormalized?
- *   • Updated only when a simulation closes (very low write frequency)
- *   • Read thousands of times per scan cycle → must be lightning-fast
- *   • Single-row per symbol = O(1) lookup
- *
- * Key fields explained:
- *   • historyJson: last 10 simulations (for detailed history view)
- *   • avgR: average R-multiple (risk-adjusted return)
- *   • winRate: % of profitable simulations
- *   • reverseCount: how many recent wins went opposite to current signal
- *   • avgMae / avgMfe / avgExcursionRatio: excursion metrics for adaptive trading
- *
- * NEW: Recent (time-bound) and directional stats for regime-aware trading
- */
-export const symbolHistory = mysqlTable(
-    'symbol_history',
-    {
-        /** Trading pair – primary key (one row per symbol) */
-        symbol: varchar('symbol', { length: 50 }).primaryKey(),
-
-        /** JSON array of recent simulation entries (newest first), filtered to last ~3 hours */
-        historyJson: json('history_json')
-            .$type<SimulationHistoryEntry[]>()
-            .notNull()
-            .default([]),
-
-        // === RECENT OVERALL STATS (last ~3 hours) ===
-        recentAvgR: float('recent_avg_r').notNull().default(0.0),
-        recentWinRate: float('recent_win_rate').notNull().default(0.0), // % of wins (label >= 1)
-        recentReverseCount: int('recent_reverse_count').notNull().default(0),
-        recentMae: float('recent_mae').notNull().default(0.0), // Negative or zero
-        recentMfe: float('recent_mfe').notNull().default(0.0), // Positive
-        recentExcursionRatio: float('recent_excursion_ratio').notNull().default(0.0),
-        recentSampleCount: int('recent_sample_count').notNull().default(0),
-
-        // === RECENT DIRECTIONAL STATS (long only, last ~3 hours) ===
-        recentMfeLong: float('recent_mfe_long').notNull().default(0.0),
-        recentMaeLong: float('recent_mae_long').notNull().default(0.0),
-        recentWinRateLong: float('recent_win_rate_long').notNull().default(0.0),
-        recentReverseCountLong: int('recent_reverse_count_long').notNull().default(0),
-        recentSampleCountLong: int('recent_sample_count_long').notNull().default(0),
-
-        // === RECENT DIRECTIONAL STATS (short only, last ~3 hours) ===
-        recentMfeShort: float('recent_mfe_short').notNull().default(0.0),
-        recentMaeShort: float('recent_mae_short').notNull().default(0.0),
-        recentWinRateShort: float('recent_win_rate_short').notNull().default(0.0),
-        recentReverseCountShort: int('recent_reverse_count_short').notNull().default(0),
-        recentSampleCountShort: int('recent_sample_count_short').notNull().default(0),
-
-        /** Last update timestamp – used for stale cleanup */
-        updatedAt: timestamp('updated_at').notNull().defaultNow().onUpdateNow(),
-    },
-    (table) => ({
-        /** Primary key index (auto-created) */
-        symbolIdx: index('idx_symbol_history_symbol').on(table.symbol),
-
-        /** Fast filtering by excursion quality */
-        excursionIdx: index('idx_symbol_history_excursions').on(table.recentMae, table.recentMfe),
-
-        /** For periodic cleanup of stale rows */
-        recentUpdatedIdx: index('idx_symbol_history_updated_at').on(table.updatedAt),
-    })
-);
-
-/**
- * =============================================================================
  * TYPE INFERENCE (TypeScript magic)
  * =============================================================================
  *
@@ -439,11 +360,6 @@ export type NewTrainingSample = typeof trainingSamples.$inferInsert;
 
 export type Trade = typeof trades.$inferSelect;
 export type NewTrade = typeof trades.$inferInsert;
-
-/** Full symbol history row with parsed JSON */
-export type SymbolHistory = typeof symbolHistory.$inferSelect;
-/** Data shape for inserting/updating symbol history */
-export type NewSymbolHistory = typeof symbolHistory.$inferInsert;
 
 export type OhlcvHistory = typeof ohlcvHistory.$inferSelect;
 export type NewOhlcvHistory = typeof ohlcvHistory.$inferInsert;

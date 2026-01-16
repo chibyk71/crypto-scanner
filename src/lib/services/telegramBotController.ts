@@ -9,6 +9,7 @@ import { MLService } from './mlService';
 import { Condition, type TradeSignal } from '../../types';
 import { closeAndCleanUp } from '../..';
 import { getExcursionAdvice } from '../utils/excursionUtils';
+import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('TelegramBot');
 
@@ -1590,7 +1591,7 @@ export class TelegramBotController {
         const username = msg.from?.username || msg.from?.first_name || 'unknown';
 
         try {
-            await this.bot.sendMessage(chatId, '🔄 *Forcing ML model retraining...*\n\nThis may take 30–90 seconds depending on sample count.');
+            await this.bot.sendMessage(chatId, '🔄 *Forcing ML model retraining...*\n\nThis may take 30\\-90 seconds depending on sample count.');
 
             await this.mlService.forceRetrain();
 
@@ -1753,7 +1754,7 @@ export class TelegramBotController {
         if (!symbolInput) {
             await this.bot.sendMessage(
                 chatId,
-                '*Usage:* `/excursions BTC/USDT`\n\nShows real-time excursion stats (including live simulations) for a symbol.',
+                '*Usage:* `/excursions BTC/USDT`\n\nShows real\\-time excursion stats (including live simulations) for a symbol.',
                 { parse_mode: 'Markdown' }
             );
             return;
@@ -1761,12 +1762,9 @@ export class TelegramBotController {
 
         try {
             // Get real-time regime: closed recent + all live active simulations
-            const regime = await dbService.getCurrentRegime(symbolInput);
+            const regime = excursionCache.getRegime(symbolInput);
 
-            // Optional: fallback to closed-only history for directional stats
-            const closedHistory = await dbService.getEnrichedSymbolHistory(symbolInput);
-
-            if (regime.sampleCount === 0) {
+            if (regime == null || (regime?.recentSampleCount) === 0) {
                 await this.bot.sendMessage(
                     chatId,
                     `ℹ️ *No excursion data yet for ${symbolInput}*\n\nWaiting for first simulation to complete or run.`,
@@ -1778,45 +1776,45 @@ export class TelegramBotController {
             const lines: string[] = [`**Live Excursion Analysis: ${symbolInput}** 📊`];
 
             const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} active sim${regime.activeCount > 1 ? 's' : ''})` : '';
-            const ratioColor = regime.excursionRatio > 2.0 ? '🟢' : regime.excursionRatio < 1.0 ? '🔴' : '🟡';
+            const ratioColor = regime.recentExcursionRatio > 2.0 ? '🟢' : regime.recentExcursionRatio < 1.0 ? '🔴' : '🟡';
 
             lines.push('');
             lines.push(`*Current Regime (last ~3h + live)${liveNote}*`);
-            lines.push(`Samples: ${regime.sampleCount}`);
-            lines.push(`Reversals: ${regime.reverseCount} ${regime.reverseCount >= 3 ? '⚠️ High' : regime.reverseCount >= 2 ? '🟡 Moderate' : ''}`);
-            lines.push(`MFE: ${regime.mfe.toFixed(2)}%`);
-            lines.push(`MAE: ${regime.mae.toFixed(2)}%`);
-            lines.push(`Ratio: ${regime.excursionRatio.toFixed(2)} ${ratioColor}`);
+            lines.push(`Samples: ${regime.recentSampleCount}`);
+            lines.push(`Reversals: ${regime.recentReverseCount} ${regime.recentReverseCount >= 3 ? '⚠️ High' : regime.recentReverseCount >= 2 ? '🟡 Moderate' : ''}`);
+            lines.push(`MFE: ${regime.recentMfe.toFixed(2)}%`);
+            lines.push(`MAE: ${regime.recentMae.toFixed(2)}%`);
+            lines.push(`Ratio: ${regime.recentExcursionRatio.toFixed(2)} ${ratioColor}`);
 
-            if (regime.excursionRatio < 1.0) {
+            if (regime.recentExcursionRatio < 1.0) {
                 lines.push('→ *Low reward phase* – consider fading or early exits');
-            } else if (regime.excursionRatio > 2.0) {
+            } else if (regime.recentExcursionRatio > 2.0) {
                 lines.push('→ *Strong reward phase* – favorable excursions');
             } else {
                 lines.push('→ *Balanced regime* – standard risk management');
             }
 
-            if (regime.reverseCount >= 3) {
+            if (regime.recentReverseCount >= 3) {
                 lines.push('⚠️ *Mean-reversion likely* – high reversal activity detected');
             }
 
             // === Directional Bias (from recent closed simulations) ===
-            if (closedHistory.recentSampleCountLong > 0 || closedHistory.recentSampleCountShort > 0) {
-                const longRatio = closedHistory.recentMfeLong / Math.max(Math.abs(closedHistory.recentMaeLong), 1e-6);
-                const shortRatio = closedHistory.recentMfeShort / Math.max(Math.abs(closedHistory.recentMaeShort), 1e-6);
+            // if (closedHistory.recentSampleCountLong > 0 || closedHistory.recentSampleCountShort > 0) {
+            //     const longRatio = closedHistory.recentMfeLong / Math.max(Math.abs(closedHistory.recentMaeLong), 1e-6);
+            //     const shortRatio = closedHistory.recentMfeShort / Math.max(Math.abs(closedHistory.recentMaeShort), 1e-6);
 
-                lines.push('');
-                lines.push('*Directional Bias (recent closed)*');
-                lines.push(`Long:  MFE ${closedHistory.recentMfeLong.toFixed(2)}% | MAE ${closedHistory.recentMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
-                lines.push(`Short: MFE ${closedHistory.recentMfeShort.toFixed(2)}% | MAE ${closedHistory.recentMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
-            }
+            //     lines.push('');
+            //     lines.push('*Directional Bias (recent closed)*');
+            //     lines.push(`Long:  MFE ${closedHistory.recentMfeLong.toFixed(2)}% | MAE ${closedHistory.recentMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
+            //     lines.push(`Short: MFE ${closedHistory.recentMfeShort.toFixed(2)}% | MAE ${closedHistory.recentMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
+            // }
 
             // === Final Risk Assessment ===
             lines.push('');
-            const highMaeRisk = Math.abs(regime.mae) > (config.strategy.maxMaePct ?? 3.0);
+            const highMaeRisk = Math.abs(regime.recentMae) > (config.strategy.maxMaePct ?? 3.0);
             const overallRisk = highMaeRisk
                 ? '🔴 High drawdown risk'
-                : regime.excursionRatio > 2.0
+                : regime.recentExcursionRatio > 2.0
                     ? '🟢 Low risk – strong reward profile'
                     : '🟡 Moderate risk';
 
@@ -1871,7 +1869,7 @@ export class TelegramBotController {
             `**Price:** $${escape(price.toFixed(8))}`,
             signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(1))}%` : '',
             signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
-            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(\\≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
+            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
             signal.mlConfidence ? `**ML Confidence:** ${escape(signal.mlConfidence.toFixed(1))}%` : '',
             signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
         ].filter(Boolean);
@@ -1879,31 +1877,31 @@ export class TelegramBotController {
         // Auto-reversal header (from AutoTradeService or Strategy if reversed)
         if (reversalInfo?.wasReversed) {
             lines.unshift('');
-            lines.unshift(`⚠️ **AUTO-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
+            lines.unshift(`⚠️ **AUTO\\-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
             lines.unshift(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
         }
 
         // Real-time regime summary
-        const regime = await dbService.getCurrentRegime(symbol);
+        const regime = excursionCache.getRegime(symbol);
 
-        if (regime.sampleCount > 0) {
+        if (regime != null && regime.recentSampleCount > 0) {
             const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
             lines.push('');
             lines.push(`**Current Regime \\(last \\~3h \\+ live\\)${liveNote}** 📊`);
-            lines.push(escape(`• Samples: ${regime.sampleCount} | Reversals: ${regime.reverseCount}`));
-            lines.push(escape(`• MFE: ${regime.mfe.toFixed(2)}% | MAE: ${regime.mae.toFixed(2)}% → Ratio: ${regime.excursionRatio.toFixed(2)}`));
+            lines.push(escape(`• Samples: ${regime.recentSampleCount} | Reversals: ${regime.recentReverseCount}`));
+            lines.push(escape(`• MFE: ${regime.recentMfe.toFixed(2)}% | MAE: ${regime.recentMae.toFixed(2)}% → Ratio: ${regime.recentExcursionRatio.toFixed(2)}`));
 
-            if (regime.excursionRatio < 1.0) {
+            if (regime.recentExcursionRatio < 1.0) {
                 lines.push('→ Low reward phase — consider early profit taking or fading');
-            } else if (regime.excursionRatio > 2.0) {
+            } else if (regime.recentExcursionRatio > 2.0) {
                 lines.push('→ Strong reward phase — favorable excursions');
             } else {
                 lines.push('→ Balanced regime — standard risk management');
             }
 
-            if (regime.reverseCount >= 3) {
-                lines.push('⚠️ High reversal risk — possible mean-reversion detected');
-            } else if (regime.reverseCount >= 2) {
+            if (regime.recentReverseCount >= 3) {
+                lines.push('⚠️ High reversal risk — possible mean\\-reversion detected');
+            } else if (regime.recentReverseCount >= 2) {
                 lines.push('🟡 Moderate reversal activity — monitor closely');
             }
         } else {
@@ -1913,9 +1911,9 @@ export class TelegramBotController {
 
         // Excursion Insight: Always compute fresh from current regime + final signal direction
         let finalExcursionAdvice = '';
-        if (regime.sampleCount > 0) {
+        if (regime != null && regime.recentSampleCount > 0) {
             const direction = signal.signal === 'buy' ? 'long' : 'short';
-            finalExcursionAdvice = getExcursionAdvice(regime as any, direction).advice;
+            finalExcursionAdvice = getExcursionAdvice(regime, direction).advice;
         }
 
         if (finalExcursionAdvice) {
