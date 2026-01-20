@@ -27,6 +27,7 @@ import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
 import { getExcursionAdvice } from './utils/excursionUtils';
 import { detectEngulfing } from './indicators';
 import { excursionCache } from './services/excursionHistoryCache';
+import { cooldownService } from './services/cooldownService';
 
 // Dedicated logger – all strategy-related messages tagged 'Strategy'
 const logger = createLogger('Strategy');
@@ -121,8 +122,6 @@ const ML_CONFIDENCE_DISCOUNT = 0.8;           // ← If model not trained, cut i
 const MIN_ATR_MULTIPLIER = 0.5;               // ← Safety bounds for stop-loss distance
 const MAX_ATR_MULTIPLIER = 5;
 
-const DEFAULT_COOLDOWN_MINUTES = 10;          // ← Don't spam signals – wait at least 10 min
-
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
@@ -155,11 +154,7 @@ export class Strategy {
     // External dependencies
     private mlService: MLService;
 
-    // Configuration
-    private cooldownMinutes: number;
-
     // State
-    private lastSignalTimes: Map<string, number> = new Map();  // Per-symbol cooldown tracking
     public lastAtr: number = 0;                               // Latest ATR (exposed for debugging)
 
     /**
@@ -167,9 +162,8 @@ export class Strategy {
      * @param mlService - Machine learning service for prediction bonus
      * @param cooldownMinutes - Minimum minutes between signals per symbol
      */
-    constructor(mlService: MLService, cooldownMinutes: number = DEFAULT_COOLDOWN_MINUTES) {
+    constructor(mlService: MLService) {
         this.mlService = mlService;
-        this.cooldownMinutes = cooldownMinutes;
     }
 
     // =========================================================================
@@ -781,10 +775,8 @@ export class Strategy {
         const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
 
         // Per-symbol cooldown
-        const now = Date.now();
-        const last = this.lastSignalTimes.get(symbol) ?? 0;
-        if ((now - last) / (1000 * 60) < this.cooldownMinutes) {
-            reasons.push(`Cooldown active (<${this.cooldownMinutes} min since last signal)`);
+        const isCooldownActive = await cooldownService.isActive(symbol);
+        if (isCooldownActive) {
             return { symbol, signal: 'hold', confidence: 0, reason: reasons, features: [], potentialSignal: 'hold' };
         }
 
@@ -888,7 +880,10 @@ export class Strategy {
                     );
 
                     if (postAdjust.signal === 'hold' || gap < MIN_GAP) {
-                        reasons.push('Reversal validation failed (score/gap insufficient) → alert/trade prevented');
+                        reasons.push(
+                            `Reversal attempted but failed validation ` +
+                            `(post-adjust score ${postAdjust.signal}, gap ${gap.toFixed(2)} < ${MIN_GAP})`
+                        );
                         // Keep the attempted reversed direction for simulation
                         potentialSignal = originalWasBuy ? 'sell' : 'buy';
                         return this._createHoldSignal(symbol, reasons, features, potentialSignal);
@@ -957,7 +952,7 @@ export class Strategy {
                 if (slMultiplier > 1.05) reasons.push(`Stop-loss loosened (×${slMultiplier.toFixed(2)})`);
 
                 // Update cooldown only when we actually signal something
-                this.lastSignalTimes.set(symbol, now);
+                cooldownService.setCooldown(symbol);
             }
 
             // Final debug log
@@ -966,7 +961,6 @@ export class Strategy {
                 buyScore: buyScore.toFixed(1),
                 sellScore: sellScore.toFixed(1),
                 liveSamples: regime?.recentSampleCount,
-                activeSims: regime?.activeCount ?? 0,
                 excursionRatio: regime?.recentExcursionRatio?.toFixed(2) ?? 'N/A',
                 TPx: tpMultiplier.toFixed(2),
                 SLx: slMultiplier.toFixed(2),
