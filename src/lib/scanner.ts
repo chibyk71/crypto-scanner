@@ -30,6 +30,7 @@ import { AlertEvaluatorService } from './services/alertEvaluator';
 import { mlService } from './services/mlService';
 import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
+import { cooldownService } from './services/cooldownService';
 
 const logger = createLogger('MarketScanner');
 
@@ -51,7 +52,6 @@ type ScannerOptions = {
     mode?: ScannerMode;
     intervalMs?: number;
     concurrency?: number;
-    cooldownMs?: number;
     jitterMs?: number;
     retries?: number;
     heartbeatCycles?: number;
@@ -75,10 +75,6 @@ export class MarketScanner {
     private isScanning = false;        // Is a scan cycle currently in progress?
     private scanTimer: NodeJS.Timeout | null = null;
     private scanCount = 0;             // Local counter when not using DB heartbeat
-
-    // Deduplication and cooldown tracking
-    private lastAlertAt: Record<string, number> = {};           // Memory backend only
-    private lastSignal: Record<string, { signal: TradeSignal; price: number }> = {};
 
     // Higher-timeframe cache – reduces API load dramatically
     private htfCache: Record<string, CachedHtf> = {};
@@ -112,7 +108,6 @@ export class MarketScanner {
             mode: 'periodic',
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 4,
-            cooldownMs: 5 * 60_000,
             jitterMs: 300,
             retries: 3,
             heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
@@ -298,45 +293,61 @@ export class MarketScanner {
     }
 
     /**
-     * Processes ONE trading symbol from start to finish during a scan cycle.
-     *
-     * High-level responsibilities in order:
-     *   1. Fetch required OHLCV data (primary + higher timeframe)
-     *   2. Generate the full TradeSignal using Strategy (technical + ML + excursion filtering)
-     *   3. Trigger background simulation for every meaningful potential / final direction
-     *      → we simulate even when final signal is 'hold' (skipped by excursion / no regime)
-     *      → we prefer the final direction when the signal was approved
-     *   4. Only alert / execute live trade when final signal is buy/sell
-     *
-     * Key decisions:
-     *   - Simulation runs for every case where there is a clear direction (potential or final)
-     *   - No extra cooldown or deduplication on simulation — we want dense history
-     *     even during periods where alerts are throttled (e.g. 7-minute cooldown)
-     *   - Alerting & live trading remain protected by the existing cooldown
-     *     (handled inside handleTradeSignal)
-     */
+ * Processes ONE trading symbol from start to finish during a single scan cycle.
+ *
+ * High-level responsibilities in strict order:
+ *   1. Early cooldown check using the new CooldownService (skips entire processing)
+ *   2. Fetch required OHLCV data (primary + higher timeframe)
+ *   3. Generate complete TradeSignal using Strategy (technical + ML + excursion filtering)
+ *   4. Decide which direction to simulate (prefer final signal > potentialSignal)
+ *   5. Trigger background simulation for every meaningful direction
+ *      → even when final signal is 'hold' (to keep history dense)
+ *      → no extra cooldown/deduplication here — we want frequent sim data
+ *   6. Only alert / execute live trade when final signal is buy/sell
+ *      (cooldown, R:R validation, etc. happen inside handleTradeSignal)
+ *
+ * Key design choices 2025:
+ *   - Cooldown applies at entry point (processSymbol) → saves API calls & CPU
+ *   - Simulation runs independently of alerting/trading cooldown
+ *     → ensures continuous excursion history even during alert throttling
+ *   - Fire-and-forget simulation (void) — never blocks the scanner
+ *   - Graceful error handling — one symbol failure doesn't stop the cycle
+ */
     private async processSymbol(symbol: string): Promise<void> {
         try {
             // ──────────────────────────────────────────────────────────────
-            // 1. Get fast timeframe data (e.g. 3m) – main source for indicators
+            // 1. Early Cooldown Check – skip entire symbol if throttled
+            //    (new CooldownService – 15 min default between signals)
+            // ──────────────────────────────────────────────────────────────
+            if (await cooldownService.isActive(symbol)) {
+                logger.debug(`Symbol ${symbol} on cooldown – skipping full processing`);
+                return;
+            }
+
+            logger.debug(`Processing symbol: ${symbol}`);
+
+            // ──────────────────────────────────────────────────────────────
+            // 2. Fetch primary (fast) timeframe data – main indicator source
             // ──────────────────────────────────────────────────────────────
             const primaryData = await this.getPrimaryData(symbol);
             if (!primaryData || primaryData.closes.length < config.historyLength) {
-                return; // not enough history – normal during warmup or illiquid symbols
+                logger.debug(`Insufficient primary data for ${symbol} – skipping`);
+                return;
             }
 
             // ──────────────────────────────────────────────────────────────
-            // 2. Get higher timeframe data (e.g. 1h) – used for trend filter
+            // 3. Fetch higher timeframe data – trend / regime filter
             // ──────────────────────────────────────────────────────────────
             const htfData = await this.getHtfData(symbol);
             if (!htfData || htfData.closes.length < config.historyLength) {
+                logger.debug(`Insufficient HTF data for ${symbol} – skipping`);
                 return;
             }
 
             const currentPrice = primaryData.closes.at(-1)!;
 
             // ──────────────────────────────────────────────────────────────
-            // 3. Generate complete signal (technical + ML + excursion logic)
+            // 4. Generate full signal (technical + ML + excursion filtering)
             // ──────────────────────────────────────────────────────────────
             const signal = await this.strategy.generateSignal({
                 symbol,
@@ -349,51 +360,65 @@ export class MarketScanner {
             });
 
             // ──────────────────────────────────────────────────────────────
-            // 4. Decide which direction to simulate
+            // 5. Decide simulation direction – smart priority order
             //
             // Priority:
-            //   A. If final signal is buy/sell → simulate the FINAL direction
-            //      (most correct when excursion approved or reversal succeeded)
-            //   B. Otherwise fall back to potentialSignal
+            //   A. Final approved signal (buy/sell) → most trustworthy
+            //   B. Fallback to pre-excursion potentialSignal
             //      (captures skipped signals, no-regime cases, failed reversals)
+            //   C. Skip simulation only if both are 'hold'
             //
-            // We only skip simulation when both are 'hold' (no meaningful edge)
+            // Goal: dense simulation history even when alerts are throttled
             // ──────────────────────────────────────────────────────────────
-            let directionToSimulate: 'buy' | 'sell' | 'hold' = signal.potentialSignal;
+            let simDirection: 'buy' | 'sell' | 'hold' = signal.potentialSignal;
 
             if (signal.signal !== 'hold') {
-                directionToSimulate = signal.signal;
+                simDirection = signal.signal;
+                logger.debug(`Using final signal direction for simulation: ${simDirection}`);
+            } else if (signal.potentialSignal !== 'hold') {
+                logger.debug(`Final signal hold – falling back to potential: ${simDirection}`);
+            } else {
+                logger.debug(`No simulation direction – both final and potential are hold`);
             }
 
             // ──────────────────────────────────────────────────────────────
-            // 5. Trigger simulation for every meaningful direction
-            //    → no extra cooldown/deduplication here
-            //    → we want frequent simulation data even when alerts are throttled
+            // 6. Trigger background simulation (fire-and-forget)
+            //    → only when there's a meaningful direction
+            //    → no cooldown here – we want frequent data for excursion cache
             // ──────────────────────────────────────────────────────────────
-            if (config.ml.trainingEnabled && directionToSimulate !== 'hold') {
-                // Create simulation signal object using the chosen direction
-                const simSignal = { ...signal, signal: directionToSimulate };
+            if (config.ml?.trainingEnabled && simDirection !== 'hold') {
+                // Build simulation signal using chosen direction
+                const simSignal: TradeSignal = {
+                    ...signal,
+                    signal: simDirection,
+                };
 
-                logger.debug(`Triggering simulation: ${symbol} → ${directionToSimulate} @ ${currentPrice.toFixed(6)} ` +
-                    `(final=${signal.signal}, potential=${signal.potentialSignal})`);
+                logger.debug(`Triggering background simulation: ${symbol} → ${simDirection} @ ${currentPrice.toFixed(6)}`);
 
-                // Fire-and-forget – simulation runs async and feeds ML
+                // Async, non-blocking – feeds ML and excursion cache
                 void this.simulateAndTrain(symbol, simSignal, currentPrice, primaryData, htfData);
             }
 
             // ──────────────────────────────────────────────────────────────
-            // 6. Alerting & live execution ONLY when final signal passed all filters
-            //    (cooldown, R:R check, etc. happen inside handleTradeSignal)
+            // 7. Alerting & live execution ONLY on approved final signal
+            //    → cooldown, R:R check, deduplication handled in handleTradeSignal
             // ──────────────────────────────────────────────────────────────
             if (signal.signal !== 'hold') {
+                logger.debug(`Final signal approved – proceeding to alert/trade: ${signal.signal}`);
                 await this.handleTradeSignal(symbol, signal, currentPrice);
+            } else {
+                logger.debug(`Final signal is hold – no alert or live trade`);
             }
 
         } catch (err) {
+            // ──────────────────────────────────────────────────────────────
+            // 8. Error handling – log but continue with other symbols
+            // ──────────────────────────────────────────────────────────────
             logger.error(`Error processing symbol ${symbol}`, {
-                error: err instanceof Error ? err.stack : String(err)
+                error: err instanceof Error ? err.stack : String(err),
+                phase: 'processSymbol',
             });
-            // Continue with other symbols – one failure shouldn't stop the scan
+            // Do NOT rethrow – one symbol failure shouldn't stop the entire scan cycle
         }
     }
 
@@ -481,60 +506,57 @@ export class MarketScanner {
     }
 
     /**
- * Handles the alerting and live execution pipeline **only for signals that passed excursion filtering**
- * (i.e. final signal === 'buy' or 'sell').
+ * Handles alerting and live execution **only** for signals that passed all filters
+ * (final signal === 'buy' or 'sell').
  *
- * This method is called **exclusively** when `signal.signal !== 'hold'`.
+ * Called exclusively from processSymbol when signal.signal !== 'hold'.
  *
- * Responsibilities (in order):
- *   1. Deduplication check (avoid sending identical alerts / opening duplicate positions)
- *   2. Risk:Reward feasibility check (optional strict gate)
- *   3. Cooldown enforcement (prevents alert/trade spam – currently ~7 minutes)
- *   4. Send Telegram alert (with full signal details)
- *   5. Execute live trade (if autoTrade is enabled)
+ * Responsibilities (in strict order):
+ *   1. Final deduplication / cooldown enforcement via CooldownService
+ *   2. Optional strict R:R feasibility check (configurable)
+ *   3. Send Telegram alert with full signal details
+ *   4. Trigger live trade execution (if config.autoTrade enabled)
  *
- * IMPORTANT:
- *   → Simulation is NO LONGER done here
- *   → All simulation logic (including skipped / potential-only cases) is now centralized in processSymbol
- *   → This method is only concerned with real-time user-visible & execution actions
+ * Important 2025 changes:
+ *   - All cooldown / deduplication now centralized in cooldownService
+ *     (no more this.lastAlertAt or this.lastSignal Maps)
+ *   - No simulation here — simulation is handled earlier in processSymbol
+ *   - Fire-and-forget style preserved for non-blocking operation
+ *   - Errors in alerting/trading are logged but do NOT block the scan
  *
- * @param symbol     Trading pair
- * @param signal     Final approved TradeSignal (signal === 'buy'|'sell')
- * @param price      Current market price
- * @param primaryData Primary timeframe OHLCV (passed for potential future use)
- * @param htf        Higher timeframe OHLCV (passed for potential future use)
+ * @param symbol Trading pair
+ * @param signal Final approved TradeSignal (signal === 'buy'|'sell')
+ * @param price Current market price
  */
     private async handleTradeSignal(
         symbol: string,
         signal: TradeSignal,
         price: number,
     ): Promise<void> {
-        // Safety: this method should never be called with hold
+        // Safety guard – this method should never be called with 'hold'
         if (signal.signal === 'hold') {
             logger.warn(`handleTradeSignal called with hold signal for ${symbol} – this should not happen`);
             return;
         }
 
-        const now = Date.now();
-
         // ──────────────────────────────────────────────────────────────
-        // 1. Deduplication: avoid sending the exact same alert / trade setup repeatedly
-        //    (same direction, very similar price, same stop-loss)
+        // 1. Final Cooldown / Deduplication Check
+        //    Uses centralized cooldownService (memory or DB backend)
         // ──────────────────────────────────────────────────────────────
-        const last = this.lastSignal[symbol];
-        if (
-            last &&
-            last.signal.signal === signal.signal &&
-            Math.abs(last.price - price) < 1e-6 &&
-            Math.abs((last.signal.stopLoss ?? 0) - (signal.stopLoss ?? 0)) < 1e-6
-        ) {
-            logger.debug(`Identical signal deduplicated for ${symbol} @ ${price.toFixed(6)}`);
+        if (await cooldownService.isActive(symbol)) {
+            logger.debug(`handleTradeSignal skipped – ${symbol} still on cooldown`);
             return;
         }
 
+        // Set cooldown immediately after passing check
+        // (prevents duplicate calls in race conditions)
+        await cooldownService.setCooldown(symbol);
+
+        logger.debug(`Cooldown set for ${symbol} – proceeding to alert/trade`);
+
         // ──────────────────────────────────────────────────────────────
         // 2. Optional strict R:R feasibility check
-        //    If disabled in config → we still proceed (soft gate)
+        //    Config-controlled soft/hard gate
         // ──────────────────────────────────────────────────────────────
         let rrValid = true;
 
@@ -550,77 +572,46 @@ export class MarketScanner {
             rrValid = risk > 0 && (reward / risk) >= (config.strategy.riskRewardTarget - 0.1);
 
             if (!rrValid) {
-                logger.info(`Poor R:R ratio – skipping alert & trade`, {
-                    symbol,
+                logger.info(`Poor R:R ratio – skipping alert & trade for ${symbol}`, {
                     direction: signal.signal,
-                    rrAchieved: reward / risk,
+                    rrAchieved: (reward / risk).toFixed(2),
                     rrRequired: config.strategy.riskRewardTarget,
-                    stop: signal.stopLoss,
-                    target: signal.takeProfit
+                    stop: signal.stopLoss?.toFixed(6),
+                    target: signal.takeProfit?.toFixed(6),
                 });
                 return;
             }
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 3. Cooldown check – protects against alert/trade spam
-        //    Uses either database or in-memory backend (configurable)
-        // ──────────────────────────────────────────────────────────────
-        let shouldProceed = true;
-
-        if (this.opts.cooldownBackend === 'database') {
-            const { lastTradeAt } = await dbService.getCoolDown(symbol);
-            if (lastTradeAt && (now - lastTradeAt) < this.opts.cooldownMs) {
-                shouldProceed = false;
-                logger.debug(`Cooldown active (DB) for ${symbol} – no alert/trade`);
-            } else {
-                await dbService.upsertCoolDown(symbol, now);
-            }
-        } else {
-            // Memory backend
-            const lastAlertTime = this.lastAlertAt[symbol] ?? 0;
-            if ((now - lastAlertTime) < this.opts.cooldownMs) {
-                shouldProceed = false;
-                logger.debug(`Cooldown active (memory) for ${symbol} – no alert/trade`);
-            } else {
-                this.lastAlertAt[symbol] = now;
-            }
-        }
-
-        if (!shouldProceed) {
-            return;
-        }
-
-        // ──────────────────────────────────────────────────────────────
-        // 4. Send Telegram alert – visible action for the user
+        // 3. Send Telegram alert – main user-visible action
         // ──────────────────────────────────────────────────────────────
         if (this.telegramService) {
             try {
                 await this.telegramService.sendSignalAlert(symbol, signal, price);
                 logger.info(`Telegram alert sent successfully for ${symbol} (${signal.signal})`);
             } catch (alertErr) {
-                logger.error(`Failed to send Telegram alert for ${symbol}`, { error: alertErr });
-                // Do NOT return – we still want to try live trading if enabled
+                logger.error(`Failed to send Telegram alert for ${symbol}`, {
+                    error: alertErr instanceof Error ? alertErr.message : String(alertErr),
+                });
+                // Continue – do NOT return; we still want to attempt live trade if enabled
             }
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 5. Remember this signal for future deduplication
-        // ──────────────────────────────────────────────────────────────
-        this.lastSignal[symbol] = { signal, price };
-
-        // ──────────────────────────────────────────────────────────────
-        // 6. Execute live trade (if enabled in config)
-        //    Fire-and-forget – execution is handled by AutoTradeService
+        // 4. Execute live trade (fire-and-forget)
+        //    Only if autoTrade is enabled in config
         // ──────────────────────────────────────────────────────────────
         if (config.autoTrade) {
             logger.info(`Initiating live trade execution for ${symbol} (${signal.signal})`);
             void this.autoTradeService.execute(signal);
-            // No await – we don't want to block the scanner loop
+            // No await – must not block scanner loop
         }
 
-        // Success path – everything that should happen, happened
-        logger.debug(`handleTradeSignal completed for ${symbol} (${signal.signal})`);
+        // ──────────────────────────────────────────────────────────────
+        // Success – log completion
+        // ──────────────────────────────────────────────────────────────
+        logger.debug(`handleTradeSignal completed successfully for ${symbol} (${signal.signal})`);
     }
 
     // =========================================================================
@@ -748,11 +739,6 @@ export class MarketScanner {
 
         // Process each alert independently
         for (const alert of alerts) {
-            // Cooldown check (DB backend only – more reliable across restarts)
-            if (this.opts.cooldownBackend === 'database' && alert.lastAlertAt && now - alert.lastAlertAt < this.opts.cooldownMs) {
-                continue;
-            }
-
             try {
                 // Fetch data for alert's specific symbol and timeframe
                 const data = await this.exchangeService.getOHLCV(alert.symbol, alert.timeframe || '1h');
