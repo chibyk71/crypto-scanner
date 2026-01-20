@@ -237,6 +237,8 @@ export const config = {
         scanIntervalMs: rawConfig.SCAN_INTERVAL_MS,
         /** Send heartbeat every N cycles */
         heartBeatInterval: rawConfig.HEARTBEAT_INTERVAL,
+
+        signalCooldownMs: 15 * 60 * 1000,
     },
 
     // =========================================================================
