@@ -110,7 +110,7 @@ async function releaseDatabaseLock(): Promise<void> {
  * @param options - Configuration options for lock type, scanner mode, and retries.
  * @throws {Error} If initialization fails after maximum retries.
  */
-export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic', maxRetries: MAX_RETRIES }):  Promise<() => Promise<never>> {
+export async function startWorker(options: WorkerOptions = { lockType: 'file', scannerMode: 'periodic', maxRetries: MAX_RETRIES }): Promise<() => Promise<never>> {
     const { lockType = 'file', scannerMode = 'periodic', maxRetries = MAX_RETRIES } = options;
     let lockAcquired = false;
 
@@ -150,7 +150,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
 
     const exchange = new ExchangeService();
     const mlService = new MLService();
-    const strategy = new Strategy(mlService, 3);
+    const strategy = new Strategy(mlService);
     let telegram: TelegramBotController | null = null;
     let scanner: MarketScanner | null = null;
     let supportedSymbols: string[] = [];
@@ -188,7 +188,6 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             mode: scannerMode,
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,
-            cooldownMs: 5 * 60_000,
             jitterMs: 250,
             retries: 1,
             heartbeatCycles: config.scanner.heartBeatInterval ?? 60,
