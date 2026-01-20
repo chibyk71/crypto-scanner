@@ -1851,6 +1851,29 @@ export class TelegramBotController {
         }, 5 * 60 * 1000);
     }
 
+    /**
+ * Sends a formatted Telegram alert for a generated signal.
+ *
+ * Handles both normal and reversed signals, includes:
+ *   - Signal header & key levels
+ *   - Confidence & ML scores
+ *   - Real-time regime summary (samples, ratio, warnings)
+ *   - Fresh excursion advice
+ *   - Strategy reasons
+ *
+ * Improvements in 2025 version:
+ *   - Uses regimeLite when possible (smaller payload)
+ *   - Better MarkdownV2 escaping (handles more edge cases)
+ *   - Cleaner conditional sections
+ *   - Uses new outcome fields (slStreak, timeoutRatio) for warnings
+ *   - Visual improvements: bold sections, consistent emoji usage
+ *   - Safety: no crash on missing regime or bad data
+ *
+ * @param symbol Trading pair
+ * @param signal Final TradeSignal (buy/sell/hold)
+ * @param price Current price
+ * @param reversalInfo Optional reversal context (from strategy or auto-trade)
+ */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
@@ -1861,77 +1884,136 @@ export class TelegramBotController {
             reversalReason: string;
         }
     ): Promise<void> {
-        const escape = (s: string) => s.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+        // Safe escape function for MarkdownV2 (Telegram is very picky)
+        const escape = (s: string | number | undefined): string => {
+            if (s === undefined || s === null) return '';
+            const str = String(s);
+            return str.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+        };
 
-        const lines = [
-            `**${signal.signal.toUpperCase()} SIGNAL** ${signal.signal !== 'hold' ? '🚀' : '🟡'}`,
-            `**Symbol:** ${escape(symbol)}`,
-            `**Price:** $${escape(price.toFixed(8))}`,
-            signal.confidence ? `**Confidence:** ${escape(signal.confidence.toFixed(1))}%` : '',
-            signal.stopLoss ? `**SL:** $${escape(signal.stopLoss.toFixed(8))}` : '',
-            signal.takeProfit ? `**TP:** $${escape(signal.takeProfit.toFixed(8))} \\(≈${escape(config.strategy.riskRewardTarget + '')}R\\)` : '',
-            signal.mlConfidence ? `**ML Confidence:** ${escape(signal.mlConfidence.toFixed(1))}%` : '',
-            signal.trailingStopDistance ? `**Trail:** $${escape(signal.trailingStopDistance.toFixed(8))}` : '',
-        ].filter(Boolean);
+        const lines: string[] = [];
 
-        // Auto-reversal header (from AutoTradeService or Strategy if reversed)
+        // ── Header: Signal type + emoji + reversal banner ───────────────────────────
+        const signalEmoji = signal.signal === 'buy' ? '🟢 LONG' : signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
+        lines.push(`**${signalEmoji} SIGNAL**`);
+
         if (reversalInfo?.wasReversed) {
-            lines.unshift('');
-            lines.unshift(`⚠️ **AUTO\\-REVERSED**: Original ${reversalInfo.originalSignal.toUpperCase()} → ${signal.signal.toUpperCase()}`);
-            lines.unshift(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
+            lines.push(
+                `⚠️ **AUTO-REVERSED** — Original: **${reversalInfo.originalSignal.toUpperCase()}** → **${signal.signal.toUpperCase()}**`
+            );
+            lines.push(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
+            lines.push('');
         }
 
-        // Real-time regime summary
-        const regime = excursionCache.getRegime(symbol);
+        // ── Core info ────────────────────────────────────────────────────────────────
+        lines.push(`**Symbol:** ${escape(symbol)}`);
+        lines.push(`**Price:** $${escape(price.toFixed(6))}`);
 
-        if (regime != null && regime.recentSampleCount > 0) {
-            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
+        if (signal.confidence > 0) {
+            lines.push(`**Confidence:** ${escape(signal.confidence.toFixed(1))}%`);
+        }
+
+        if (signal.mlConfidence !== undefined) {
+            lines.push(`**ML Confidence:** ${escape(signal.mlConfidence.toFixed(1))}%`);
+        }
+
+        if (signal.stopLoss) {
+            lines.push(`**SL:** $${escape(signal.stopLoss.toFixed(6))}`);
+        }
+
+        if (signal.takeProfit) {
+            const rrApprox = signal.takeProfit && signal.stopLoss
+                ? Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
+                : config.strategy.riskRewardTarget.toString();
+            lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${rrApprox}R\\)`);
+        }
+
+        if (signal.trailingStopDistance) {
+            lines.push(`**Trailing:** $${escape(signal.trailingStopDistance.toFixed(6))}`);
+        }
+
+        // ── Regime Summary (use Lite version when possible) ──────────────────────────
+        const regime = excursionCache.getRegimeLite(symbol) || excursionCache.getRegime(symbol);
+
+        if (regime && regime.recentSampleCount > 0) {
             lines.push('');
-            lines.push(`**Current Regime \\(last \\~3h \\+ live\\)${liveNote}** 📊`);
-            lines.push(escape(`• Samples: ${regime.recentSampleCount} | Reversals: ${regime.recentReverseCount}`));
-            lines.push(escape(`• MFE: ${regime.recentMfe.toFixed(2)}% | MAE: ${regime.recentMae.toFixed(2)}% → Ratio: ${regime.recentExcursionRatio.toFixed(2)}`));
+            lines.push('**Regime Summary** 📊');
 
-            if (regime.recentExcursionRatio < 1.0) {
-                lines.push('→ Low reward phase — consider early profit taking or fading');
-            } else if (regime.recentExcursionRatio > 2.0) {
-                lines.push('→ Strong reward phase — favorable excursions');
-            } else {
-                lines.push('→ Balanced regime — standard risk management');
+            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
+            lines.push(`Samples: **${regime.recentSampleCount}${liveNote}** | Reversals: **${regime.recentReverseCount}**`);
+
+            lines.push(`MFE: **${regime.recentMfe.toFixed(2)}%** | MAE: **${regime.recentMae.toFixed(2)}%**`);
+            lines.push(`Ratio: **${regime.recentExcursionRatio.toFixed(2)}**`);
+
+            // Outcome-based warnings (new 2025 fields)
+            const { tp, partial_tp, sl, timeout } = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
+            const total = tp + partial_tp + sl + timeout;
+            if (total > 0) {
+                const slRatio = sl / total;
+                if (slRatio > 0.6 || sl >= 3) {
+                    lines.push(`⚠️ **High SL rate** (${sl}/${total}) — caution advised`);
+                }
+                if (timeout / total > 0.5 || timeout >= 3) {
+                    lines.push(`⚠️ **Choppy market** (${timeout} timeouts) — possible ranging`);
+                }
             }
 
-            if (regime.recentReverseCount >= 3) {
-                lines.push('⚠️ High reversal risk — possible mean\\-reversion detected');
-            } else if (regime.recentReverseCount >= 2) {
-                lines.push('🟡 Moderate reversal activity — monitor closely');
+            // SL streak warning
+            if (regime.slStreak >= 2) {
+                lines.push(`⚠️ **Consecutive SL detected** (${regime.slStreak}) — trend may be strong against`);
+            }
+
+            // Ratio interpretation
+            if (regime.recentExcursionRatio < 0.8) {
+                lines.push('→ Low reward:risk — consider early exits or skip');
+            } else if (regime.recentExcursionRatio > 2.5) {
+                lines.push('→ Strong reward phase — favorable conditions');
             }
         } else {
             lines.push('');
-            lines.push('**No recent regime data** — first signal for this symbol');
+            lines.push('**No recent regime data** — first signal or limited history');
         }
 
-        // Excursion Insight: Always compute fresh from current regime + final signal direction
-        let finalExcursionAdvice = '';
-        if (regime != null && regime.recentSampleCount > 0) {
-            const direction = signal.signal === 'buy' ? 'long' : 'short';
-            finalExcursionAdvice = getExcursionAdvice(regime, direction).advice;
-        }
+        // ── Fresh Excursion Advice ──────────────────────────────────────────────────
+        if (regime && regime.recentSampleCount >= 2) {
+            const dir = signal.signal === 'buy' ? 'long' : 'short';
+            const adviceObj = getExcursionAdvice(regime, dir);
 
-        if (finalExcursionAdvice) {
             lines.push('');
-            lines.push(`**Excursion Insight:** ${escape(finalExcursionAdvice)}`);
+            lines.push(`**Excursion Advice:** ${escape(adviceObj.advice)}`);
+
+            // Show adjustments if meaningful
+            const adj = adviceObj.adjustments;
+            const adjParts: string[] = [];
+            if (adj.slMultiplier !== 1) adjParts.push(`SL ×${adj.slMultiplier.toFixed(2)}`);
+            if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${adj.tpMultiplier.toFixed(2)}`);
+            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${adj.confidenceBoost.toFixed(2)}`);
+
+            if (adjParts.length > 0) {
+                lines.push(`**Adjustments:** ${adjParts.join(' | ')}`);
+            }
         }
 
-        // Reasons from Strategy (includes excursion advice if added there)
+        // ── Strategy Reasons ─────────────────────────────────────────────────────────
         if (signal.reason.length > 0) {
             lines.push('');
-            lines.push('**Reasons:**');
+            lines.push('**Signal Reasons:**');
             signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
         }
 
-        await this.sendMessage(lines.join('\n'), { parse_mode: 'MarkdownV2' })
-            .catch((e) => {
-                logger.error('Error sending signal alert to Telegram', { symbol, error: e });
+        // ── Send message with proper MarkdownV2 parsing ─────────────────────────────
+        const message = lines.join('\n');
+
+        try {
+            await this.sendMessage(message, { parse_mode: 'MarkdownV2' });
+            logger.info(`Signal alert sent for ${symbol} (${signal.signal})`);
+        } catch (err) {
+            logger.error('Failed to send signal alert', {
+                symbol,
+                signal: signal.signal,
+                error: err instanceof Error ? err.message : String(err),
             });
+        }
     }
 
     /**
