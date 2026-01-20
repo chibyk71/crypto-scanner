@@ -120,7 +120,6 @@ export async function simulateTrade(
     }
 
     const isLong = signal.signal === 'buy';
-    const direction: 'buy' | 'sell' = signal.signal === 'buy' ? 'buy' : 'sell';
     const hasTrailing = !!signal.trailingStopDistance;
 
     // Current stop-loss (updated dynamically if trailing)
@@ -141,8 +140,6 @@ export async function simulateTrade(
     const startTime = Date.now();
     const timeoutMs = 60 * 60 * 1000;                    // 1 hour maximum simulation duration
     const pollIntervalMs = ExchangeService.toTimeframeMs(config.scanner.primaryTimeframe);
-    const INTERIM_UPDATE_INTERVAL_MS = 5 * 60 * 1000;    // Update recent stats every 5 minutes
-    let lastInterimUpdateTime = startTime;
 
     // =========================================================================
     // 1. Prepare TP levels for DB storage (if any)
@@ -173,14 +170,6 @@ export async function simulateTrade(
         stopLoss: currentStopLoss?.toFixed(8) ?? 'none',
         trailing: hasTrailing,
     });
-
-    // === ADD THIS: Register in in-memory cache ===
-    excursionCache.updateOrAdd(symbol, signalId, {
-        direction,
-        mfe: 0,
-        mae: 0,
-        timestamp: startTime,
-    }, true);
 
     // =========================================================================
     // 3. Main Simulation Loop – runs until exit or timeout
@@ -269,9 +258,6 @@ export async function simulateTrade(
                             pnlThis: (pnlThisLevel * 100).toFixed(2),
                             remaining: remainingPosition.toFixed(3),
                         });
-
-                        // Optional: interim update on partial close
-                        void triggerInterimUpdate();
                     }
                 }
 
@@ -337,13 +323,6 @@ export async function simulateTrade(
                 }
             }
 
-            // Interim Excursion Update (every 5 minutes)
-            const now = Date.now();
-            if (now - lastInterimUpdateTime >= INTERIM_UPDATE_INTERVAL_MS) {
-                lastInterimUpdateTime = now;
-                await triggerInterimUpdate();
-            }
-
             await sleep(pollIntervalMs);
         } catch (err) {
             logger.error('Error in simulation loop', { symbol, signalId, error: err });
@@ -388,45 +367,6 @@ export async function simulateTrade(
         maxFavorablePrice,
         maxAdversePrice
     );
-
-    // =========================================================================
-    // Helper: Update in-memory cache with current interim excursion state
-    // =========================================================================
-    /**
-     * Updates the global in-memory cache with the current MFE/MAE of this running simulation.
-     * Called every ~5 minutes during the simulation loop.
-     * Enables real-time regime awareness for new signals on the same symbol.
-     */
-    async function triggerInterimUpdate(): Promise<void> {
-        // Compute current excursions as percentages
-        const currentMfePct = isLong
-            ? ((maxFavorablePrice - entryPrice) / entryPrice) * 100
-            : ((entryPrice - maxFavorablePrice) / entryPrice) * 100;
-
-        const rawMaePct = isLong
-            ? ((entryPrice - maxAdversePrice) / entryPrice) * 100
-            : ((maxAdversePrice - entryPrice) / entryPrice) * 100;
-
-        // MAE is negative by convention
-        const currentMaePct = -Math.abs(rawMaePct);
-
-        // Bound extreme values (safety)
-        const boundedMfe = Math.max(0, Math.min(1000, currentMfePct));
-        const boundedMae = Math.max(-1000, Math.min(0, currentMaePct));
-
-        // Update the in-memory cache
-        excursionCache.updateOrAdd(symbol, signalId, {
-            mfe: boundedMfe,
-            mae: boundedMae,
-        }, true);
-
-        logger.debug(`[SIM] Interim excursion cached`, {
-            signalId,
-            symbol,
-            mfePct: boundedMfe.toFixed(2),
-            maePct: boundedMae.toFixed(2),
-        });
-    }
 }
 
 /**
@@ -536,7 +476,9 @@ async function finalizeSimulation(
         durationMs: Date.now() - startTime,  // Assuming startTime from outer scope
         mfe: boundedMfePct,
         mae: boundedMaePct,
-    }, false);
+        direction: isLong ? 'buy' : 'sell',
+
+    });
 
     // =========================================================================
     // 7. Comprehensive logging
