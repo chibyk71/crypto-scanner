@@ -737,13 +737,62 @@ class DatabaseService {
      * @param symbol - Trading pair (e.g., 'BTC/USDT')
      * @param lastTradeAt - Unix millisecond timestamp of last action
      */
-    public async upsertCoolDown(symbol: string, lastTradeAt: number): Promise<void> {
-        // Insert new row or update existing one with new timestamp
-        // onDuplicateKeyUpdate handles both cases safely (no race conditions)
-        await this.db.insert(coolDownTable)
-            .values({ symbol, lastTradeAt })
-            .onDuplicateKeyUpdate({ set: { lastTradeAt } })
-            .execute();
+    /**
+ * Upserts (insert or update) a cooldown entry for a given symbol.
+ *
+ * This method is the single source of truth for updating the `lastTradeAt`
+ * timestamp in the cooldown table. It uses MySQL's `ON DUPLICATE KEY UPDATE`
+ * syntax to handle both insert and update cases in one atomic operation.
+ *
+ * Key guarantees:
+ *   - Atomic & race-condition safe (no double-insert or lost updates)
+ *   - Works correctly even if the row doesn't exist yet
+ *   - Uses current timestamp if none provided (most common usage)
+ *   - Logs on error but does not throw (fail-open for cooldown)
+ *
+ * @param symbol     - Trading pair (e.g. 'BTC/USDT') – should already be normalized
+ * @param lastTradeAt - Unix timestamp (ms) when the last trade/alert occurred
+ *                     If omitted, uses Date.now()
+ */
+    public async upsertCoolDown(symbol: string, lastTradeAt: number = Date.now()): Promise<void> {
+        try {
+            // Safety: ensure we have a valid positive timestamp
+            if (!Number.isFinite(lastTradeAt) || lastTradeAt <= 0) {
+                logger.warn('Invalid lastTradeAt provided to upsertCoolDown – using current time', {
+                    symbol,
+                    received: lastTradeAt,
+                    fallback: Date.now(),
+                });
+                lastTradeAt = Date.now();
+            }
+
+            await this.db
+                .insert(coolDownTable)
+                .values({
+                    symbol,
+                    lastTradeAt,
+                })
+                .onDuplicateKeyUpdate({
+                    set: {
+                        lastTradeAt,
+                    },
+                })
+                .execute();
+
+            logger.debug('Cooldown upserted successfully', {
+                symbol,
+                lastTradeAt: new Date(lastTradeAt).toISOString(),
+            });
+        } catch (err) {
+            // Fail-open: log but do NOT throw
+            // If DB write fails, we prefer to allow the alert/trade than block everything
+            logger.error('Failed to upsert cooldown entry', {
+                symbol,
+                lastTradeAt: new Date(lastTradeAt).toISOString(),
+                error: err instanceof Error ? err.message : String(err),
+                stack: err instanceof Error ? err.stack : undefined,
+            });
+        }
     }
 
     // =========================================================================
@@ -1201,11 +1250,9 @@ class DatabaseService {
         activeCount: number;
         mfeLong: number;
         maeLong: number;
-        winRateLong: number;
         sampleCountLong: number;
         mfeShort: number;
         maeShort: number;
-        winRateShort: number;
         sampleCountShort: number;
     }> {
         // ── 1. Fetch lightweight regime from cache (fast path) ───────────────────────
@@ -1224,11 +1271,9 @@ class DatabaseService {
                 activeCount: 0,
                 mfeLong: 0,
                 maeLong: 0,
-                winRateLong: 0,
                 sampleCountLong: 0,
                 mfeShort: 0,
                 maeShort: 0,
-                winRateShort: 0,
                 sampleCountShort: 0,
             };
         }
@@ -1255,13 +1300,11 @@ class DatabaseService {
             // Directional long (buy)
             mfeLong: regime.recentMfeLong ?? 0,
             maeLong: regime.recentMaeLong ?? 0,
-            winRateLong: regime.recentWinRateLong ?? 0,
             sampleCountLong: regime.recentSampleCountLong ?? 0,
 
             // Directional short (sell)
             mfeShort: regime.recentMfeShort ?? 0,
             maeShort: regime.recentMaeShort ?? 0,
-            winRateShort: regime.recentWinRateShort ?? 0,
             sampleCountShort: regime.recentSampleCountShort ?? 0,
         };
 
