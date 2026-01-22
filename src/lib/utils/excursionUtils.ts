@@ -43,198 +43,180 @@ export interface ExcursionAdvice {
 }
 
 /**
- * Analyzes the current excursion regime and provides actionable trading advice for a given direction.
+ * Analyzes the current excursion regime and provides actionable trading advice.
  *
- * Updated 2025 logic:
- *   - Minimum trusted samples lowered to 2
- *   - Outcome counts and slStreak drive early warnings (not hard blocks)
- *   - Extreme adverse ratio triggers reverse — but overridden by consecutive SL
- *   - Warnings added to advice instead of always skipping
- *   - Confidence penalties applied on risky outcome patterns
+ * 2025 logic – strictly following user-specified rules:
  *
- * Goals:
- *   - Favor directions with historically good reward/risk
- *   - Protect capital with warnings on high SL or choppy (timeout-heavy) regimes
- *   - Suggest reversal on extreme adverse excursions — but avoid fighting strong trends (consec SL)
- *   - Always provide readable explanations + adjustment multipliers
+ * 1. Consecutive SL > 2 + MAE significant + MAE >> MFE → reverse
+ * 2. High SL count (≥3 and > wins) even if not consecutive → warn, no reverse
+ * 3. Consecutive or dominant TP (including partial) + good MFE → strong take
+ * 4. Mostly timeouts → check pure excursions (MFE good → take; MAE bad → take+warn)
+ * 5. All other cases → hold
  *
- * @param regime - Current regime (full or lite) from excursionCache
- * @param direction - Trade direction to evaluate ('long' | 'short')
- * @returns Advice object with human-readable string, adjustments, and final action
+ * @param regime    Current regime (full or lite)
+ * @param direction Trade direction to evaluate
  */
 export function getExcursionAdvice(
-    regime: ExcursionRegime,
+    regime: ExcursionRegime | ExcursionRegimeLite,
     direction: 'long' | 'short'
 ): ExcursionAdvice {
-    // ── DEFAULTS: Start conservative ─────────────────────────────────────────────
-    let advice = '⚪ Neutral / insufficient data – skipping';
+    // ── DEFAULTS ────────────────────────────────────────────────────────────────
+    let advice = '⚪ No clear regime signal – holding';
     let action: ExcursionAction = 'skip';
     let adjustments = {
         slMultiplier: 1.0,
         tpMultiplier: 1.0,
-        confidenceBoost: -0.10,
+        confidenceBoost: 0.0,
     };
 
-    // ── CONFIGURATION: Tunable thresholds (move to config later if needed) ────────
-    const MAX_MAE_PCT = config.strategy?.maxMaePct ?? 3.0;
-    const MIN_SAMPLES = 2;                      // lowered per 2025 plan
-    const MIN_MFE_PCT = 0.5;
-    const MIN_RATIO = 2.0;                      // relaxed from 2.5
-    const MIN_GAP_PCT = 0.20;
-    const EXTREME_RATIO_THRESHOLD = 0.6;        // ratio < 0.6 → adverse dominance
-    const MIN_GAP_FOR_EXTREME = 0.5;            // |MAE| must exceed MFE by at least this
-    const HIGH_SL_COUNT = 3;                    // ≥3 SL → strong warning
-    const HIGH_TIMEOUT_COUNT = 3;               // ≥3 timeouts → choppy market warning
-    const HIGH_TIMEOUT_RATIO = 0.5;             // >50% timeouts → ranging warning
-    const MAX_SAFE_REVERSALS = 1;
-    const MIN_REVERSALS_FOR_REVERSE = 2;
+    // ── CONFIG THRESHOLDS ───────────────────────────────────────────────────────
+    const MIN_SAMPLES = 2;
+    const MIN_MFE_PCT = 0.4;   // lowered a bit – more forgiving
+    const MIN_MAE_PCT = 0.2;   // MAE must be meaningful to trigger risk
+    const EXTREME_RATIO = 2.65;  // MFE/|MAE| < 0.65 → MAE dominates * 0.65
+    const SIGNIFICANT_GAP = 0.2;   // |MAE| > MFE + this amount → strong dominance * 1.2
+    const HIGH_SL_COUNT = 3;
+    const CONSECUTIVE_SL = 2;     // >2 means ≥3
+    const DOMINANT_TP_COUNT = 2;
 
-    // ── STEP 1: Early guard – insufficient data? ─────────────────────────────────
+    // ── STEP 1: Data guard – too few samples? ───────────────────────────────────
     if (!ExcursionHistoryCache.hasEnoughSamples(regime, MIN_SAMPLES)) {
-        advice = `⚠️ Too few recent samples (${regime.recentSampleCount ?? 0}/${MIN_SAMPLES}) – cautious skip`;
-        adjustments.confidenceBoost = -0.25;
-        action = 'skip';
-        return { advice, adjustments, action };
+        advice = `⚠️ Too few samples (${regime.recentSampleCount ?? 0}/${MIN_SAMPLES}) – holding`;
+        adjustments.confidenceBoost = -0.20;
+        return { advice, adjustments, action: 'skip' };
     }
 
-    // ── STEP 2: Select directional or overall metrics ────────────────────────────
-    let selectedMfe = regime.recentMfe ?? 0;
-    let selectedMae = regime.recentMae ?? 0;
-    let selectedSamples = regime.recentSampleCount ?? 0;
-    let selectedReversals = regime.recentReverseCount ?? 0;
-    let sourceLabel = 'overall-recent';
+    // ── STEP 2: Directional / overall selection ─────────────────────────────────
+    let mfe = regime.recentMfe ?? 0;
+    let mae = regime.recentMae ?? 0;
+    let samples = regime.recentSampleCount ?? 0;
+    let source = 'overall';
 
     if (direction === 'long' && (regime.recentSampleCountLong ?? 0) >= MIN_SAMPLES) {
-        selectedMfe = regime.recentMfeLong ?? selectedMfe;
-        selectedMae = regime.recentMaeLong ?? selectedMae;
-        selectedSamples = regime.recentSampleCountLong ?? selectedSamples;
-        selectedReversals = regime.recentReverseCount ?? selectedReversals;
-        sourceLabel = 'long-directional';
+        mfe = regime.recentMfeLong ?? mfe;
+        mae = regime.recentMaeLong ?? mae;
+        samples = regime.recentSampleCountLong ?? samples;
+        source = 'long';
     } else if (direction === 'short' && (regime.recentSampleCountShort ?? 0) >= MIN_SAMPLES) {
-        selectedMfe = regime.recentMfeShort ?? selectedMfe;
-        selectedMae = regime.recentMaeShort ?? selectedMae;
-        selectedSamples = regime.recentSampleCountShort ?? selectedSamples;
-        selectedReversals = regime.recentReverseCount ?? selectedReversals;
-        sourceLabel = 'short-directional';
+        mfe = regime.recentMfeShort ?? mfe;
+        mae = regime.recentMaeShort ?? mae;
+        samples = regime.recentSampleCountShort ?? samples;
+        source = 'short';
     }
 
-    // ── STEP 3: Early outcome-based warnings (before metrics) ─────────────────────
-    const outcomeCounts = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
-    const slCount = outcomeCounts.sl;
-    const tpCount = outcomeCounts.tp + outcomeCounts.partial_tp;
-    const timeoutCount = outcomeCounts.timeout;
-    const timeoutRatio = regime.timeoutRatio ?? 0;
+    const absMae = Math.abs(mae);
+    const ratio = ExcursionHistoryCache.computeExcursionRatio(mfe, mae);
+    // const gap = mfe - absMae;
 
-    let warningParts: string[] = [];
+    // ── STEP 3: Outcome counts & streaks ────────────────────────────────────────
+    const oc = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
+    const tpCount = oc.tp + oc.partial_tp;
+    const slCount = oc.sl;
+    const timeoutCount = oc.timeout;
+    const total = tpCount + slCount + timeoutCount;
 
-    // High SL count → warning + confidence penalty, but still allow 'take'
-    if (slCount > tpCount || slCount >= HIGH_SL_COUNT) {
-        warningParts.push(`High SL rate (${slCount}/${selectedSamples})`);
-        adjustments.confidenceBoost -= 0.15;
-    }
+    const timeoutRatio = total > 0 ? timeoutCount / total : 0;
 
-    // High timeouts → choppy/ranging market warning
-    if (timeoutCount >= HIGH_TIMEOUT_COUNT || timeoutRatio > HIGH_TIMEOUT_RATIO) {
-        warningParts.push(`Many timeouts (${timeoutCount}/${selectedSamples} – possible ranging)`);
-        adjustments.confidenceBoost -= 0.10;
-    }
-
-    // ── STEP 4: Get SL streak (prefer precomputed, fallback to manual count) ──────
+    // SL streak (prefer precomputed)
     let slStreak = regime.slStreak ?? 0;
-    if (slStreak === 0 && regime.historyJson) {
-        // Manual fallback (newest first)
+    if (slStreak === 0 && 'historyJson' in regime && regime.historyJson) {
         for (const e of regime.historyJson) {
             if (e.outcome === 'sl') slStreak++;
             else break;
         }
     }
 
-    if (slStreak >= 2) {
-        warningParts.push(`Consecutive SL detected (${slStreak}) – reversal may be risky`);
-        adjustments.confidenceBoost -= 0.10;
-    }
+    // ── STEP 4: Decision tree – exact rules as requested ────────────────────────
+    let warnings: string[] = [];
 
-    // ── STEP 5: Core metrics ─────────────────────────────────────────────────────
-    const absMae = Math.abs(selectedMae);
-    const ratio = ExcursionHistoryCache.computeExcursionRatio(selectedMfe, selectedMae);
-    const gap = selectedMfe - absMae;
-
-    // ── STEP 6: Excessive drawdown guard (still strongest safety check) ──────────
-    if (absMae > MAX_MAE_PCT) {
-        advice = `🔴 Dangerous drawdown risk (|MAE| ${absMae.toFixed(2)}% > ${MAX_MAE_PCT}%)`;
-        adjustments.slMultiplier = 0.70;
-        adjustments.tpMultiplier = 0.80;
-        adjustments.confidenceBoost = -0.30;
-        action = 'skip';
-        if (warningParts.length) advice += ` | ${warningParts.join(' | ')}`;
+    // Rule 1: Consecutive SL dominant + bad excursion → reverse
+    if (
+        slStreak >= CONSECUTIVE_SL &&
+        absMae >= MIN_MAE_PCT &&
+        (ratio < EXTREME_RATIO || absMae > mfe + SIGNIFICANT_GAP)
+    ) {
+        advice = `🔴 Consecutive SL (${slStreak}) + extreme adverse excursion → taking`;
+        action = 'take';
+        adjustments = {
+            slMultiplier: 0.80,
+            tpMultiplier: 1.15,
+            confidenceBoost: 0.05,
+        };
         return { advice, adjustments, action };
     }
 
-    // ── STEP 7: Main decision tree (strongest signals first) ─────────────────────
-    let baseAdvice = `(${sourceLabel}) Samples: ${selectedSamples} | Ratio: ${ratio.toFixed(2)}`;
+    // Rule 2: High SL count (even non-consecutive) → warn only, no reverse
+    if (slCount >= HIGH_SL_COUNT && slCount > tpCount) {
+        warnings.push(`High SL count (${slCount}/${total}) – caution`);
+        adjustments.confidenceBoost -= 0.20;
 
-    if (
-        selectedMfe >= MIN_MFE_PCT &&
-        ratio >= MIN_RATIO &&
-        gap >= MIN_GAP_PCT &&
-        selectedReversals <= MAX_SAFE_REVERSALS
-    ) {
-        // Strong positive profile
-        advice = `🟢 Strong profile | ${baseAdvice} | Gap: +${gap.toFixed(2)}%`;
+        // Still allow take only if MFE is reasonable
+        if (mfe >= MIN_MFE_PCT && ratio > 0.9) {
+            action = 'take';
+            advice = `🟠 High SL (${slCount}) but acceptable MFE → taking with caution`;
+        } else {
+            action = 'skip';
+            advice = `🟠 High SL (${slCount}) + weak MFE → holding`;
+        }
+    }
+
+    // Rule 3: Consecutive or dominant TP → strong take if MFE good
+    const hasConsecutiveTP = (() => {
+        if (!('historyJson' in regime) || !regime.historyJson) return false;
+        let streak = 0;
+        for (const e of regime.historyJson) {
+            if (e.outcome === 'tp' || e.outcome === 'partial_tp') streak++;
+            else break;
+        }
+        return streak >= 2;
+    })();
+
+    const tpDominant = tpCount >= DOMINANT_TP_COUNT && tpCount > slCount && tpCount > timeoutCount;
+
+    if ((hasConsecutiveTP || tpDominant) && mfe >= MIN_MFE_PCT && ratio > 1.5) {
+        advice = `🟢 ${hasConsecutiveTP ? 'Consecutive' : 'Dominant'} TP (${tpCount}) + strong MFE → take`;
         action = 'take';
         adjustments = {
-            slMultiplier: 1.15,
-            tpMultiplier: 1.25,
-            confidenceBoost: 0.20,
+            slMultiplier: 1.20,
+            tpMultiplier: 1.35,
+            confidenceBoost: 0.25,
         };
-    } else if (
-        ratio < EXTREME_RATIO_THRESHOLD &&
-        absMae > selectedMfe + MIN_GAP_FOR_EXTREME
-    ) {
-        // Extreme adverse excursion → consider reverse
-        if (slStreak >= 2) {
-            // But consecutive SL → don't fight the trend
-            advice = `🟠 Extreme adverse ratio but consecutive SL (${slStreak}) – take with caution`;
+        return { advice, adjustments, action };
+    }
+
+    // Rule 4: Mostly timeouts → pure excursion fallback
+    if (timeoutRatio > 0.6 || timeoutCount >= 4) {
+        warnings.push(`Mostly timeouts (${timeoutCount}/${total}) – possible chop`);
+
+        if (mfe >= MIN_MFE_PCT && ratio > 1.2) {
             action = 'take';
-            adjustments.confidenceBoost = -0.15;
+            advice = `🟢 Mostly timeouts but good MFE → taking cautiously`;
+            adjustments.confidenceBoost = -0.10;
+        } else if (absMae >= MIN_MAE_PCT) {
+            action = 'take';
+            advice = `🟠 Mostly timeouts + high MAE → take but expect drawdown`;
+            adjustments.slMultiplier = 0.75;
+            adjustments.confidenceBoost = -0.20;
         } else {
-            advice = `🔴 Extreme adverse ratio (${ratio.toFixed(2)}) – reversing`;
-            action = 'reverse';
-            adjustments = {
-                slMultiplier: 0.85,
-                tpMultiplier: 1.10,
-                confidenceBoost: 0.10,
-            };
+            action = 'skip';
+            advice = `🟡 Mostly timeouts + weak excursions → holding`;
         }
-    } else if (selectedReversals >= MIN_REVERSALS_FOR_REVERSE && ratio <= 0.85) {
-        // Secondary reversal signal
-        advice = `🟠 Reversal potential | ${baseAdvice} | Reversals: ${selectedReversals}`;
-        action = 'reverse';
-        adjustments = {
-            slMultiplier: 0.90,
-            tpMultiplier: 1.05,
-            confidenceBoost: 0.05,
-        };
-    } else {
-        // Mixed / weak → safest is skip, but allow take with penalty if outcomes ok
-        advice = `🟡 Mixed/weak profile | ${baseAdvice}`;
-        action = 'skip';
-        adjustments.confidenceBoost = -0.15;
     }
 
-    // ── STEP 8: Apply outcome warnings to any action ─────────────────────────────
-    if (warningParts.length > 0) {
-        advice += ` | ⚠️ ${warningParts.join(' | ')}`;
-        // Extra confidence penalty if multiple warnings
-        if (warningParts.length >= 2) adjustments.confidenceBoost -= 0.10;
+    // Rule 5: Default – hold unless something strong above triggered
+    if (action === 'skip') {
+        if (warnings.length > 0) {
+            advice = `🟡 Holding – ${warnings.join(' | ')}`;
+        } else {
+            advice = `🟡 No strong signal from regime – holding`;
+        }
     }
 
-    // ── STEP 9: Final touch-ups ──────────────────────────────────────────────────
-    if (action !== 'skip') {
-        advice += ` | Reversals: ${selectedReversals}`;
+    // ── FINAL: Apply accumulated warnings to any action ──────────────────────────
+    if (warnings.length > 0 && action !== 'skip') {
+        advice += ` | ⚠️ ${warnings.join(' | ')}`;
     }
 
-    // ── Done ─────────────────────────────────────────────────────────────────────
     return { advice, adjustments, action };
 }
 
