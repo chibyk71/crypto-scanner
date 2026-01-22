@@ -1985,9 +1985,9 @@ export class TelegramBotController {
             // Show adjustments if meaningful
             const adj = adviceObj.adjustments;
             const adjParts: string[] = [];
-            if (adj.slMultiplier !== 1) adjParts.push(`SL ×${adj.slMultiplier.toFixed(2)}`);
-            if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${adj.tpMultiplier.toFixed(2)}`);
-            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${adj.confidenceBoost.toFixed(2)}`);
+            if (adj.slMultiplier !== 1) adjParts.push(`SL ×${escape(adj.slMultiplier.toFixed(2))}`);
+            if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${escape(adj.tpMultiplier.toFixed(2))}`);
+            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
 
             if (adjParts.length > 0) {
                 lines.push(`**Adjustments:** ${adjParts.join(' \\| ')}`);
