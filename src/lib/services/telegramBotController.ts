@@ -1899,7 +1899,7 @@ export class TelegramBotController {
 
         if (reversalInfo?.wasReversed) {
             lines.push(
-                `⚠️ **AUTO-REVERSED** — Original: **${reversalInfo.originalSignal.toUpperCase()}** → **${signal.signal.toUpperCase()}**`
+                `⚠️ **AUTO\\-REVERSED** — Original: **${reversalInfo.originalSignal.toUpperCase()}** → **${signal.signal.toUpperCase()}**`
             );
             lines.push(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
             lines.push('');
@@ -1925,7 +1925,7 @@ export class TelegramBotController {
             const rrApprox = signal.takeProfit && signal.stopLoss
                 ? Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
                 : config.strategy.riskRewardTarget.toString();
-            lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${rrApprox}R\\)`);
+            lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${escape(rrApprox)}R\\)`);
         }
 
         if (signal.trailingStopDistance) {
@@ -1939,10 +1939,10 @@ export class TelegramBotController {
             lines.push('');
             lines.push('**Regime Summary** 📊');
 
-            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
-            lines.push(`Samples: **${regime.recentSampleCount}${liveNote}** | Reversals: **${regime.recentReverseCount}**`);
+            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
+            lines.push(`Samples: **${regime.recentSampleCount}${liveNote}** \\| Reversals: **${regime.recentReverseCount}**`);
 
-            lines.push(`MFE: **${regime.recentMfe.toFixed(2)}%** | MAE: **${regime.recentMae.toFixed(2)}%**`);
+            lines.push(`MFE: **${regime.recentMfe.toFixed(2)}%** \\| MAE: **${regime.recentMae.toFixed(2)}%**`);
             lines.push(`Ratio: **${regime.recentExcursionRatio.toFixed(2)}**`);
 
             // Outcome-based warnings (new 2025 fields)
@@ -1951,10 +1951,10 @@ export class TelegramBotController {
             if (total > 0) {
                 const slRatio = sl / total;
                 if (slRatio > 0.6 || sl >= 3) {
-                    lines.push(`⚠️ **High SL rate** (${sl}/${total}) — caution advised`);
+                    lines.push(`⚠️ **High SL rate** ${escape(`(${sl}/${total}) — caution advised`)}`);
                 }
                 if (timeout / total > 0.5 || timeout >= 3) {
-                    lines.push(`⚠️ **Choppy market** (${timeout} timeouts) — possible ranging`);
+                    lines.push(`⚠️ **Choppy market** ${escape(`(${timeout} timeouts) — possible ranging`)}`);
                 }
             }
 
@@ -1990,7 +1990,7 @@ export class TelegramBotController {
             if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${adj.confidenceBoost.toFixed(2)}`);
 
             if (adjParts.length > 0) {
-                lines.push(`**Adjustments:** ${adjParts.join(' | ')}`);
+                lines.push(`**Adjustments:** ${adjParts.join(' \\| ')}`);
             }
         }
 
