@@ -477,7 +477,7 @@ async function finalizeSimulation(
         mfe: boundedMfePct,
         mae: boundedMaePct,
         direction: isLong ? 'buy' : 'sell',
-
+        timestamp: Date.now(),
     });
 
     // =========================================================================
