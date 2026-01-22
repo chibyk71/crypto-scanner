@@ -1929,7 +1929,7 @@ export class TelegramBotController {
         }
 
         if (signal.trailingStopDistance) {
-            lines.push(`**Trailing:** $${escape(signal.trailingStopDistance.toFixed(6))}`);
+            lines.push(`**Trailing:** ${escape(signal.trailingStopDistance.toFixed(6))}`);
         }
 
         // ── Regime Summary (use Lite version when possible) ──────────────────────────
@@ -1942,8 +1942,8 @@ export class TelegramBotController {
             const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
             lines.push(`Samples: **${regime.recentSampleCount}${liveNote}** \\| Reversals: **${regime.recentReverseCount}**`);
 
-            lines.push(`MFE: **${regime.recentMfe.toFixed(2)}%** \\| MAE: **${regime.recentMae.toFixed(2)}%**`);
-            lines.push(`Ratio: **${regime.recentExcursionRatio.toFixed(2)}**`);
+            lines.push(`MFE: **${escape(regime.recentMfe.toFixed(2))}%** \\| MAE: **${escape(regime.recentMae.toFixed(2))}%**`);
+            lines.push(`Ratio: **${escape(regime.recentExcursionRatio.toFixed(2))}**`);
 
             // Outcome-based warnings (new 2025 fields)
             const { tp, partial_tp, sl, timeout } = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
@@ -1960,7 +1960,7 @@ export class TelegramBotController {
 
             // SL streak warning
             if (regime.slStreak >= 2) {
-                lines.push(`⚠️ **Consecutive SL detected** (${regime.slStreak}) — trend may be strong against`);
+                lines.push(`⚠️ **Consecutive SL detected** ${escape(`(${regime.slStreak})`)} — trend may be strong against`);
             }
 
             // Ratio interpretation
