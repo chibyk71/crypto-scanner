@@ -359,6 +359,8 @@ export class MarketScanner {
                 trailingStopPercent: config.strategy.trailingStopPercent,
             });
 
+            console.log(`[Signal] ${symbol}: ${signal.signal.toUpperCase()} (Confidence: ${signal.confidence.toFixed(1)})`, signal.stopLoss ? `SL: ${signal.stopLoss.toFixed(6)}` : '', signal.takeProfit ? `TP: ${signal.takeProfit.toFixed(6)}` : '');
+
             // ──────────────────────────────────────────────────────────────
             // 5. Decide simulation direction – smart priority order
             //
