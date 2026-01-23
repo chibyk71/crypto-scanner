@@ -1940,7 +1940,7 @@ export class TelegramBotController {
             lines.push('**Regime Summary** 📊');
 
             const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
-            lines.push(`Samples: **${regime.recentSampleCount}${liveNote}** \\| Reversals: **${regime.recentReverseCount}**`);
+            lines.push(`Samples: **${escape(regime.recentSampleCount)}${liveNote}** \\| Reversals: **${escape(regime.recentReverseCount)}**`);
 
             lines.push(`MFE: **${escape(regime.recentMfe.toFixed(2))}%** \\| MAE: **${escape(regime.recentMae.toFixed(2))}%**`);
             lines.push(`Ratio: **${escape(regime.recentExcursionRatio.toFixed(2))}**`);
@@ -1987,7 +1987,7 @@ export class TelegramBotController {
             const adjParts: string[] = [];
             if (adj.slMultiplier !== 1) adjParts.push(`SL ×${escape(adj.slMultiplier.toFixed(2))}`);
             if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${escape(adj.tpMultiplier.toFixed(2))}`);
-            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
+            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '\\+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
 
             if (adjParts.length > 0) {
                 lines.push(`**Adjustments:** ${adjParts.join(' \\| ')}`);
