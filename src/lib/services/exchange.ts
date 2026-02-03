@@ -88,6 +88,7 @@ export class ExchangeService {
         try {
             logger.info('Loading all markets from the exchange...');
             const markets = await this.withRetries(() => this.exchange.loadMarkets(), 3);
+            console.log(markets);
             this.supportedSymbols = Object.keys(markets).filter(symbol =>
                 config.symbols.includes(symbol)
             );
@@ -223,7 +224,7 @@ export class ExchangeService {
 
             // Use withRetries wrapper for robustness against temporary network/exchange issues
             const rawCandles = await this.withRetries(
-                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, params),
+                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, { ...params, interval: timeframe }),
                 3 // Retry up to 3 times
             );
 
@@ -286,8 +287,10 @@ export class ExchangeService {
     private async loadMarkets(): Promise<void> {
         try {
             const markets = await this.exchange.loadMarkets();
+            logger.debug('Loaded markets', Object.keys(markets));
+
             this.supportedSymbols = Object.keys(markets).filter(m =>
-                config.symbols.includes(m) && m.endsWith('/USDT')
+                config.symbols.includes(m) && m.endsWith('USDT')
             );
             logger.info(`Successfully loaded ${this.supportedSymbols.length} whitelisted markets`, { symbols: this.supportedSymbols });
         } catch (error) {
@@ -329,32 +332,6 @@ export class ExchangeService {
                 // Update live in-memory data (used by strategy, scanner, alerts)
                 this.primaryOhlcvData[symbol] = candles;
 
-                const latest = candles.at(-1)!;
-                logger.info(`[${symbol}:${timeframe}] Updated OHLCV`, {
-                    latestClose: latest[4],
-                    candleCount: candles.length,
-                });
-
-                // === Smart Incremental Persistence ===
-                // Filter only candles newer than what we've already persisted
-                // const newCandles = candles.filter(candle => {
-                //     const ts = candle[0] as number;
-                //     return ts > lastPersistedTimestamp;
-                // });
-
-                // if (newCandles.length > 0) {
-                //     // Fire-and-forget persistence
-                //     // void this.persistOhlcvToDb(symbol, timeframe, newCandles).catch(err => {
-                //     //     logger.error(`Async failure persisting ${newCandles.length} new candles for ${symbol}`, {
-                //     //         error: err,
-                //     //     });
-                //     // });
-
-                //     // // Update tracker to newest persisted timestamp
-                //     // lastPersistedTimestamp = newCandles.at(-1)![0] as number;
-                // } else {
-                //     logger.debug(`No new candles to persist for ${symbol} (up to date)`);
-                // }
             } catch (error) {
                 logger.error(`Polling failed for ${symbol} ${timeframe}`, { error });
             }
