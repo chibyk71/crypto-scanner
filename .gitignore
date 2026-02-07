@@ -12,3 +12,4 @@ yarn.lock
 local.db
 worker.lock
 rf_model.json
+build.zip

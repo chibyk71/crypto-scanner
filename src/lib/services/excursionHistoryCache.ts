@@ -4,8 +4,8 @@
 //
 // Fresh 2025 implementation:
 //   • Focused exclusively on completed simulations (no live tracking)
-//   • Max 5 most recent completed simulations per symbol (after time pruning)
-//   • Configurable 6-hour recency window
+//   • Max 10 most recent completed simulations per symbol (after time pruning)
+//   • Configurable 2-hour recency window
 //   • Enriched with outcome counts, directional outcomes, SL streak, timeout ratio
 //   • Aggregates recomputed on write + during periodic cleanup
 // =============================================================================
@@ -20,22 +20,29 @@ const logger = createLogger('ExcursionCache');
 // Configuration constants (overridable via config)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const RECENT_WINDOW_HOURS_DEFAULT = 6;
-const MAX_CLOSED_SIMS_PER_SYMBOL = 5;
-const MIN_SAMPLES_FOR_TRUST_DEFAULT = 2;
+const RECENT_WINDOW_HOURS_DEFAULT = 2;
+const MAX_CLOSED_SIMS_PER_SYMBOL = 10;
+const MIN_SAMPLES_FOR_TRUST_DEFAULT = 3;
 
 /**
  * Cached entry – strictly for completed simulations only
+ * This is the internal representation stored in the cache Map
  */
 interface CachedSimulationEntry extends SimulationHistoryEntry {
     signalId: string;
-    timestamp: number;     // completion timestamp
-    lastUpdated: number;   // matches timestamp for completed
+    timestamp: number;          // completion timestamp
+    lastUpdated: number;        // when this entry was last written/updated
     direction: 'buy' | 'sell';
+
+    // ── NEW: Required timing fields from finalizeSimulation (scalping 2025)
+    durationMs: number;         // total trade duration in milliseconds
+    timeToMFE_ms: number;       // ms from entry to peak favorable excursion
+    timeToMAE_ms: number;       // ms from entry to peak adverse excursion
 }
 
 /**
  * Full regime – includes capped history + outcome-enriched aggregates
+ * This is what getRegime() returns (with historyJson)
  */
 export interface ExcursionRegime {
     symbol: string;
@@ -59,7 +66,7 @@ export interface ExcursionRegime {
     recentMaeShort?: number;
     recentSampleCountShort?: number;
 
-    // Outcome statistics (new)
+    // Outcome statistics
     outcomeCounts: {
         tp: number;
         partial_tp: number;
@@ -82,13 +89,19 @@ export interface ExcursionRegime {
     slStreak: number;           // consecutive SL from newest entry
     timeoutRatio: number;       // timeoutCount / total (0–1)
 
+    // ── NEW: Duration aggregates (average in milliseconds)
+    avgDurationMs: number;           // overall average trade duration
+    avgDurationLong?: number;        // average for long trades only
+    avgDurationShort?: number;       // average for short trades only
+
     activeCount: 0;             // permanently 0 – no live simulations
 
     updatedAt: Date;
 }
 
 /**
- * Lightweight version – no historyJson array
+ * Lightweight version – no historyJson array (used in getRegimeLite)
+ * Automatically inherits all new avgDuration* fields via Omit
  */
 export interface ExcursionRegimeLite
     extends Omit<ExcursionRegime, 'historyJson'> { }
@@ -104,8 +117,8 @@ export class ExcursionHistoryCache {
     private cache: Map<string, CachedSimulationEntry[]>;           // symbol → completed entries (newest first)
     private aggregates: Map<string, ExcursionRegime>;              // symbol → precomputed regime
 
-    private recentWindowMs: number;                                // 6 hours default
-    private maxClosedSims: number;                                 // 5 default
+    private recentWindowMs: number;                                // 2 hours default
+    private maxClosedSims: number;                                 // 10 default
     private cleanupIntervalMs: number = 30 * 60_000;               // 30 min periodic cleanup
 
     private cleanupTimer: NodeJS.Timeout | null = null;
@@ -119,7 +132,7 @@ export class ExcursionHistoryCache {
         this.aggregates = new Map();
 
         // Apply config with safe defaults
-        const windowHours = Math.max(1, config.strategy?.recentWindowHours ?? RECENT_WINDOW_HOURS_DEFAULT);
+        const windowHours = Math.max(1, RECENT_WINDOW_HOURS_DEFAULT);
         this.recentWindowMs = windowHours * 60 * 60 * 1000;
 
         this.maxClosedSims = MAX_CLOSED_SIMS_PER_SYMBOL;
@@ -141,10 +154,6 @@ export class ExcursionHistoryCache {
         }, this.cleanupIntervalMs);
     }
 
-    // ──────────────────────────────────────────────────────────────────────────────
-    // Method stubs – signatures only (implementation to be added later)
-    // ──────────────────────────────────────────────────────────────────────────────
-
     /**
  * Primary write method – responsible for adding a NEW completed simulation
  * or updating an EXISTING completed simulation entry for a given symbol.
@@ -154,7 +163,7 @@ export class ExcursionHistoryCache {
  *      are completely rejected (no more interim MFE/MAE updates)
  *   2. Entries are kept **newest first** (descending timestamp)
  *   3. We enforce two constraints immediately after write:
- *      - Time window (older than ~6 hours → discarded)
+ *      - Time window (older than ~2 hours → discarded)
  *      - Maximum count (more than 5 → oldest discarded)
  *   4. After any change we immediately recompute aggregates for this symbol
  *      (since max 5 entries → very cheap operation)
@@ -163,8 +172,7 @@ export class ExcursionHistoryCache {
  *
  * @param symbol    - Trading pair e.g. 'BTC/USDT' (case-insensitive, will be normalized)
  * @param signalId  - Unique identifier of this simulation (usually from DB)
- * @param updates   - Data coming from finalizeSimulation (must contain at least timestamp, direction, outcome, mfe, mae)
- * @param isLive    - Parameter kept for signature compatibility, but **ignored & warned** if true
+ * @param updates   - Data coming from finalizeSimulation (must contain at least timestamp, direction, outcome, mfe, mae, durationMs, timeToMFE_ms, timeToMAE_ms)
  */
     public updateOrAdd(
         symbol: string,
@@ -172,30 +180,26 @@ export class ExcursionHistoryCache {
         updates: Partial<SimulationHistoryEntry>,
     ): void {
         // ── 1. Symbol normalization ──────────────────────────────────────────────────
-        // We always work with uppercase, trimmed symbols to prevent duplicates
-        // caused by case sensitivity or accidental whitespace
         const normalizedSymbol = symbol.trim().toUpperCase();
 
-        // ── 2. Required fields validation ────────────────────────────────────────────
-        // We must have at minimum these fields to consider the entry valid
-        if (
-            !updates.timestamp ||
-            typeof updates.timestamp !== 'number' ||
-            !updates.direction || !['buy', 'sell'].includes(updates.direction) ||
-            !updates.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(updates.outcome) ||
-            updates.mfe === undefined ||
-            updates.mae === undefined
-        ) {
+        // ── 2. Required fields validation – now stricter with new timing fields ──────
+        const missingFields = [
+            !updates.timestamp ? 'timestamp' : null,
+            !updates.direction || !['buy', 'sell'].includes(updates.direction) ? 'direction' : null,
+            !updates.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(updates.outcome) ? 'outcome' : null,
+            updates.mfe === undefined ? 'mfe' : null,
+            updates.mae === undefined ? 'mae' : null,
+            // ── NEW: Require timing fields from finalizeSimulation
+            updates.durationMs == null ? 'durationMs' : null,
+            updates.timeToMFE_ms == null ? 'timeToMFE_ms' : null,
+            updates.timeToMAE_ms == null ? 'timeToMAE_ms' : null,
+        ].filter(Boolean);
+
+        if (missingFields.length > 0) {
             logger.warn('Incomplete completed simulation data — entry rejected', {
                 symbol: normalizedSymbol,
                 signalId,
-                missingFields: [
-                    !updates.timestamp ? 'timestamp' : null,
-                    !updates.direction ? 'direction' : null,
-                    !updates.outcome ? 'outcome' : null,
-                    updates.mfe === undefined ? 'mfe' : null,
-                    updates.mae === undefined ? 'mae' : null,
-                ].filter(Boolean),
+                missingFields,
             });
             return;
         }
@@ -214,30 +218,48 @@ export class ExcursionHistoryCache {
 
         const now = Date.now();
 
-        // Prepare the complete entry object with safe defaults where needed
+        // ── 5. Prepare complete entry with all required fields ───────────────────────
         const entryToSave: CachedSimulationEntry = {
             signalId,
-            timestamp: updates.timestamp,
-            lastUpdated: now, // even for completed, we record when it was last written/updated
+            timestamp: updates.timestamp!,
+            lastUpdated: now,
             direction: updates.direction as 'buy' | 'sell',
-            outcome: updates.outcome,
+            outcome: updates.outcome!,
             rMultiple: updates.rMultiple ?? 0,
             label: updates.label ?? 0,
-            durationMs: updates.durationMs ?? 0,
-            mfe: updates.mfe,
-            mae: updates.mae,
-            // Spread any other fields that might be present (entryPrice, pnl, etc.)
+            mfe: updates.mfe!,
+            mae: updates.mae!,
+
+            // ── NEW: Explicitly assign the timing fields (no fallback to 0)
+            durationMs: updates.durationMs!,
+            timeToMFE_ms: updates.timeToMFE_ms!,
+            timeToMAE_ms: updates.timeToMAE_ms!,
+
+            // Spread any extra fields (safe, won't override required ones)
             ...updates,
-        } as CachedSimulationEntry;
+        };
+
+        // ── Optional: warn if any timing field looks suspicious (e.g. negative or huge)
+        if (
+            entryToSave.durationMs < 0 ||
+            entryToSave.timeToMFE_ms < 0 ||
+            entryToSave.timeToMAE_ms < 0 ||
+            entryToSave.timeToMFE_ms > entryToSave.durationMs ||
+            entryToSave.timeToMAE_ms > entryToSave.durationMs
+        ) {
+            logger.warn('Suspicious timing values in new simulation entry', {
+                symbol: normalizedSymbol,
+                signalId,
+                durationMs: entryToSave.durationMs,
+                timeToMFE_ms: entryToSave.timeToMFE_ms,
+                timeToMAE_ms: entryToSave.timeToMAE_ms,
+            });
+        }
 
         if (existingIndex !== -1) {
             // ── CASE: UPDATE EXISTING ENTRY ──────────────────────────────────────────
-            // This might happen if:
-            // - We correct outcome after manual review
-            // - We had duplicate signalId somehow
-            // - Simulation outcome was delayed/finalized later
             entries[existingIndex] = {
-                ...entries[existingIndex], // keep any old fields we didn't overwrite
+                ...entries[existingIndex],
                 ...entryToSave,
             };
 
@@ -247,6 +269,9 @@ export class ExcursionHistoryCache {
                 newOutcome: entryToSave.outcome,
                 newMfe: entryToSave.mfe,
                 newMae: entryToSave.mae,
+                durationMs: entryToSave.durationMs,
+                timeToMFE_ms: entryToSave.timeToMFE_ms,
+                timeToMAE_ms: entryToSave.timeToMAE_ms,
             });
         } else {
             // ── CASE: ADD NEW COMPLETED SIMULATION ───────────────────────────────────
@@ -258,19 +283,19 @@ export class ExcursionHistoryCache {
                 outcome: entryToSave.outcome,
                 mfe: entryToSave.mfe,
                 mae: entryToSave.mae,
+                durationMs: entryToSave.durationMs,
+                timeToMFE_ms: entryToSave.timeToMFE_ms,
+                timeToMAE_ms: entryToSave.timeToMAE_ms,
                 timestamp: new Date(entryToSave.timestamp).toISOString(),
             });
         }
 
-        // ── 5. Always keep entries sorted newest → oldest ────────────────────────────
-        // Very important: we rely on this order for slStreak and "most recent" logic
+        // ── 6. Always keep entries sorted newest → oldest ────────────────────────────
         entries.sort((a, b) => b.timestamp - a.timestamp);
 
-        // ── 6. Immediately enforce time window + max count constraints ──────────────
-        // We do this right after every write so aggregates are always based on valid set
+        // ── 7. Immediately enforce time window + max count constraints ──────────────
         this._pruneEntries(entries, now);
 
-        // If after pruning we have zero entries → clean up completely
         if (entries.length === 0) {
             this.cache.delete(normalizedSymbol);
             this.aggregates.delete(normalizedSymbol);
@@ -278,69 +303,62 @@ export class ExcursionHistoryCache {
             return;
         }
 
-        // ── 7. Update the cache reference (in case array was modified) ───────────────
+        // ── 8. Update the cache reference ───────────────────────────────────────────
         this.cache.set(normalizedSymbol, entries);
 
-        // ── 8. Immediately recompute aggregates for this symbol only ─────────────────
-        // Because we changed data → all derived stats (ratio, streaks, counts) are stale
+        // ── 9. Immediately recompute aggregates ─────────────────────────────────────
         this.recomputeAggregates(normalizedSymbol);
     }
 
     /**
- * Private method: Recomputes all aggregate statistics and outcome-derived fields
- * for a single symbol based on its current (pruned) list of completed simulations.
- *
- * Called from:
- *   1. updateOrAdd() — immediately after any write/prune
- *   2. cleanup() — after pruning a symbol during periodic maintenance
- *   3. Potentially from getRegime() if aggregates are missing (cache miss)
- *
- * Responsibilities in strict order:
- *   A. Early exit if no entries exist (clean up stale aggregate cache)
- *   B. Get the current pruned entries (already newest → oldest)
- *   C. Compute core aggregates (MFE/MAE averages, ratio, win rate, etc.)
- *   D. Compute outcome counts (tp / sl / timeout / partial_tp) — overall + directional
- *   E. Compute streaks (slStreak from newest entries)
- *   F. Compute directional breakdowns (long/short where possible)
- *   G. Build a fresh ExcursionRegime object
- *   H. Store it in this.aggregates Map (overwriting old one)
- *   I. Log key results for observability (debug/info depending on change size)
- *
- * Important invariants this method must guarantee:
- *   - All stats are computed **only from completed simulations** (no live blending)
- *   - All values are safe (no NaN, no division by zero → defaults to 0 or undefined)
- *   - Directional fields are optional (undefined if no data in that direction)
- *   - activeCount is **always 0** — we no longer track live simulations
- *   - historyJson in full regime contains **only the capped/recent entries**
- *   - Computation is deterministic and cheap (max 5 entries → trivial math)
- *
- * Performance note:
- *   - O(n) where n ≤ 5 → negligible even if called frequently
- *   - No external calls, no I/O — pure in-memory math
- *
- * @param symbol - Normalized uppercase symbol (e.g. 'BTC/USDT')
- */
+    * Private method: Recomputes all aggregate statistics and outcome-derived fields
+    * for a single symbol based on its current (pruned) list of completed simulations.
+    *
+    * Called from:
+    *   1. updateOrAdd() — immediately after any write/prune
+    *   2. cleanup() — after pruning a symbol during periodic maintenance
+    *   3. Potentially from getRegime() if aggregates are missing (cache miss)
+    *
+    * Responsibilities in strict order:
+    *   A. Early exit if no entries exist (clean up stale aggregate cache)
+    *   B. Get the current pruned entries (already newest → oldest)
+    *   C. Compute core aggregates (MFE/MAE averages, ratio, win rate, etc.)
+    *   D. Compute outcome counts (tp / sl / timeout / partial_tp) — overall + directional
+    *   E. Compute streaks (slStreak from newest entries)
+    *   F. Compute directional breakdowns (long/short where possible)
+    *   G. Compute **NEW** duration averages (overall + long/short) — key for scalping freshness
+    *   H. Build a fresh ExcursionRegime object
+    *   I. Store it in this.aggregates Map (overwriting old one)
+    *   J. Log key results for observability (debug/info depending on change size)
+    *
+    * Important invariants this method must guarantee:
+    *   - All stats are computed **only from completed simulations** (no live blending)
+    *   - All values are safe (no NaN, no division by zero → defaults to 0 or undefined)
+    *   - Directional fields are optional (undefined if no data in that direction)
+    *   - activeCount is **always 0** — we no longer track live simulations
+    *   - historyJson in full regime contains **only the capped/recent entries**
+    *   - Computation is deterministic and cheap (max 5 entries → trivial math)
+    *
+    * Performance note:
+    *   - O(n) where n ≤ 5 → negligible even if called frequently
+    *   - No external calls, no I/O — pure in-memory math
+    *
+    * @param symbol - Normalized uppercase symbol (e.g. 'BTC/USDT')
+    */
     private recomputeAggregates(symbol: string): void {
         // ── STEP 1: Early exit if symbol has no entries at all ───────────────────────
-        // If cache is empty for this symbol → no point computing anything
-        // Also clean up any stale aggregate that might be hanging around
         const entries = this.cache.get(symbol);
 
         if (!entries || entries.length === 0) {
             const hadAggregate = this.aggregates.delete(symbol);
-
             if (hadAggregate) {
-                logger.debug('Removed stale aggregate cache for symbol with no entries', {
-                    symbol,
-                });
+                logger.debug('Removed stale aggregate cache for symbol with no entries', { symbol });
             }
-
             logger.debug('recomputeAggregates skipped — no entries exist', { symbol });
             return;
         }
 
         // ── STEP 2: Log entry point for observability ────────────────────────────────
-        // Helps track how often we recompute (should be only after real changes)
         logger.debug('Starting aggregate recomputation', {
             symbol,
             entryCount: entries.length,
@@ -360,7 +378,6 @@ export class ExcursionHistoryCache {
         };
 
         // ── STEP 4: Core aggregates (overall) ────────────────────────────────────────
-        // These are computed from ALL recent entries (up to 5)
         const mfeValues = entries.map(e => e.mfe ?? 0);
         const maeValues = entries.map(e => e.mae ?? 0);
         const rValues = entries.map(e => e.rMultiple ?? 0);
@@ -368,30 +385,19 @@ export class ExcursionHistoryCache {
         const recentMfe = safeAvg(mfeValues);
         const recentMae = safeAvg(maeValues);
         const recentAvgR = safeAvg(rValues);
-
         const recentSampleCount = entries.length;
 
-        // Excursion ratio = MFE / |MAE| with safe handling
         const recentExcursionRatio = ExcursionHistoryCache.computeExcursionRatio(recentMfe, recentMae);
 
-        // Win rate: percentage of entries with label >= 1 (good win or monster win)
         const winCount = entries.filter(e => (e.label ?? 0) >= 1).length;
         const recentWinRate = recentSampleCount > 0 ? winCount / recentSampleCount : 0;
 
-        // Reverse count: strong negative outcomes (big/small loss)
         const reverseCount = entries.filter(
             e => (e.rMultiple ?? 0) < 0 && Math.abs(e.label ?? 0) >= 1
         ).length;
 
         // ── STEP 5: Outcome counts (overall) ─────────────────────────────────────────
-        // Count how many of each exit type we have
-        const outcomeCounts = {
-            tp: 0,
-            partial_tp: 0,
-            sl: 0,
-            timeout: 0,
-        };
-
+        const outcomeCounts = { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
         entries.forEach(entry => {
             const outcome = entry.outcome;
             if (outcome && outcome in outcomeCounts) {
@@ -399,49 +405,62 @@ export class ExcursionHistoryCache {
             }
         });
 
-        // Timeout ratio — useful for detecting choppy / ranging markets
         const timeoutRatio = recentSampleCount > 0
             ? outcomeCounts.timeout / recentSampleCount
             : 0;
 
         // ── STEP 6: SL streak (consecutive stop-losses from newest entry) ────────────
-        // Very important for reversal logic — consecutive SL often means strong trend against us
         let slStreak = 0;
-        for (const entry of entries) {           // entries[0] is newest
+        for (const entry of entries) {
             if (entry.outcome === 'sl') {
                 slStreak++;
             } else {
-                break;                           // streak ends at first non-SL
+                break;
             }
         }
 
         // ── STEP 7: Directional breakdowns (long / short) ────────────────────────────
-        // Only compute if we have at least one entry in that direction
         const longs = entries.filter(e => e.direction === 'buy');
         const shorts = entries.filter(e => e.direction === 'sell');
 
-        // Longs
         const recentMfeLong = longs.length ? safeAvg(longs.map(e => e.mfe)) : undefined;
         const recentMaeLong = longs.length ? safeAvg(longs.map(e => e.mae)) : undefined;
         const recentSampleCountLong = longs.length || undefined;
 
-        // Shorts
         const recentMfeShort = shorts.length ? safeAvg(shorts.map(e => e.mfe)) : undefined;
         const recentMaeShort = shorts.length ? safeAvg(shorts.map(e => e.mae)) : undefined;
         const recentSampleCountShort = shorts.length || undefined;
 
-        // Optional: directional outcome counts (can be useful for very directional regimes)
         const outcomeCountsLong = longs.length ? this._computeOutcomeCounts(longs) : undefined;
         const outcomeCountsShort = shorts.length ? this._computeOutcomeCounts(shorts) : undefined;
+
+        // ── NEW: STEP 7.5 – Duration aggregates (average trade length) ───────────────
+        // Very important for scalping: short duration + good outcome = strong momentum
+        const durationValues = entries.map(e => e.durationMs ?? 0);
+        const avgDurationMs = safeAvg(durationValues);
+
+        const longDurations = longs.map(e => e.durationMs ?? 0);
+        const shortDurations = shorts.map(e => e.durationMs ?? 0);
+
+        const avgDurationLong = longs.length ? safeAvg(longDurations) : undefined;
+        const avgDurationShort = shorts.length ? safeAvg(shortDurations) : undefined;
+
+        // Optional safety check: warn if average duration looks unrealistic
+        if (avgDurationMs > 30 * 60 * 1000) { // > 30 minutes — suspicious for 10-candle max
+            logger.warn('Unusually long average duration detected', {
+                symbol,
+                avgDurationMs,
+                avgDurationSec: (avgDurationMs / 1000).toFixed(1),
+                sampleCount: recentSampleCount,
+            });
+        }
 
         // ── STEP 8: Build the fresh regime object ────────────────────────────────────
         const freshRegime: ExcursionRegime = {
             symbol,
 
-            // Include the actual capped history (newest first)
             historyJson: entries.map(e => ({ ...e }) as SimulationHistoryEntry),
 
-            // Core stats
             recentAvgR,
             recentWinRate,
             recentReverseCount: reverseCount,
@@ -450,7 +469,6 @@ export class ExcursionHistoryCache {
             recentExcursionRatio,
             recentSampleCount,
 
-            // Directional
             recentMfeLong,
             recentMaeLong,
             recentSampleCountLong,
@@ -459,27 +477,26 @@ export class ExcursionHistoryCache {
             recentMaeShort,
             recentSampleCountShort,
 
-            // Outcome stats (new in 2025)
             outcomeCounts,
             outcomeCountsLong,
             outcomeCountsShort,
 
-            // Streaks & ratios
             slStreak,
             timeoutRatio,
 
-            // No live simulations anymore
-            activeCount: 0,
+            // ── NEW: Duration averages
+            avgDurationMs,
+            avgDurationLong,
+            avgDurationShort,
 
-            // When this aggregate was last computed
+            activeCount: 0,
             updatedAt: new Date(),
         };
 
         // ── STEP 9: Store the new aggregate in cache ─────────────────────────────────
         this.aggregates.set(symbol, freshRegime);
 
-        // ── STEP 10: Observability logging ───────────────────────────────────────────
-        // Show key metrics so we can see at a glance if something looks wrong
+        // ── STEP 10: Observability logging – include new duration metrics ────────────
         logger.debug('Aggregates recomputed successfully', {
             symbol,
             samples: recentSampleCount,
@@ -492,10 +509,12 @@ export class ExcursionHistoryCache {
                 longSamples: recentSampleCountLong ?? 0,
                 shortSamples: recentSampleCountShort ?? 0,
             },
+            // NEW: duration metrics in seconds and minutes for readability
+            avgDurationSec: (avgDurationMs / 1000).toFixed(1),
+            avgDurationMin: (avgDurationMs / 60000).toFixed(2),
+            avgLongSec: avgDurationLong ? (avgDurationLong / 1000).toFixed(1) : 'n/a',
+            avgShortSec: avgDurationShort ? (avgDurationShort / 1000).toFixed(1) : 'n/a',
         });
-
-        // ── End ──────────────────────────────────────────────────────────────────────
-        // The aggregates Map now contains fresh, correct data for this symbol
     }
 
     /**

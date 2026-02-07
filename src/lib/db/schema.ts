@@ -293,6 +293,8 @@ export const simulatedTrades = mysqlTable(
         maxAdverseExcursion: bigint('mae', { mode: 'number' }),
 
         durationMs: bigint('duration_ms', { mode: 'number' }).default(0),
+        timeToMFEMs: bigint('time_to_mfe_ms', { mode: 'number' }).default(0),
+        timeToMAEMs: bigint('time_to_mae_ms', { mode: 'number' }).default(0),
     },
     (table) => ({
         signalIdIdx: index('idx_sim_signal_id').on(table.signalId),

@@ -38,7 +38,8 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Exchange & Trading Mode
     // ──────────────────────────────────────────────────────────────
-    AUTO_TRADE: z.coerce.boolean().default(false),
+    AUTO_TRADE_ENABLED: z.coerce.boolean().default(false),
+    FIXED_TRADE_USD: z.coerce.number().default(20).optional(), // If set, overrides position sizing to fixed USD amount
     EXCHANGE: z.enum(Object.values(exchanges) as unknown as string[]).default('bybit'),
     EXCHANGE_API_KEY: z.string().optional(),
     EXCHANGE_API_SECRET: z.string().optional(),
@@ -194,11 +195,15 @@ export const config = {
      *   • API key AND secret are provided
      * This prevents accidental live trading in dev/test
      */
-    autoTrade: Boolean(
-        rawConfig.AUTO_TRADE &&
-        rawConfig.EXCHANGE_API_KEY &&
-        rawConfig.EXCHANGE_API_SECRET
-    ),
+    autoTrade: {
+        enabled: Boolean(
+            rawConfig.AUTO_TRADE_ENABLED &&
+            rawConfig.EXCHANGE_API_KEY &&
+            rawConfig.EXCHANGE_API_SECRET
+
+        ),
+        fixedTradeUsd: rawConfig.FIXED_TRADE_USD,
+    },
 
     // =========================================================================
     // EXCHANGE CONFIGURATION

@@ -124,7 +124,7 @@ const MAX_ATR_MULTIPLIER = 5;
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.25;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.35;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 20;
 
 const MIN_BB_BANDWIDTH_PCT = 0.3;             // ← Minimum Bollinger Band width percentage to avoid flat markets
@@ -663,9 +663,6 @@ export class Strategy {
         positionSizeMultiplier?: number;
         riskAmountUsd: number;
     } {
-
-        console.log(`signal): ${signal}`);
-
         // No signal → zero risk
         if (signal === 'hold') {
             logger.info('No signal generated – skipping risk parameter calculation');

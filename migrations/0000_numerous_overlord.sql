@@ -70,32 +70,10 @@ CREATE TABLE `simulated_trades` (
 	`mfe` bigint,
 	`mae` bigint,
 	`duration_ms` bigint DEFAULT 0,
+	`time_to_mfe_ms` bigint DEFAULT 0,
+	`time_to_mae_ms` bigint DEFAULT 0,
 	CONSTRAINT `simulated_trades_id` PRIMARY KEY(`id`),
 	CONSTRAINT `simulated_trades_signal_id_unique` UNIQUE(`signal_id`)
-);
---> statement-breakpoint
-CREATE TABLE `symbol_history` (
-	`symbol` varchar(50) NOT NULL,
-	`history_json` json NOT NULL DEFAULT ('[]'),
-	`recent_avg_r` float NOT NULL DEFAULT 0,
-	`recent_win_rate` float NOT NULL DEFAULT 0,
-	`recent_reverse_count` int NOT NULL DEFAULT 0,
-	`recent_mae` float NOT NULL DEFAULT 0,
-	`recent_mfe` float NOT NULL DEFAULT 0,
-	`recent_excursion_ratio` float NOT NULL DEFAULT 0,
-	`recent_sample_count` int NOT NULL DEFAULT 0,
-	`recent_mfe_long` float NOT NULL DEFAULT 0,
-	`recent_mae_long` float NOT NULL DEFAULT 0,
-	`recent_win_rate_long` float NOT NULL DEFAULT 0,
-	`recent_reverse_count_long` int NOT NULL DEFAULT 0,
-	`recent_sample_count_long` int NOT NULL DEFAULT 0,
-	`recent_mfe_short` float NOT NULL DEFAULT 0,
-	`recent_mae_short` float NOT NULL DEFAULT 0,
-	`recent_win_rate_short` float NOT NULL DEFAULT 0,
-	`recent_reverse_count_short` int NOT NULL DEFAULT 0,
-	`recent_sample_count_short` int NOT NULL DEFAULT 0,
-	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
-	CONSTRAINT `symbol_history_symbol` PRIMARY KEY(`symbol`)
 );
 --> statement-breakpoint
 CREATE TABLE `trades` (
@@ -137,9 +115,6 @@ CREATE INDEX `idx_sim_outcome` ON `simulated_trades` (`outcome`);--> statement-b
 CREATE INDEX `idx_sim_label` ON `simulated_trades` (`label`);--> statement-breakpoint
 CREATE INDEX `idx_sim_closed` ON `simulated_trades` (`closed_at`);--> statement-breakpoint
 CREATE INDEX `idx_sim_duration` ON `simulated_trades` (`duration_ms`);--> statement-breakpoint
-CREATE INDEX `idx_symbol_history_symbol` ON `symbol_history` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_symbol_history_excursions` ON `symbol_history` (`recent_mae`,`recent_mfe`);--> statement-breakpoint
-CREATE INDEX `idx_symbol_history_updated_at` ON `symbol_history` (`updated_at`);--> statement-breakpoint
 CREATE INDEX `idx_trades_symbol` ON `trades` (`symbol`);--> statement-breakpoint
 CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
 CREATE INDEX `idx_training_symbol` ON `training_samples` (`symbol`);--> statement-breakpoint

@@ -604,7 +604,7 @@ export class MarketScanner {
         // 4. Execute live trade (fire-and-forget)
         //    Only if autoTrade is enabled in config
         // ──────────────────────────────────────────────────────────────
-        if (config.autoTrade) {
+        if (config.autoTrade.enabled) {
             logger.info(`Initiating live trade execution for ${symbol} (${signal.signal})`);
             void this.autoTradeService.execute(signal);
             // No await – must not block scanner loop

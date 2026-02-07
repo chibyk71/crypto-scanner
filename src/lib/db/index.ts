@@ -975,7 +975,10 @@ class DatabaseService {
             label: null,
             maxFavorableExcursion: null,
             maxAdverseExcursion: null,
-        } as any).execute();
+            durationMs: null,
+            timeToMFEMs: null,
+            timeToMAEMs: null
+        }).execute();
 
         // Log for visibility in simulation monitoring
         logger.info('Started new simulated trade', {
@@ -1020,7 +1023,10 @@ class DatabaseService {
         rMultiple: number,
         label: -2 | -1 | 0 | 1 | 2,
         mfePct: number,     // Positive bounded %
-        maePct: number      // Negative bounded %
+        maePct: number,      // Negative bounded %
+        timeToMFEMs: number,
+        timeToMAEMs: number,
+        durationMs: number
     ): Promise<void> {
         const now = Date.now();
 
@@ -1035,6 +1041,9 @@ class DatabaseService {
                     label,
                     maxFavorableExcursion: Math.round(mfePct * 1e4),
                     maxAdverseExcursion: Math.round(maePct * 1e4),
+                    timeToMFEMs,
+                    timeToMAEMs,
+                    durationMs
                 })
                 .where(eq(simulatedTrades.signalId, signalId))
                 .execute();

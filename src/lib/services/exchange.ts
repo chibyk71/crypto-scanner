@@ -42,7 +42,7 @@ export class ExchangeService {
      */
     constructor(name?: string) {
         const exchange = name ?? config.exchange.name;
-        logger.info('Initializing ExchangeService...', { exchange, liveMode: config.autoTrade });
+        logger.info('Initializing ExchangeService...', { exchange, liveMode: config.autoTrade.enabled });
 
         this.exchange = this.createExchange(exchange);
 
@@ -74,7 +74,7 @@ export class ExchangeService {
     }
 
     public isAutoTradeEnvSet(): boolean {
-        return config.autoTrade;
+        return config.autoTrade.enabled;
     }
 
     /**
@@ -224,7 +224,7 @@ export class ExchangeService {
 
             // Use withRetries wrapper for robustness against temporary network/exchange issues
             const rawCandles = await this.withRetries(
-                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, { ...params, interval: timeframe }),
+                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, { ...params }),
                 3 // Retry up to 3 times
             );
 
@@ -287,8 +287,6 @@ export class ExchangeService {
     private async loadMarkets(): Promise<void> {
         try {
             const markets = await this.exchange.loadMarkets();
-            logger.debug('Loaded markets', Object.keys(markets));
-
             this.supportedSymbols = Object.keys(markets).filter(m =>
                 config.symbols.includes(m) && m.endsWith('USDT')
             );

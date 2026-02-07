@@ -1331,7 +1331,7 @@ export class TelegramBotController {
             const lockStatus = await dbService.getLock();
             const heartbeatData = await dbService.getHeartbeatCount();
             const balance = await this.exchange.getAccountBalance();
-            const isLive = config.autoTrade;
+            const isLive = config.autoTrade.enabled;
 
             const lastHeartbeat = heartbeatData
                 ? new Date(heartbeatData).toLocaleString()
@@ -1854,61 +1854,39 @@ export class TelegramBotController {
     /**
  * Sends a formatted Telegram alert for a generated signal.
  *
- * Handles both normal and reversed signals, includes:
- *   - Signal header & key levels
- *   - Confidence & ML scores
- *   - Real-time regime summary (samples, ratio, warnings)
- *   - Fresh excursion advice
- *   - Strategy reasons
+ * Now includes:
+ *   - Average duration (overall + directional if available)
+ *   - Time-to-MFE / Time-to-MAE (when present)
+ *   - Timeout ratio warning if high
+ *   - All previous fields (confidence, SL/TP, regime summary, advice, reasons)
  *
- * Improvements in 2025 version:
- *   - Uses regimeLite when possible (smaller payload)
- *   - Better MarkdownV2 escaping (handles more edge cases)
- *   - Cleaner conditional sections
- *   - Uses new outcome fields (slStreak, timeoutRatio) for warnings
- *   - Visual improvements: bold sections, consistent emoji usage
- *   - Safety: no crash on missing regime or bad data
- *
- * @param symbol Trading pair
+ * @param symbol Trading pair (e.g. 'BTC/USDT')
  * @param signal Final TradeSignal (buy/sell/hold)
  * @param price Current price
- * @param reversalInfo Optional reversal context (from strategy or auto-trade)
  */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
-        price: number,
-        reversalInfo?: {
-            wasReversed: boolean;
-            originalSignal: 'buy' | 'sell';
-            reversalReason: string;
-        }
+        price: number
     ): Promise<void> {
-        // Safe escape function for MarkdownV2 (Telegram is very picky)
-        const escape = (s: string | number | undefined): string => {
-            if (s === undefined || s === null) return '';
-            const str = String(s);
-            return str.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+        // Robust MarkdownV2 escape
+        const escape = (value: string | number | undefined): string => {
+            if (value === undefined || value === null) return '';
+            const str = String(value);
+            return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
         };
 
         const lines: string[] = [];
 
-        // ── Header: Signal type + emoji + reversal banner ───────────────────────────
-        const signalEmoji = signal.signal === 'buy' ? '🟢 LONG' : signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
-        lines.push(`**${signalEmoji} SIGNAL**`);
+        // ── Header ────────────────────────────────────────────────────────────────
+        const signalEmoji =
+            signal.signal === 'buy' ? '🟢 LONG' :
+                signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
 
-        if (reversalInfo?.wasReversed) {
-            lines.push(
-                `⚠️ **AUTO\\-REVERSED** — Original: **${reversalInfo.originalSignal.toUpperCase()}** → **${signal.signal.toUpperCase()}**`
-            );
-            lines.push(`**Reason:** ${escape(reversalInfo.reversalReason)}`);
-            lines.push('');
-        }
-
-        // ── Core info ────────────────────────────────────────────────────────────────
-        lines.push(`**Symbol:** ${escape(symbol)}`);
+        lines.push(`**${signalEmoji} SIGNAL** ${escape(symbol)}`);
         lines.push(`**Price:** $${escape(price.toFixed(6))}`);
 
+        // ── Confidence & key levels ──────────────────────────────────────────────
         if (signal.confidence > 0) {
             lines.push(`**Confidence:** ${escape(signal.confidence.toFixed(1))}%`);
         }
@@ -1924,7 +1902,8 @@ export class TelegramBotController {
         if (signal.takeProfit) {
             const rrApprox = signal.takeProfit && signal.stopLoss
                 ? Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
-                : config.strategy.riskRewardTarget.toString();
+                : config.strategy.riskRewardTarget?.toString() ?? 'N/A';
+
             lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${escape(rrApprox)}R\\)`);
         }
 
@@ -1932,49 +1911,85 @@ export class TelegramBotController {
             lines.push(`**Trailing:** ${escape(signal.trailingStopDistance.toFixed(6))}`);
         }
 
-        // ── Regime Summary (use Lite version when possible) ──────────────────────────
-        const regime = excursionCache.getRegimeLite(symbol) || excursionCache.getRegime(symbol);
+        // ── Regime Summary ───────────────────────────────────────────────────────
+        const regime = excursionCache.getRegime(symbol);
 
         if (regime && regime.recentSampleCount > 0) {
             lines.push('');
             lines.push('**Regime Summary** 📊');
 
-            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
-            lines.push(`Samples: **${escape(regime.recentSampleCount)}${liveNote}** \\| Reversals: **${escape(regime.recentReverseCount)}**`);
+            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
+            lines.push(`Samples: **${escape(regime.recentSampleCount)}${escape(liveNote)}**`);
+
+            if (regime.recentReverseCount > 0) {
+                lines.push(`Reversals: **${escape(regime.recentReverseCount)}**`);
+            }
 
             lines.push(`MFE: **${escape(regime.recentMfe.toFixed(2))}%** \\| MAE: **${escape(regime.recentMae.toFixed(2))}%**`);
             lines.push(`Ratio: **${escape(regime.recentExcursionRatio.toFixed(2))}**`);
 
-            // Outcome-based warnings (new 2025 fields)
+            // Outcome warnings
             const { tp, partial_tp, sl, timeout } = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
             const total = tp + partial_tp + sl + timeout;
+
             if (total > 0) {
                 const slRatio = sl / total;
                 if (slRatio > 0.6 || sl >= 3) {
-                    lines.push(`⚠️ **High SL rate** ${escape(`(${sl}/${total}) — caution advised`)}`);
+                    lines.push(`⚠️ High SL rate (${escape(sl)}/${escape(total)})`);
                 }
                 if (timeout / total > 0.5 || timeout >= 3) {
-                    lines.push(`⚠️ **Choppy market** ${escape(`(${timeout} timeouts) — possible ranging`)}`);
+                    lines.push(`⚠️ High timeouts (${escape(timeout)})`);
                 }
             }
 
-            // SL streak warning
             if (regime.slStreak >= 2) {
-                lines.push(`⚠️ **Consecutive SL detected** ${escape(`(${regime.slStreak})`)} — trend may be strong against`);
-            }
-
-            // Ratio interpretation
-            if (regime.recentExcursionRatio < 0.8) {
-                lines.push('→ Low reward:risk — consider early exits or skip');
-            } else if (regime.recentExcursionRatio > 2.5) {
-                lines.push('→ Strong reward phase — favorable conditions');
+                lines.push(`⚠️ SL streak: **${escape(regime.slStreak)}**`);
             }
         } else {
             lines.push('');
-            lines.push('**No recent regime data** — first signal or limited history');
+            lines.push('**No recent regime data** — limited history');
         }
 
-        // ── Fresh Excursion Advice ──────────────────────────────────────────────────
+        // ── NEW: Regime Timing Stats ─────────────────────────────────────────────
+        if (regime && regime.avgDurationMs > 0) {
+            lines.push('');
+            lines.push('**Regime Timing Stats** ⏱️');
+
+            const avgMin = (regime.avgDurationMs / 60000).toFixed(1);
+            lines.push(`Avg Duration: **${escape(avgMin)} min**`);
+
+            // Directional duration if available
+            if (regime.avgDurationLong && regime.recentSampleCountLong && regime.recentSampleCountLong >= 2) {
+                const longMin = (regime.avgDurationLong / 60000).toFixed(1);
+                lines.push(`Longs Avg: **${escape(longMin)} min**`);
+            }
+
+            if (regime.avgDurationShort && regime.recentSampleCountShort && regime.recentSampleCountShort >= 2) {
+                const shortMin = (regime.avgDurationShort / 60000).toFixed(1);
+                lines.push(`Shorts Avg: **${escape(shortMin)} min**`);
+            }
+
+            // Simple comparison
+            if (regime.avgDurationLong && regime.avgDurationShort) {
+                const diff = Math.abs(regime.avgDurationLong - regime.avgDurationShort) / 60000;
+                if (diff > 3) {
+                    lines.push(`→ Notable difference between long/short durations`);
+                }
+            }
+
+            // Time-to-MFE / MAE if available (from individual recent sims if historyJson present)
+            if ('historyJson' in regime && regime.historyJson && regime.historyJson.length > 0) {
+                const recent = regime.historyJson[0]; // most recent sim
+                if (recent.timeToMFE_ms > 0) {
+                    lines.push(`Recent Time-to-MFE: **${(recent.timeToMFE_ms / 1000).toFixed(0)} sec**`);
+                }
+                if (recent.timeToMAE_ms > 0) {
+                    lines.push(`Recent Time-to-MAE: **${(recent.timeToMAE_ms / 1000).toFixed(0)} sec**`);
+                }
+            }
+        }
+
+        // ── Fresh Excursion Advice ───────────────────────────────────────────────
         if (regime && regime.recentSampleCount >= 2) {
             const dir = signal.signal === 'buy' ? 'long' : 'short';
             const adviceObj = getExcursionAdvice(regime, dir);
@@ -1982,26 +1997,32 @@ export class TelegramBotController {
             lines.push('');
             lines.push(`**Excursion Advice:** ${escape(adviceObj.advice)}`);
 
-            // Show adjustments if meaningful
             const adj = adviceObj.adjustments;
             const adjParts: string[] = [];
             if (adj.slMultiplier !== 1) adjParts.push(`SL ×${escape(adj.slMultiplier.toFixed(2))}`);
             if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${escape(adj.tpMultiplier.toFixed(2))}`);
-            if (adj.confidenceBoost !== 0) adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '\\+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
+            if (adj.confidenceBoost !== 0) {
+                adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
+            }
 
             if (adjParts.length > 0) {
                 lines.push(`**Adjustments:** ${adjParts.join(' \\| ')}`);
             }
         }
 
-        // ── Strategy Reasons ─────────────────────────────────────────────────────────
-        if (signal.reason.length > 0) {
+        // ── Strategy Reasons ─────────────────────────────────────────────────────
+        if (signal.reason?.length > 0) {
             lines.push('');
             lines.push('**Signal Reasons:**');
             signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
         }
 
-        // ── Send message with proper MarkdownV2 parsing ─────────────────────────────
+        // ── Timestamp ────────────────────────────────────────────────────────────
+        const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        lines.push('');
+        lines.push(`🕒 ${escape(timestamp)}`);
+
+        // ── Send ─────────────────────────────────────────────────────────────────
         const message = lines.join('\n');
 
         try {
@@ -2011,7 +2032,7 @@ export class TelegramBotController {
             logger.error('Failed to send signal alert', {
                 symbol,
                 signal: signal.signal,
-                error: err instanceof Error ? err.message : String(err),
+                error: err instanceof Error ? err.message : String(err)
             });
         }
     }

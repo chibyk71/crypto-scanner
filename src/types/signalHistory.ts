@@ -15,6 +15,12 @@ export interface SimulationHistoryEntry {
 
     /** Max Adverse Excursion (% of entry, negative or zero) */
     mae: number;
+
+    // ── NEW: Timing metrics from 2025 scalping simulation ────────────────────────
+    // These measure how quickly the best/worst price excursions were reached
+    // All in milliseconds since entry
+    timeToMFE_ms: number;     // Time from entry to peak favorable excursion
+    timeToMAE_ms: number;     // Time from entry to peak adverse excursion (worst drawdown)
 }
 
 export interface SymbolHistory {
@@ -36,7 +42,7 @@ export interface SymbolHistory {
     winRateLong: number;
     winRateShort: number;
 
-    // Recent (~3h)
+    // Recent (~3h → now 2h in cache)
     recentMfe: number;
     recentMae: number;
     recentSampleCount: number;
@@ -53,7 +59,7 @@ export interface SymbolHistory {
     recentReverseCountShort?: number;
 
     lastDirection: 'buy' | 'sell' | null;
-    warningLevel: 'safe' | 'caution' | 'high_risk';
+    warningLevel: WarningLevel;
     updatedAt: number;
 }
 

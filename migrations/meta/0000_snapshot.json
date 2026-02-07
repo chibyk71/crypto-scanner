@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "765e254d-57fe-4e2d-ae2c-ff443b7fdae8",
+  "id": "58892ba1-da1c-4318-9818-6fbd4ccc9fa3",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -471,6 +471,22 @@
           "notNull": false,
           "autoincrement": false,
           "default": 0
+        },
+        "time_to_mfe_ms": {
+          "name": "time_to_mfe_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false,
+          "default": 0
+        },
+        "time_to_mae_ms": {
+          "name": "time_to_mae_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false,
+          "default": 0
         }
       },
       "indexes": {
@@ -541,206 +557,6 @@
           ]
         }
       },
-      "checkConstraint": {}
-    },
-    "symbol_history": {
-      "name": "symbol_history",
-      "columns": {
-        "symbol": {
-          "name": "symbol",
-          "type": "varchar(50)",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "history_json": {
-          "name": "history_json",
-          "type": "json",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "('[]')"
-        },
-        "recent_avg_r": {
-          "name": "recent_avg_r",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_win_rate": {
-          "name": "recent_win_rate",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_reverse_count": {
-          "name": "recent_reverse_count",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mae": {
-          "name": "recent_mae",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mfe": {
-          "name": "recent_mfe",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_excursion_ratio": {
-          "name": "recent_excursion_ratio",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_sample_count": {
-          "name": "recent_sample_count",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mfe_long": {
-          "name": "recent_mfe_long",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mae_long": {
-          "name": "recent_mae_long",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_win_rate_long": {
-          "name": "recent_win_rate_long",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_reverse_count_long": {
-          "name": "recent_reverse_count_long",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_sample_count_long": {
-          "name": "recent_sample_count_long",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mfe_short": {
-          "name": "recent_mfe_short",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_mae_short": {
-          "name": "recent_mae_short",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_win_rate_short": {
-          "name": "recent_win_rate_short",
-          "type": "float",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_reverse_count_short": {
-          "name": "recent_reverse_count_short",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "recent_sample_count_short": {
-          "name": "recent_sample_count_short",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "onUpdate": true,
-          "default": "(now())"
-        }
-      },
-      "indexes": {
-        "idx_symbol_history_symbol": {
-          "name": "idx_symbol_history_symbol",
-          "columns": [
-            "symbol"
-          ],
-          "isUnique": false
-        },
-        "idx_symbol_history_excursions": {
-          "name": "idx_symbol_history_excursions",
-          "columns": [
-            "recent_mae",
-            "recent_mfe"
-          ],
-          "isUnique": false
-        },
-        "idx_symbol_history_updated_at": {
-          "name": "idx_symbol_history_updated_at",
-          "columns": [
-            "updated_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "symbol_history_symbol": {
-          "name": "symbol_history_symbol",
-          "columns": [
-            "symbol"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
       "checkConstraint": {}
     },
     "trades": {
