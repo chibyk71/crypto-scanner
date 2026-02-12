@@ -13,6 +13,7 @@
 import { createLogger } from '../logger';
 import { config } from '../config/settings';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
+import type { SignalLabel } from '../../types';
 
 const logger = createLogger('ExcursionCache');
 
@@ -20,7 +21,7 @@ const logger = createLogger('ExcursionCache');
 // Configuration constants (overridable via config)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const RECENT_WINDOW_HOURS_DEFAULT = 2;
+const RECENT_WINDOW_HOURS_DEFAULT = 3; // 3 hours default recency window for simulations included in regime (tune as needed)
 const MAX_CLOSED_SIMS_PER_SYMBOL = 10;
 const MIN_SAMPLES_FOR_TRUST_DEFAULT = 3;
 
@@ -31,13 +32,22 @@ const MIN_SAMPLES_FOR_TRUST_DEFAULT = 3;
 interface CachedSimulationEntry extends SimulationHistoryEntry {
     signalId: string;
     timestamp: number;          // completion timestamp
-    lastUpdated: number;        // when this entry was last written/updated
     direction: 'buy' | 'sell';
 
     // ── NEW: Required timing fields from finalizeSimulation (scalping 2025)
     durationMs: number;         // total trade duration in milliseconds
     timeToMFE_ms: number;       // ms from entry to peak favorable excursion
     timeToMAE_ms: number;       // ms from entry to peak adverse excursion
+}
+
+/**
+ * Score breakdown for a single simulation (0–5 scale)
+ * Used for regime advice, weighted aggregates, and ML label mapping
+ */
+interface SimulationScore {
+    baseScore: number;          // 0–5 from outcome + excursion table
+    timeModifier: number;       // -1.5 to +1.8 from magnitude-gated timing
+    totalScore: number;         // Final clamped 0–5
 }
 
 /**
@@ -107,6 +117,23 @@ export interface ExcursionRegimeLite
     extends Omit<ExcursionRegime, 'historyJson'> { }
 
 /**
+ * Tunable thresholds for 2026 scalping scoring (excursion-dominant)
+ * Move to config later for live tuning
+ */
+const SCORE_THRESHOLDS = {
+    mfeGood: 0.5,               // % — meaningful favorable excursion
+    mfeDecent: 0.25,
+    maeMaxGood: 1.0,            // % — acceptable adverse
+    ratioReverse: 0.6,          // MAE > MFE / 0.6 → MAE dominates
+    earlyTimeMs: 5 * 60 * 1000,  // 5 minutes
+    fastCloseMs: 5 * 60 * 1000,  // Fast overall close bonus
+    slowCloseMs: 8 * 60 * 1000,  // Slow close penalty
+    earlyMfeBonusMs: 3 * 60 * 1000,
+    rapidMaePenaltyMs: 2 * 60 * 1000,
+    lateMfePenaltyRatio: 0.7,   // >70% of duration = late peak
+};
+
+/**
  * Central cache manager – completed simulations only
  */
 export class ExcursionHistoryCache {
@@ -155,159 +182,237 @@ export class ExcursionHistoryCache {
     }
 
     /**
- * Primary write method – responsible for adding a NEW completed simulation
- * or updating an EXISTING completed simulation entry for a given symbol.
- *
- * Important design decisions (2025 version):
- *   1. We **only accept completed simulations** — live/in-progress simulations
- *      are completely rejected (no more interim MFE/MAE updates)
- *   2. Entries are kept **newest first** (descending timestamp)
- *   3. We enforce two constraints immediately after write:
- *      - Time window (older than ~2 hours → discarded)
- *      - Maximum count (more than 5 → oldest discarded)
- *   4. After any change we immediately recompute aggregates for this symbol
- *      (since max 5 entries → very cheap operation)
- *   5. All operations are synchronous (no promises here) because we want
- *      predictable write behavior and immediate consistency for getRegime()
- *
- * @param symbol    - Trading pair e.g. 'BTC/USDT' (case-insensitive, will be normalized)
- * @param signalId  - Unique identifier of this simulation (usually from DB)
- * @param updates   - Data coming from finalizeSimulation (must contain at least timestamp, direction, outcome, mfe, mae, durationMs, timeToMFE_ms, timeToMAE_ms)
- */
-    public updateOrAdd(
-        symbol: string,
-        signalId: string,
-        updates: Partial<SimulationHistoryEntry>,
-    ): void {
-        // ── 1. Symbol normalization ──────────────────────────────────────────────────
-        const normalizedSymbol = symbol.trim().toUpperCase();
+     * Maps final 0–5 score to ML label (-2 to +2)
+     * Asymmetric: higher bar for positive labels (scalping favors clear/quick wins)
+     */
+    public mapScoreToLabel(score: number): SignalLabel {
+        if (score >= 4.0) return 2;      // Excellent – strong conviction win
+        if (score >= 3.0) return 1;      // Good – solid outcome
+        if (score >= 2.0) return 0;      // Neutral – no strong edge
+        if (score >= 1.0) return -1;     // Small loss / reverse hint
+        return -2;                       // Disaster – strong reverse / regime warning
+    }
 
-        // ── 2. Required fields validation – now stricter with new timing fields ──────
+    /**
+     * Computes a nuanced 0–5 score for one completed simulation.
+     *
+     * 2026 scalping philosophy:
+     *   - Excursion-dominant for non-TP outcomes (timeout/SL)
+     *   - Magnitude-gated time modifiers: only meaningful excursions (≥1.0%) trigger bonuses/penalties
+     *   - Early meaningful MFE = strong momentum
+     *   - Fast clean SL + low MFE = strong reverse candidate
+     *   - MAE dominance in timeout = reverse candidate
+     *   - Fast close = good regardless of size
+     *
+     * This score drives:
+     *   - Regime advice (higher = take, lower = skip/reverse)
+     *   - Weighted aggregates (future enhancement)
+     *   - ML labels (via mapScoreToLabel)
+     *
+     * @param entry Cached entry with full outcome & metrics
+     * @returns SimulationScore with breakdown + final clamped 0–5 score
+     */
+    public computeSimulationScore(entry: Partial<CachedSimulationEntry>): SimulationScore {
+        // Early guards
+        if (!entry || typeof entry !== 'object') {
+            logger.warn('computeSimulationScore received invalid entry – returning 0');
+            return { baseScore: 0, timeModifier: 0, totalScore: 0 };
+        }
+
+        const outcome = entry.outcome ?? 'timeout';
+        const mfe = entry.mfe ?? 0;
+        const absMae = Math.abs(entry.mae ?? 0);
+        const durationMs = entry.durationMs ?? 0;
+        const timeToMfeMs = entry.timeToMFE_ms ?? 0;
+        const timeToMaeMs = entry.timeToMAE_ms ?? 0;
+
+        // ── 1. Base score – excursion-dominant table ───────────────────────
+        let baseScore = 0;
+
+        if (outcome === 'tp' || outcome === 'partial_tp') {
+            baseScore = 5.0; // Clear win — highest possible
+        } else if (outcome === 'timeout') {
+            if (mfe >= SCORE_THRESHOLDS.mfeGood && absMae < SCORE_THRESHOLDS.maeMaxGood) {
+                baseScore = 4.5; // Excellent excursion — near-win
+            } else if (mfe >= SCORE_THRESHOLDS.mfeDecent && absMae < SCORE_THRESHOLDS.maeMaxGood) {
+                baseScore = 3.5; // Decent excursion
+            } else if (absMae > mfe / SCORE_THRESHOLDS.ratioReverse) {
+                baseScore = 0.5; // MAE dominates — strong reverse candidate
+            } else {
+                baseScore = 2.0; // Neutral timeout
+            }
+        } else if (outcome === 'sl') {
+            if (mfe >= SCORE_THRESHOLDS.mfeGood && timeToMfeMs <= SCORE_THRESHOLDS.earlyTimeMs) {
+                baseScore = 3.0; // Early meaningful MFE — trapped but good momentum
+            } else if (mfe >= SCORE_THRESHOLDS.mfeDecent) {
+                baseScore = 2.0; // Some favorable potential
+            } else if (durationMs <= SCORE_THRESHOLDS.earlyTimeMs && mfe < SCORE_THRESHOLDS.mfeDecent) {
+                baseScore = 0.0; // Fast clean loss — strong reverse sign
+            } else {
+                baseScore = 0.0; // Bad loss but not strong reverse
+            }
+        }
+
+        // ── 2. Magnitude-gated time modifiers ───────────────────────────────
+        let timeModifier = 0;
+
+        // Fast close = good momentum (no magnitude gate — quick resolution always positive)
+        if (durationMs <= SCORE_THRESHOLDS.fastCloseMs && outcome !== 'sl') timeModifier += 1.0;
+        if (durationMs > SCORE_THRESHOLDS.slowCloseMs) timeModifier -= 0.5;
+
+        // Early meaningful MFE = strong momentum (only if meaningful excursion)
+        if (timeToMfeMs <= SCORE_THRESHOLDS.earlyMfeBonusMs && mfe >= SCORE_THRESHOLDS.mfeGood) {
+            timeModifier += 0.8;
+        }
+
+        // Rapid meaningful drawdown = dangerous volatility (only if meaningful MAE)
+        if (timeToMaeMs <= SCORE_THRESHOLDS.rapidMaePenaltyMs && absMae >= SCORE_THRESHOLDS.mfeGood) {
+            timeModifier -= 1.0;
+        }
+
+        // Late meaningful peak = fading momentum (only if meaningful MFE)
+        if (timeToMfeMs > durationMs * SCORE_THRESHOLDS.lateMfePenaltyRatio && mfe >= SCORE_THRESHOLDS.mfeGood) {
+            timeModifier -= 0.5;
+        }
+
+        // Clamp modifier to reasonable range
+        timeModifier = Math.max(-1.5, Math.min(1.8, timeModifier));
+
+        // ── 3. Final score ───────────────────────────────────────────────────
+        let totalScore = baseScore + timeModifier;
+        totalScore = Math.max(0, Math.min(5, totalScore));
+
+        // Optional debug logging (uncomment during tuning)
+        /*
+        logger.debug('Scored simulation', {
+            symbol: entry.symbol,
+            outcome,
+            mfe: mfe.toFixed(2),
+            mae: -absMae.toFixed(2),
+            durationMin: (durationMs / 60000).toFixed(1),
+            timeToMfeMin: (timeToMfeMs / 60000).toFixed(1),
+            timeToMaeMin: (timeToMaeMs / 60000).toFixed(1),
+            baseScore: baseScore.toFixed(2),
+            timeModifier: timeModifier.toFixed(2),
+            totalScore: totalScore.toFixed(2),
+        });
+        */
+
+        return { baseScore, timeModifier, totalScore };
+    }
+
+    // =========================================================================
+    // PRIMARY WRITE METHOD: Add completed simulation to cache
+    // =========================================================================
+    /**
+     * Adds a newly completed simulation to the per-symbol cache.
+     * - Validates required fields
+     * - Computes nuanced 0–5 score + ML label
+     * - Enriches entry with score/label
+     * - Ensures newest first order
+     * - Prunes (time window + max size)
+     * - Triggers aggregate recompute
+     *
+     * Called from: simulateTrade (after DB insert)
+     * Design: Add-only (no updates — simulations are final/immutable)
+     */
+    public addCompletedSimulation(symbol: string, entry: Partial<CachedSimulationEntry>): void {
+        if (!entry || typeof entry !== 'object') {
+            logger.warn('addCompletedSimulation received invalid entry – rejected');
+            return;
+        }
+
+        symbol = symbol.trim().toUpperCase();
+        if (!symbol) {
+            logger.warn('Missing symbol in simulation entry – rejected');
+            return;
+        }
+
+        // Required fields validation (strict for data integrity)
         const missingFields = [
-            !updates.timestamp ? 'timestamp' : null,
-            !updates.direction || !['buy', 'sell'].includes(updates.direction) ? 'direction' : null,
-            !updates.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(updates.outcome) ? 'outcome' : null,
-            updates.mfe === undefined ? 'mfe' : null,
-            updates.mae === undefined ? 'mae' : null,
-            // ── NEW: Require timing fields from finalizeSimulation
-            updates.durationMs == null ? 'durationMs' : null,
-            updates.timeToMFE_ms == null ? 'timeToMFE_ms' : null,
-            updates.timeToMAE_ms == null ? 'timeToMAE_ms' : null,
+            !entry.signalId ? 'signalId' : null,
+            !entry.timestamp ? 'timestamp' : null,
+            !entry.direction || !['buy', 'sell'].includes(entry.direction) ? 'direction' : null,
+            !entry.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(entry.outcome) ? 'outcome' : null,
+            entry.mfe === undefined ? 'mfe' : null,
+            entry.mae === undefined ? 'mae' : null,
+            entry.durationMs == null ? 'durationMs' : null,
+            entry.timeToMFE_ms == null ? 'timeToMFE_ms' : null,
+            entry.timeToMAE_ms == null ? 'timeToMAE_ms' : null,
         ].filter(Boolean);
 
         if (missingFields.length > 0) {
-            logger.warn('Incomplete completed simulation data — entry rejected', {
-                symbol: normalizedSymbol,
-                signalId,
+            logger.warn('Incomplete simulation data – entry rejected', {
+                symbol,
+                signalId: entry.signalId,
                 missingFields,
             });
             return;
         }
 
-        // ── 3. Get or create entries array for this symbol ───────────────────────────
-        let entries = this.cache.get(normalizedSymbol);
+        // Compute score & label
+        const { totalScore } = this.computeSimulationScore(entry as CachedSimulationEntry);
+        const label = this.mapScoreToLabel(totalScore);
 
-        if (!entries) {
-            entries = [];
-            this.cache.set(normalizedSymbol, entries);
-            logger.debug('Created new entries array for symbol', { symbol: normalizedSymbol });
-        }
-
-        // ── 4. Check if this signalId already exists (update vs add) ─────────────────
-        const existingIndex = entries.findIndex(e => e.signalId === signalId);
-
-        const now = Date.now();
-
-        // ── 5. Prepare complete entry with all required fields ───────────────────────
-        const entryToSave: CachedSimulationEntry = {
-            signalId,
-            timestamp: updates.timestamp!,
-            lastUpdated: now,
-            direction: updates.direction as 'buy' | 'sell',
-            outcome: updates.outcome!,
-            rMultiple: updates.rMultiple ?? 0,
-            label: updates.label ?? 0,
-            mfe: updates.mfe!,
-            mae: updates.mae!,
-
-            // ── NEW: Explicitly assign the timing fields (no fallback to 0)
-            durationMs: updates.durationMs!,
-            timeToMFE_ms: updates.timeToMFE_ms!,
-            timeToMAE_ms: updates.timeToMAE_ms!,
-
-            // Spread any extra fields (safe, won't override required ones)
-            ...updates,
+        // Enrich entry
+        const enrichedEntry: CachedSimulationEntry & { score: number; label: SignalLabel } = {
+            ...entry as CachedSimulationEntry,
+            score: totalScore,
+            label,
         };
 
-        // ── Optional: warn if any timing field looks suspicious (e.g. negative or huge)
+        // Suspicious timing warning (defensive)
         if (
-            entryToSave.durationMs < 0 ||
-            entryToSave.timeToMFE_ms < 0 ||
-            entryToSave.timeToMAE_ms < 0 ||
-            entryToSave.timeToMFE_ms > entryToSave.durationMs ||
-            entryToSave.timeToMAE_ms > entryToSave.durationMs
+            enrichedEntry.durationMs < 0 ||
+            enrichedEntry.timeToMFE_ms < 0 ||
+            enrichedEntry.timeToMAE_ms < 0 ||
+            enrichedEntry.timeToMFE_ms > enrichedEntry.durationMs ||
+            enrichedEntry.timeToMAE_ms > enrichedEntry.durationMs
         ) {
-            logger.warn('Suspicious timing values in new simulation entry', {
-                symbol: normalizedSymbol,
-                signalId,
-                durationMs: entryToSave.durationMs,
-                timeToMFE_ms: entryToSave.timeToMFE_ms,
-                timeToMAE_ms: entryToSave.timeToMAE_ms,
+            logger.warn('Suspicious timing values in simulation entry', {
+                symbol,
+                signalId: enrichedEntry.signalId,
+                durationMs: enrichedEntry.durationMs,
+                timeToMFE_ms: enrichedEntry.timeToMFE_ms,
+                timeToMAE_ms: enrichedEntry.timeToMAE_ms,
             });
         }
 
-        if (existingIndex !== -1) {
-            // ── CASE: UPDATE EXISTING ENTRY ──────────────────────────────────────────
-            entries[existingIndex] = {
-                ...entries[existingIndex],
-                ...entryToSave,
-            };
+        // Get or initialize cache
+        let sims = this.cache.get(symbol) ?? [];
 
-            logger.debug('Updated existing completed simulation entry', {
-                symbol: normalizedSymbol,
-                signalId,
-                newOutcome: entryToSave.outcome,
-                newMfe: entryToSave.mfe,
-                newMae: entryToSave.mae,
-                durationMs: entryToSave.durationMs,
-                timeToMFE_ms: entryToSave.timeToMFE_ms,
-                timeToMAE_ms: entryToSave.timeToMAE_ms,
-            });
+        // Add new entry
+        sims.push(enrichedEntry);
+
+        // Sort newest first (defensive)
+        sims.sort((a, b) => b.timestamp - a.timestamp);
+
+        // Prune
+        const cutoff = Date.now() - RECENT_WINDOW_HOURS_DEFAULT * 60 * 60 * 1000;
+        sims = sims.filter(s => s.timestamp >= cutoff);
+        if (sims.length > MAX_CLOSED_SIMS_PER_SYMBOL) {
+            sims = sims.slice(0, MAX_CLOSED_SIMS_PER_SYMBOL);
+        }
+
+        // Update cache
+        if (sims.length === 0) {
+            this.cache.delete(symbol);
+            this.aggregates.delete(symbol);
         } else {
-            // ── CASE: ADD NEW COMPLETED SIMULATION ───────────────────────────────────
-            entries.push(entryToSave);
-
-            logger.debug('Added new completed simulation entry', {
-                symbol: normalizedSymbol,
-                signalId,
-                outcome: entryToSave.outcome,
-                mfe: entryToSave.mfe,
-                mae: entryToSave.mae,
-                durationMs: entryToSave.durationMs,
-                timeToMFE_ms: entryToSave.timeToMFE_ms,
-                timeToMAE_ms: entryToSave.timeToMAE_ms,
-                timestamp: new Date(entryToSave.timestamp).toISOString(),
-            });
+            this.cache.set(symbol, sims);
         }
 
-        // ── 6. Always keep entries sorted newest → oldest ────────────────────────────
-        entries.sort((a, b) => b.timestamp - a.timestamp);
+        // Recompute aggregates
+        this.recomputeAggregates(symbol);
 
-        // ── 7. Immediately enforce time window + max count constraints ──────────────
-        this._pruneEntries(entries, now);
-
-        if (entries.length === 0) {
-            this.cache.delete(normalizedSymbol);
-            this.aggregates.delete(normalizedSymbol);
-            logger.debug('Symbol cache completely cleaned after pruning', { symbol: normalizedSymbol });
-            return;
-        }
-
-        // ── 8. Update the cache reference ───────────────────────────────────────────
-        this.cache.set(normalizedSymbol, entries);
-
-        // ── 9. Immediately recompute aggregates ─────────────────────────────────────
-        this.recomputeAggregates(normalizedSymbol);
+        logger.info(`Added & scored simulation to cache`, {
+            symbol,
+            signalId: enrichedEntry.signalId,
+            outcome: enrichedEntry.outcome,
+            score: totalScore.toFixed(2),
+            label,
+            cacheSize: sims.length,
+        });
     }
 
     /**

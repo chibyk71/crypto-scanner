@@ -22,32 +22,26 @@
 
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
-import { and, eq, gte, isNull, not, sql, count, desc, sum } from 'drizzle-orm';
+import { and, eq, gte, isNull, not, sql, count, desc, isNotNull } from 'drizzle-orm';
 
 // Import all table definitions and TypeScript types from schema
 import {
     alert,
     locks,
     heartbeat,
-    trainingSamples,
     trades,
     simulatedTrades,
     type Alert,
     type NewAlert,
-    type TrainingSample,
-    type NewTrainingSample,
     type NewTrade,
     type SimulatedTrade,
-    type NewSimulatedTrade,
     coolDownTable,
-    type NewOhlcvHistory,
     ohlcvHistory,
 } from './schema';
 
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
-import { excursionCache } from '../services/excursionHistoryCache';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -165,7 +159,6 @@ class DatabaseService {
                         alert,
                         locks,
                         heartbeat,
-                        trainingSamples,
                         trades,
                         simulatedTrades,
                         coolDownTable,
@@ -796,330 +789,153 @@ class DatabaseService {
     }
 
     // =========================================================================
-    // ML TRAINING SAMPLES: Add a new labeled sample
+    // LABELED SIMULATIONS: Fetch all rows usable for ML training (newest first)
     // =========================================================================
     /**
-     * Inserts a new training sample into the database for ML model training.
+     * Retrieves all simulated trades that have a computed label (i.e., ready for ML training),
+     * ordered by closed time descending (most recent first).
      *
-     * Called from:
-     *   • simulateAndTrain() after every completed simulation
-     *   • Potentially live trade monitoring (future enhancement)
-     *
-     * What it stores:
-     *   • symbol – for per-symbol performance analysis
-     *   • features – normalized indicator vector (number[])
-     *   • label – 5-tier outcome (-2 to +2) based on R-multiple
-     *
-     * @param sample - Object containing symbol, features array, and label
-     * @returns Database ID of the inserted sample
-     */
-    public async addTrainingSample(sample: NewTrainingSample): Promise<number> {
-        // Insert into trainingSamples table
-        const [result] = await this.db
-            .insert(trainingSamples)
-            .values({
-                symbol: sample.symbol,
-                features: sample.features,  // Drizzle automatically JSON-stringifies arrays
-                label: sample.label,
-            })
-            .execute();
-
-        // Log for monitoring sample growth and debugging
-        logger.debug('Added ML training sample', {
-            id: result.insertId,
-            symbol: sample.symbol,
-            label: sample.label,
-            featureCount: sample.features.length,
-        });
-
-        // Return ID (useful for advanced tracking if needed)
-        return result.insertId;
-    }
-
-    // =========================================================================
-    // ML TRAINING SAMPLES: Fetch all samples (newest first)
-    // =========================================================================
-    /**
-     * Retrieves all stored training samples, ordered by insertion time (descending).
+     * New reality (after removing training_samples table):
+     *   - Single source of truth = simulatedTrades table
+     *   - Training data = rows WHERE label IS NOT NULL
+     *   - No duplication — features, label, mfe/mae, duration etc. live in one place
      *
      * Used by:
-     *   • MLService.retrain() – to load full dataset
-     *   • Debugging / analytics commands
+     *   • MLService.retrain() – to load full dataset for training
+     *   • Debugging, analytics, or reporting commands
      *
-     * Important:
-     *   • Features are stored as JSON in DB → must parse back to number[]
-     *   • Safe handling if somehow stored as string
+     * Important notes:
+     *   - Only closed simulations with label are returned
+     *   - Features are stored as JSON → safely parsed to number[]
+     *   - If features somehow stored as string (DB quirk), it's handled
+     *   - Returns SimulatedTrade type (with all excursion/duration fields)
      *
-     * @returns Array of TrainingSample objects with parsed features
+     * @returns Array of SimulatedTrade objects with parsed features
      */
-    public async getTrainingSamples(): Promise<TrainingSample[]> {
-        // Query all rows, newest first
+    public async getTrainingSamples(): Promise<SimulatedTrade[]> {
+        // Query only labeled (completed + labeled) simulations, newest first
         const rows = await this.db
             .select()
-            .from(trainingSamples)
-            .orderBy(desc(trainingSamples.id))
+            .from(simulatedTrades)
+            .where(isNotNull(simulatedTrades.label))
+            .orderBy(desc(simulatedTrades.closedAt))
             .execute();
 
-        // Normalize features: ensure it's always a number[]
-        return rows.map(s => ({
-            ...s,
-            features: typeof s.features === 'string' ? JSON.parse(s.features) : s.features,
+        // Normalize features: ensure it's always number[] (handle DB string edge case)
+        return rows.map(row => ({
+            ...row,
+            features: row.features
+                ? (typeof row.features === 'string'
+                    ? JSON.parse(row.features)
+                    : Array.isArray(row.features)
+                        ? row.features
+                        : [])
+                : [],  // fallback to empty array if missing/null
         }));
     }
 
     // =========================================================================
-    // ML TRAINING SAMPLES: Count total or per-symbol samples
+    // SIMULATED TRADES: Store a completed simulation (single atomic insert)
     // =========================================================================
     /**
-     * Returns the total number of training samples, or count for a specific symbol.
+     * Stores a fully completed simulated trade in the database in one operation.
      *
-     * Used by:
-     *   • MLService – to decide when to retrain (minSamplesToTrain)
-     *   • /ml_status and analytics commands
+     * Replaces the old startSimulatedTrade + closeSimulatedTrade pattern.
+     * Called once at the end of simulation when all outcome metrics are known.
      *
-     * @param symbol - Optional: if provided, count only that symbol's samples
-     * @returns Number of matching samples
+     * Benefits of single-call design:
+     *   - Atomic: either full row or nothing (no partial/incomplete records)
+     *   - One DB write instead of two
+     *   - No need to track signalId across calls
+     *   - Simpler caller code (simulateTrade just computes → calls this)
+     *
+     * @param data All required simulation data (entry + outcome + metrics)
+     * @returns The generated signalId (for logging / correlation)
      */
-    public async getSampleCount(symbol?: string): Promise<number> {
-        if (symbol) {
-            // Per-symbol count
-            const [row] = await this.db
-                .select({ count: count() })
-                .from(trainingSamples)
-                .where(eq(trainingSamples.symbol, symbol))
-                .execute();
-            return row.count;
-        }
-
-        // Global total count
-        const [row] = await this.db.select({ count: count() }).from(trainingSamples).execute();
-        return row.count;
-    }
-
-    // =========================================================================
-    // ML TRAINING SAMPLES: Per-symbol performance summary
-    // =========================================================================
-    /**
-     * Generates a summary of training samples grouped by symbol.
-     *
-     * Used by:
-     *   • TelegramBotController – /ml_samples command
-     *   • MLService diagnostics and monitoring
-     *
-     * What it calculates:
-     *   • total: total samples for the symbol
-     *   • wins: samples with label = 1 (good wins) – used for win rate
-     *   • buys: same as wins (label 1 = profitable long/short)
-     *   • sells: samples with label = -1 (losses)
-     *
-     * Note:
-     *   • Current labeling treats label 1 as "win" regardless of side
-     *   • This may be refined later (separate long/short performance)
-     *
-     * @returns Array of objects with symbol-level stats
-     */
-    public async getSampleSummary(): Promise<{ symbol: string; total: number; buys: number; sells: number; wins: number }[]> {
-        // GROUP BY symbol and calculate aggregates using SQL functions
-        const result = await this.db
-            .select({
-                symbol: trainingSamples.symbol,
-                total: count(),  // Total samples per symbol
-                wins: sum(sql`CASE WHEN ${trainingSamples.label} = 1 THEN 1 ELSE 0 END`),     // Count of good wins
-                buys: sum(sql`CASE WHEN ${trainingSamples.label} = 1 THEN 1 ELSE 0 END`),     // Same as wins (current design)
-                sells: sum(sql`CASE WHEN ${trainingSamples.label} = -1 THEN 1 ELSE 0 END`),   // Count of losses
-            })
-            .from(trainingSamples)
-            .groupBy(trainingSamples.symbol)
-            .execute();
-
-        // Convert BigInt results from Drizzle to regular numbers
-        return result.map(r => ({
-            symbol: r.symbol,
-            total: r.total,
-            buys: Number(r.buys),
-            sells: Number(r.sells),
-            wins: Number(r.wins),
-        }));
-    }
-
-    // =========================================================================
-    // SIMULATED TRADES: Start a new simulation record
-    // =========================================================================
-    /**
-     * Creates a new entry in the simulatedTrades table when a simulation begins.
-     *
-     * Called from:
-     *   • simulateTrade() function – at the very start of simulation
-     *
-     * Key details:
-     *   • Generates unique signalId (UUID) for tracking
-     *   • Initializes all outcome fields as null/0
-     *   • Stores entry price with high precision (×1e8 internally)
-     *   • Logs start for debugging and monitoring
-     *
-     * @param trade - Partial trade data (everything except signalId and openedAt)
-     * @returns Generated signalId (used to close the trade later)
-     */
-    public async startSimulatedTrade(trade: Omit<NewSimulatedTrade, 'signalId' | 'openedAt'>): Promise<string> {
-        // Create unique identifier for this simulation
-        const signalId = crypto.randomUUID();
-
-        // Insert initial row – all result fields are null/zero
-        await this.db.insert(simulatedTrades).values({
-            ...trade,
-            signalId,
-            openedAt: Date.now(),
-            outcome: null!,                     // Explicit null to satisfy TypeScript
-            pnl: 0,
-            rMultiple: null,
-            label: null,
-            maxFavorableExcursion: null,
-            maxAdverseExcursion: null,
-            durationMs: null,
-            timeToMFEMs: null,
-            timeToMAEMs: null
-        }).execute();
-
-        // Log for visibility in simulation monitoring
-        logger.info('Started new simulated trade', {
-            signalId,
-            symbol: trade.symbol,
-            side: trade.side,
-            entryPrice: (Number(trade.entryPrice)).toFixed(8),
-        });
-
-        // Return ID so caller can reference it when closing
-        return signalId;
-    }
-
-    // =========================================================================
-    // SIMULATED TRADES: Close simulation and store final results
-    // =========================================================================
-    /**
- * Simplified closeSimulatedTrade – persists only raw closing data to simulated_trades
- *
- * All recent regime aggregates, historyJson, reversal counting, and directional stats
- * are now handled exclusively in-memory by excursionCache.
- *
- * This method only:
- *   • Updates the simulated_trades row with closing timestamp, outcome, PnL, etc.
- *   • Stores bounded MFE (positive %) and MAE (negative %) with scaled precision
- *   • Logs success/error
- *
- * No DB fetches, no recomputation, no symbolHistory updates.
- *
- * @param signalId - UUID from startSimulatedTrade()
- * @param outcome - Final outcome type
- * @param pnl - Realized PnL as decimal (e.g., 0.023 = +2.3%)
- * @param rMultiple - Risk-multiple achieved
- * @param label - 5-tier ML label (-2 to +2)
- * @param mfePct - Bounded Max Favorable Excursion % (positive, pre-computed in finalizeSimulation)
- * @param maePct - Bounded Max Adverse Excursion % (negative, pre-computed in finalizeSimulation)
- */
-    public async closeSimulatedTrade(
-        signalId: string,
-        outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
-        pnl: number,
-        rMultiple: number,
-        label: -2 | -1 | 0 | 1 | 2,
-        mfePct: number,     // Positive bounded %
-        maePct: number,      // Negative bounded %
-        timeToMFEMs: number,
-        timeToMAEMs: number,
-        durationMs: number
-    ): Promise<void> {
-        const now = Date.now();
-
-        try {
-            await this.db
-                .update(simulatedTrades)
-                .set({
-                    closedAt: now,
-                    outcome,
-                    pnl: Math.round(pnl * 1e8),                       // Scaled for precision
-                    rMultiple: Math.round(rMultiple * 1e4),
-                    label,
-                    maxFavorableExcursion: Math.round(mfePct * 1e4),
-                    maxAdverseExcursion: Math.round(maePct * 1e4),
-                    timeToMFEMs,
-                    timeToMAEMs,
-                    durationMs
-                })
-                .where(eq(simulatedTrades.signalId, signalId))
-                .execute();
-
-            logger.debug('Closed simulated trade in DB (raw data only)', { signalId, outcome });
-        } catch (err) {
-            logger.error('Failed to close simulated trade in DB', {
-                signalId,
-                error: (err as Error).message,
-            });
-        }
-    }
-
-    /**
-     * NEW: Batch insert OHLCV candles into historical table.
-     *
-     * Uses ON DUPLICATE KEY UPDATE to skip existing candles (idempotent).
-     * Fire-and-forget: logs errors but does not throw (safe for ExchangeService polling).
-     *
-     * @param records Array of OHLCV records from CCXT fetchOHLCV
-     */
-    public async batchInsertOhlcv(
-        records: {
+    public async storeCompletedSimulation(
+        data: {
+            signalId?: string;                   // optional – if not provided, a new UUID will be generated
             symbol: string;
-            timeframe: string;
-            timestamp: number;
-            open: number | string;
-            high: number | string;
-            low: number | string;
-            close: number | string;
-            volume: number | string;
-        }[]
-    ): Promise<void> {
-        if (records.length === 0) {
-            return;
+            side: 'buy' | 'sell';
+            entryPrice: number;                 // raw float
+            stopLoss?: number;
+            trailingDist?: number;
+            tpLevels?: { price: number; weight: number }[];
+            openedAt: number;                   // Unix ms
+            closedAt: number;                   // Unix ms
+            outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout';
+            pnl: number;                        // decimal (e.g. 0.023 = +2.3%)
+            rMultiple: number;
+            label: -2 | -1 | 0 | 1 | 2;
+            maxFavorableExcursion: number;      // positive % (e.g. 0.015 = 1.5%)
+            maxAdverseExcursion: number;        // negative % (e.g. -0.008 = -0.8%)
+            durationMs: number;
+            timeToMFEMs: number;
+            timeToMAEMs: number;
+            features?: number[];                // optional – if you want to store
+        }
+    ): Promise<string> {
+        const signalId = data.signalId ?? crypto.randomUUID();
+        // const now = Date.now();
+
+        // Defensive guard: ensure openedAt ≤ closedAt
+        if (data.openedAt > data.closedAt) {
+            logger.warn('Invalid timestamps in simulation – adjusting openedAt', {
+                symbol: data.symbol,
+                signalId,
+                openedAt: new Date(data.openedAt).toISOString(),
+                closedAt: new Date(data.closedAt).toISOString(),
+            });
+            data.openedAt = data.closedAt;
         }
 
         try {
-            // Convert to Drizzle-compatible format (decimal as string)
-            const values: NewOhlcvHistory[] = records.map(r => ({
-                symbol: r.symbol,
-                timeframe: r.timeframe,
-                timestamp: r.timestamp,
-                open: r.open.toString(),
-                high: r.high.toString(),
-                low: r.low.toString(),
-                close: r.close.toString(),
-                volume: r.volume.toString(),
-            }));
+            await this.db.insert(simulatedTrades).values({
+                signalId,
+                symbol: data.symbol.trim().toUpperCase(),
+                side: data.side,
+                entryPrice: data.entryPrice,
+                stopLoss: data.stopLoss,
+                trailingDist: data.trailingDist,
+                tpLevels: data.tpLevels,
+                openedAt: data.openedAt,
+                closedAt: data.closedAt,
+                outcome: data.outcome,
+                pnl: Math.round(data.pnl * 1e8),                           // ×1e8
+                rMultiple: Math.round(data.rMultiple * 1e4),               // ×1e4
+                label: data.label,
+                maxFavorableExcursion: Math.round(data.maxFavorableExcursion * 1e4), // ×1e4
+                maxAdverseExcursion: Math.round(data.maxAdverseExcursion * 1e4),     // ×1e4
+                durationMs: data.durationMs,
+                timeToMFEMs: data.timeToMFEMs,
+                timeToMAEMs: data.timeToMAEMs,
+                features: data.features ?? null,                           // optional
+            }).execute();
 
-            // Batch upsert — efficient and safe
-            await this.db
-                .insert(ohlcvHistory)
-                .values(values)
-                .onDuplicateKeyUpdate({
-                    set: {
-                        open: sql`VALUES(${ohlcvHistory.open})`,
-                        high: sql`VALUES(${ohlcvHistory.high})`,
-                        low: sql`VALUES(${ohlcvHistory.low})`,
-                        close: sql`VALUES(${ohlcvHistory.close})`,
-                        volume: sql`VALUES(${ohlcvHistory.volume})`,
-                    },
-                });
-
-            logger.debug(`Persisted ${values.length} OHLCV candles to history table`, {
-                symbol: records[0].symbol,
-                timeframe: records[0].timeframe,
-                count: values.length,
+            logger.info('Stored completed simulated trade', {
+                signalId,
+                symbol: data.symbol,
+                side: data.side,
+                outcome: data.outcome,
+                label: data.label,
+                rMultiple: data.rMultiple.toFixed(3),
+                pnlPercent: (data.pnl * 100).toFixed(2) + '%',
+                durationMin: (data.durationMs / 60000).toFixed(1),
+                mfe: data.maxFavorableExcursion.toFixed(4) + '%',
+                mae: data.maxAdverseExcursion.toFixed(4) + '%',
             });
+
+            return signalId;
         } catch (err) {
-            logger.error('Failed to batch insert OHLCV data', {
-                count: records.length,
-                symbol: records[0]?.symbol || 'unknown',
-                error: err instanceof Error ? err.message : err,
+            logger.error('Failed to store completed simulated trade', {
+                symbol: data.symbol,
+                signalId,
+                outcome: data.outcome,
+                error: err instanceof Error ? err.message : String(err),
+                stack: err instanceof Error ? err.stack : undefined,
             });
-            // Do NOT throw — this should never break live polling or simulation
+
+            throw err; // Let caller decide whether to retry or skip
         }
     }
 
@@ -1147,42 +963,208 @@ class DatabaseService {
             .execute();
     }
 
-    // =========================================================================
-    // SIMULATION ANALYTICS: Overall stats by label
-    // =========================================================================
     /**
-     * Generates performance statistics grouped by ML label (-2 to +2).
+ * Fetches all simulations that have a computed label (i.e., ready for ML training).
+ *
+ * This is the primary method used by MLService.retrain() to load training data.
+ *
+ * Key features:
+ *   - Filters WHERE label IS NOT NULL (only completed + labeled rows)
+ *   - Orders by closedAt DESC (most recent first)
+ *   - Safely parses features JSON → number[]
+ *   - Optional: limit, symbol filter, offset for pagination/large datasets
+ *   - Returns empty array on error (fail-safe for retrain)
+ *
+ * @param options Optional filters and limits
+ * @returns Array of fully typed SimulatedTrade objects with parsed features
+ */
+    public async getLabeledSimulations(options: {
+        limit?: number;          // max rows to return (default: all)
+        offset?: number;         // skip first N rows (for pagination)
+        symbol?: string;         // filter to one symbol only
+    } = {}): Promise<SimulatedTrade[]> {
+        const { limit, offset = 0, symbol } = options;
+
+        try {
+            let query = this.db
+                .select()
+                .from(simulatedTrades)
+                .where(and(
+                    isNotNull(simulatedTrades.label),
+                    symbol ? eq(simulatedTrades.symbol, symbol.trim().toUpperCase()) : undefined
+                ))
+                .orderBy(desc(simulatedTrades.closedAt))
+                .offset(offset)
+                .$dynamic();
+
+            if (limit !== undefined) {
+                query = query.limit(limit);
+            }
+
+            const rows = await query.execute();
+
+            // Safely parse features (handle string JSON from DB or already-parsed array)
+            const parsedRows = rows.map(row => ({
+                ...row,
+                features: row.features
+                    ? (typeof row.features === 'string'
+                        ? JSON.parse(row.features)
+                        : Array.isArray(row.features)
+                            ? row.features
+                            : [])
+                    : [],  // fallback empty array if missing/null
+            }));
+
+            logger.debug('Fetched labeled simulations', {
+                count: parsedRows.length,
+                limit: limit ?? 'all',
+                symbol: symbol ?? 'all',
+                offset,
+                sampleFeaturesLength: parsedRows[0]?.features?.length ?? 'none',
+            });
+
+            return parsedRows;
+
+        } catch (err) {
+            logger.error('Failed to fetch labeled simulations', {
+                error: err instanceof Error ? err.message : String(err),
+                symbol: options.symbol,
+                limit: options.limit,
+            });
+            return []; // fail-safe: empty array so retrain can continue gracefully
+        }
+    }
+
+    /**
+     * Returns the count of labeled simulations for each possible label (-2 to +2).
      *
+     * Returns a complete distribution (all labels present, even if count = 0).
      * Used for:
-     *   • Monitoring simulation quality
-     *   • ML model health checks
-     *   • Reporting overall win rate and average R-multiple
+     *   • MLService status reporting (/ml_status)
+     *   • Monitoring class balance (critical for model health)
+     *   • Telegram /ml_performance command
      *
-     * Returns:
-     *   • count: number of simulations per label
-     *   • avgPnl: average PnL percentage
-     *   • avgR: average R-multiple
-     *   • winRate: % of trades with label >= 1
+     * @returns Array of { label: number; count: number } with all labels -2 to +2
      */
-    public async getSimulationStats() {
-        return await this.db
-            .select({
-                label: simulatedTrades.label,
-                count: count(),
-                avgPnl: sql<number>`ROUND(AVG(${simulatedTrades.pnl} / 1e8), 6)`.mapWith(Number),     // PnL ×1e8 → %
-                avgR: sql<number>`ROUND(AVG(${simulatedTrades.rMultiple} / 1e4), 3)`.mapWith(Number), // R ×1e4 → actual
-                winRate: sql<number>`
-          ROUND(
-            SUM(CASE WHEN ${simulatedTrades.label} >= 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0),
-            2
-          )
-        `.mapWith(Number),
-            })
-            .from(simulatedTrades)
-            .where(not(isNull(simulatedTrades.closedAt)))  // Only completed simulations
-            .groupBy(simulatedTrades.label)
-            .orderBy(simulatedTrades.label)
-            .execute();
+    public async getLabelDistribution(): Promise<{ label: number; count: number }[]> {
+        try {
+            // Raw count per existing label
+            const result = await this.db
+                .select({
+                    label: simulatedTrades.label,
+                    count: count().as('count'),
+                })
+                .from(simulatedTrades)
+                .where(isNotNull(simulatedTrades.label))
+                .groupBy(simulatedTrades.label)
+                .orderBy(simulatedTrades.label)
+                .execute();
+
+            // Initialize full distribution map with 0s for all labels
+            const distributionMap = new Map<number, number>();
+            for (let label = -2; label <= 2; label++) {
+                distributionMap.set(label, 0);
+            }
+
+            // Fill in actual counts
+            for (const row of result) {
+                if (row.label !== null) {
+                    distributionMap.set(row.label, Number(row.count));
+                }
+            }
+
+            // Convert to sorted array
+            return Array.from(distributionMap.entries())
+                .map(([label, count]) => ({ label, count }))
+                .sort((a, b) => a.label - b.label);
+
+        } catch (err) {
+            logger.error('Failed to compute label distribution', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+
+            // Fail-safe: return empty distribution with zeros
+            return [
+                { label: -2, count: 0 },
+                { label: -1, count: 0 },
+                { label: 0, count: 0 },
+                { label: 1, count: 0 },
+                { label: 2, count: 0 },
+            ];
+        }
+    }
+
+    /**
+ * Returns the total number of labeled simulations ready for ML training.
+ *
+ * Counts rows in simulatedTrades where label IS NOT NULL.
+ * Used by:
+ *   • MLService.retrain() – to check if enough samples exist
+ *   • MLService.getStatus() – for Telegram status reporting
+ *   • Monitoring / debugging (e.g. "are we collecting enough data?")
+ *
+ * @returns Number of simulations with a valid label (-2 to +2)
+ */
+    public async getSampleCount(): Promise<number> {
+        try {
+            const result = await this.db
+                .select({ count: count() })
+                .from(simulatedTrades)
+                .where(isNotNull(simulatedTrades.label))
+                .execute();
+
+            const num = result[0]?.count ?? 0;
+            logger.debug('Fetched labeled sample count', { num });
+            return num;
+        } catch (err) {
+            logger.error('Failed to get sample count', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return 0; // fail-safe: return 0 so retrain can gracefully skip
+        }
+    }
+
+    /**
+ * Aggregated summary of labeled simulations per symbol.
+ *
+ * Used by MLService.getSampleSummary() for Telegram reporting.
+ *
+ * Returns:
+ *   - total: number of labeled sims
+ *   - buys/sells: count by side
+ *   - wins: count where label >= 1
+ */
+    public async getSimulationSummaryBySymbol(): Promise<Array<{
+        symbol: string;
+        total: number;
+        buys: number;
+        sells: number;
+        wins: number;
+    }>> {
+        try {
+            const rows = await this.db
+                .select({
+                    symbol: simulatedTrades.symbol,
+                    total: count(),
+                    buys: sql<number>`SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END)`,
+                    sells: sql<number>`SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END)`,
+                    wins: sql<number>`SUM(CASE WHEN label >= 1 THEN 1 ELSE 0 END)`,
+                })
+                .from(simulatedTrades)
+                .where(isNotNull(simulatedTrades.label))
+                .groupBy(simulatedTrades.symbol)
+                .orderBy(desc(sql`total`)) // optional: most active symbols first
+                .execute();
+
+            logger.debug('Fetched simulation summary by symbol', { rowCount: rows.length });
+
+            return rows;
+        } catch (err) {
+            logger.error('Failed to get simulation summary by symbol', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return [];
+        }
     }
 
     // =========================================================================
@@ -1230,158 +1212,6 @@ class DatabaseService {
             .execute();
     }
 
-    /**
- * Returns the **real-time excursion regime** for a given symbol.
- *
- * This is the **recommended entry point** for any part of the system that needs
- * current MFE/MAE statistics, sample counts, win rates, etc. before making
- * trading decisions (Strategy.generateSignal, AutoTradeService.execute, alerts, etc.).
- *
- * Features:
- * - Fully backed by the in-memory `excursionCache` — **zero database queries** in hot path
- * - Uses lightweight `getRegimeLite()` version (no history array)
- * - Blends completed + live simulations for current MFE/MAE
- * - Win rate, avgR, reverse count → completed simulations only (most reliable)
- * - Returns safe zeroed-out defaults when no data exists
- * - Maintains **exact same shape** as previous implementation → no call-site changes required
- *
- * @param symbol - Trading symbol (e.g. 'BTC/USDT')
- * @returns Promise resolving to flat regime object with backward-compatible field names
- */
-    public async getCurrentRegime(symbol: string): Promise<{
-        mfe: number;
-        mae: number;
-        excursionRatio: number;
-        avgR: number;
-        winRate: number;
-        reverseCount: number;
-        sampleCount: number;
-        activeCount: number;
-        mfeLong: number;
-        maeLong: number;
-        sampleCountLong: number;
-        mfeShort: number;
-        maeShort: number;
-        sampleCountShort: number;
-    }> {
-        // ── 1. Fetch lightweight regime from cache (fast path) ───────────────────────
-        const regime = excursionCache.getRegimeLite(symbol);
-
-        // ── 2. Early return with safe defaults when no data exists ───────────────────
-        if (!regime) {
-            return {
-                mfe: 0,
-                mae: 0,
-                excursionRatio: 0,
-                avgR: 0,
-                winRate: 0,
-                reverseCount: 0,
-                sampleCount: 0,
-                activeCount: 0,
-                mfeLong: 0,
-                maeLong: 0,
-                sampleCountLong: 0,
-                mfeShort: 0,
-                maeShort: 0,
-                sampleCountShort: 0,
-            };
-        }
-
-        // ── 3. Extract & blend key counts ────────────────────────────────────────────
-        const activeCount = regime.activeCount ?? 0;
-
-        // Total sampleCount exposed to callers is **completed + live**
-        // → useful for callers who want total simulation activity
-        const totalSampleCount = regime.recentSampleCount + activeCount;
-
-        // ── 4. Map internal recent* fields → flat public names (compatibility layer) ─
-        const result = {
-            // Overall metrics
-            mfe: regime.recentMfe,
-            mae: regime.recentMae,
-            excursionRatio: regime.recentExcursionRatio,
-            avgR: regime.recentAvgR,
-            winRate: regime.recentWinRate ?? 0,              // completed only
-            reverseCount: regime.recentReverseCount ?? 0,    // completed only
-            sampleCount: totalSampleCount,
-            activeCount,
-
-            // Directional long (buy)
-            mfeLong: regime.recentMfeLong ?? 0,
-            maeLong: regime.recentMaeLong ?? 0,
-            sampleCountLong: regime.recentSampleCountLong ?? 0,
-
-            // Directional short (sell)
-            mfeShort: regime.recentMfeShort ?? 0,
-            maeShort: regime.recentMaeShort ?? 0,
-            sampleCountShort: regime.recentSampleCountShort ?? 0,
-        };
-
-        // ── 5. Optional debug logging (helps monitoring hot symbols) ─────────────────
-        if (logger.isDebugEnabled()) {
-            logger.debug('getCurrentRegime fetched regime data', {
-                symbol,
-                activeCount,
-                completedCount: regime.recentSampleCount,
-                totalSamples: totalSampleCount,
-                overallRatio: regime.recentExcursionRatio.toFixed(2),
-                hasLongData: regime.recentMfeLong !== undefined,
-                hasShortData: regime.recentMfeShort !== undefined,
-            });
-        }
-
-        return result;
-    }
-
-    // =========================================================================
-    // ML TRAINING: Full label distribution across all samples
-    // =========================================================================
-    /**
-     * Returns the count of training samples for each possible label (-2 to +2).
-     *
-     * Used by:
-     *   • MLService status reporting
-     *   • Monitoring class balance (critical for model health)
-     *   • Telegram /ml_status command
-     *
-     * Important feature:
-     *   • Ensures all 5 labels are represented, even if count = 0
-     *   • Prevents missing labels in charts/reports
-     *
-     * @returns Array of { label: number, count: number } with all labels present
-     */
-    public async getLabelDistribution(): Promise<{ label: number; count: number }[]> {
-        // Raw query: count per existing label
-        const result = await this.db
-            .select({
-                label: trainingSamples.label,
-                count: count().as('count'),
-            })
-            .from(trainingSamples)
-            .groupBy(trainingSamples.label)
-            .orderBy(trainingSamples.label)
-            .execute();
-
-        // Initialize map with all possible labels set to 0
-        // This guarantees complete distribution even for unused labels
-        const distributionMap = new Map<number, number>();
-        for (let label = -2; label <= 2; label++) {
-            distributionMap.set(label, 0);
-        }
-
-        // Fill in actual counts from query results
-        for (const row of result) {
-            if (row.label !== null) {
-                distributionMap.set(row.label, row.count);
-            }
-        }
-
-        // Convert map to array for clean return
-        return Array.from(distributionMap.entries()).map(([label, count]) => ({
-            label,
-            count,
-        }));
-    }
 }
 
 // =============================================================================

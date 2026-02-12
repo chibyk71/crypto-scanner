@@ -151,7 +151,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
     const exchange = new ExchangeService();
     const mlService = new MLService();
     const strategy = new Strategy(mlService);
-    let telegram: TelegramBotController | null = null;
+    let telegram: TelegramBotController | undefined = undefined;
     let scanner: MarketScanner | null = null;
     let supportedSymbols: string[] = [];
 

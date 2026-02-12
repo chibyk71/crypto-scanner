@@ -10,7 +10,7 @@
 
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
 import { createLogger } from '../logger';
-import { ExcursionHistoryCache, type ExcursionRegime, type ExcursionRegimeLite } from '../services/excursionHistoryCache';
+import { excursionCache, ExcursionHistoryCache, type ExcursionRegime, type ExcursionRegimeLite } from '../services/excursionHistoryCache';
 
 const logger = createLogger('ExcursionUtils');
 
@@ -61,8 +61,6 @@ export interface ExcursionScore {
 // CONSTANTS
 // =============================================================================
 const MAX_SIMS = 10; // Maximum number of recent sims to consider
-const MFE_THRESHOLD = 0.5; // Minimum MFE % to consider a timeout/SL "good" (for scoring sims)
-const MAX_MAE_THRESHOLD = 0.5; // Maximum MAE % to consider a sim relevant (for scoring sims)
 
 /**
  * Analyze recent regime and return actionable advice + adjustments
@@ -105,9 +103,9 @@ export function getExcursionAdvice(
     // ────────────────────────────────────────────────────────────────
     // 1. EARLY GUARD: Not enough samples → conservative skip
     // ────────────────────────────────────────────────────────────────
-    if (!ExcursionHistoryCache.hasEnoughSamples(regime, 2)) {
+    if (!ExcursionHistoryCache.hasEnoughSamples(regime, 3)) {
         return {
-            advice: `⚠️ Too few recent simulations (${regime.recentSampleCount ?? 0}/2) – holding`,
+            advice: `⚠️ Too few recent simulations (${regime.recentSampleCount ?? 0}/3) – holding`,
             adjustments: {
                 slMultiplier: 1.0,
                 tpMultiplier: 1.0,
@@ -167,210 +165,50 @@ export function getExcursionAdvice(
     };
 }
 
-/**
- * Compute a single score (0–5) for one completed simulation
- *
- * This is the heart of the 2025 regime scoring system.
- * Goal: Turn each historical sim into a simple numeric "quality" score
- * that reflects how useful/valuable that signal was in hindsight.
- *
- * Scoring philosophy:
- *   - Clear wins (TP/partial_tp) are rewarded highest — +5
- *   - Good-but-not-perfect moves (timeout with strong MFE) get +4
- *   - Losses with some favorable excursion are mildly rewarded +3
- *   - Clean losses (no meaningful MFE) are punished 2
- *   - Time modifiers adjust the base score:
- *     - Fast favorable moves → boost
- *     - Slow or quick adverse moves → penalty
- *     - Fast overall closure → boost
- *
- * Range: -2 to +5 (allows mild punishment for really bad sims)
- *
- * Tunable parameters (hardcoded for now – move to config later):
- *   - mfeThreshold        = 2.0%   → what counts as "strong MFE" for timeouts/SL
- *   - fastMFEThreshold    = 90s    → very quick favorable = strong boost
- *   - slowMFELimit        = 360s   → peak came too late = penalty
- *   - fastMAELimit        = 60s    → rapid drawdown = dangerous
- *   - fastDurationLimit   = 180s   → quick closure = good momentum
- *   - slowDurationLimit   = 420s   → lingering trade = likely chop
- *
- * @param entry         - One completed simulation entry (from cache or historyJson)
- * @returns Numeric score: -2 (bad) to +5 (excellent)
- */
-function scoreSingleSimulation(
-    entry: SimulationHistoryEntry,
-): number {
-    // ────────────────────────────────────────────────────────────────
-    // 1. EARLY GUARDS – protect against incomplete/malformed entries
-    // ────────────────────────────────────────────────────────────────
-    if (!entry || typeof entry !== 'object') {
-        logger.warn('scoreSingleSimulation received invalid entry – returning 0', { entry });
-        return 0;
-    }
-
-    // Required fields – fallback safely but warn
-    const outcome = entry.outcome ?? 'timeout'; // treat missing outcome as neutral timeout
-    const mfe = entry.mfe ?? 0;
-    const mae = entry.mae ?? 0;
-    const durationMs = entry.durationMs ?? 0;
-    const timeToMFE_ms = entry.timeToMFE_ms ?? 0;
-    const timeToMAE_ms = entry.timeToMAE_ms ?? 0;
-
-    if (!outcome) {
-        logger.warn('Missing outcome in simulation entry – scoring neutrally', { entry });
-        return 0;
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // 2. BASE SCORE – determined by outcome + MFE threshold
-    // ────────────────────────────────────────────────────────────────
-    let baseScore = 0;
-
-    switch (outcome) {
-        case 'tp':
-        case 'partial_tp':
-            baseScore = 5;  // Clear win – maximum reward
-            break;
-
-        case 'timeout':
-            if (mfe >= MFE_THRESHOLD && mae < MAX_MAE_THRESHOLD) {
-                baseScore = 4;  // Strong move but didn't hit TP – still very good
-            } else if (mae > MAX_MAE_THRESHOLD) {
-                baseScore = -2; // MAE too high – likely a bad regime
-            } else {
-                baseScore = 0;  // No real edge – neutral
-            }
-            break;
-
-        case 'sl':
-            if (mfe >= MFE_THRESHOLD) {
-                baseScore = 3;  // Big favorable excursion before SL – trapped or late reversal
-            } else if (mfe < 0) {
-                baseScore = -2; // Immediate adverse – very bad regime
-            } else {
-                baseScore = 0; // Clean loss, no upside
-            }
-            break;
-
-        default:
-            logger.warn(`Unknown outcome '${outcome}' in scoreSingleSimulation – neutral score`, { entry });
-            baseScore = 0;
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // 3. TIME MODIFIERS – adjust base score based on timing factors
-    // ────────────────────────────────────────────────────────────────
-    let timeModifier = 0;
-
-    // 3.1: How fast did favorable excursion peak? (timeToMFE)
-    if (timeToMFE_ms > 0 && timeToMFE_ms <= durationMs) {
-        if (timeToMFE_ms <= 120_000) {           // ≤ 2 min = very fast
-            timeModifier += 1.0;
-        } else if (timeToMFE_ms <= 240_000) {   // ≤ 4 min = fast
-            timeModifier += 0.5;
-        } else if (timeToMFE_ms > 420_000) {    // > 7 min = too slow
-            timeModifier -= 0.5;
-        }
-
-        // Penalty if peak came very late in trade life
-        if (timeToMFE_ms > durationMs * 0.6) {
-            timeModifier -= 0.5;  // Favorable move happened too late → fading
-        }
-    }
-
-    // 3.2: How fast did adverse excursion happen? (timeToMAE)
-    if (timeToMAE_ms > 0 && timeToMAE_ms <= durationMs && mae >= MAX_MAE_THRESHOLD) {
-        if (timeToMAE_ms <= 60_000) {           // ≤ 1 min = rapid drawdown
-            timeModifier -= 1.0;                // Dangerous volatility
-        } else if (timeToMAE_ms <= 120_000) {   // ≤ 2 min = fairly quick
-            timeModifier -= 0.5;
-        }
-
-        // Bonus if drawdown developed slowly
-        if (timeToMAE_ms > durationMs * 0.5) {
-            timeModifier += 0.3;  // Drawdown was gradual → possibly controllable
-        }
-    }
-
-    // 3.3: Overall trade duration (how quickly did it close?)
-    if (durationMs > 0) {
-        if (durationMs <= 180_000) {            // ≤ 3 min = very fast closure
-            timeModifier += 0.8;
-        } else if (durationMs <= 360_000) {     // ≤ 6 min = acceptable
-            timeModifier += 0.3;
-        } else if (durationMs > 420_000) {      // > 7 min = lingering
-            timeModifier -= 0.5;
-        }
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // 4. FINAL SCORE = base + time modifiers (clamp to -2..5)
-    // ────────────────────────────────────────────────────────────────
-    let finalScore = baseScore + timeModifier;
-
-    // Hard clamp – prevent extreme outliers
-    finalScore = Math.max(-2, Math.min(5, finalScore));
-
-    // Optional debug log for individual sim scoring (uncomment during tuning)
-    /*
-    logger.debug('Scored single simulation', {
-        outcome: entry.outcome,
-        mfe: entry.mfe?.toFixed(2),
-        durationSec: (durationMs / 1000).toFixed(1),
-        timeToMFESec: (timeToMFE_ms / 1000).toFixed(1),
-        timeToMAESec: (timeToMAE_ms / 1000).toFixed(1),
-        baseScore,
-        timeModifier: timeModifier.toFixed(2),
-        finalScore: finalScore.toFixed(2)
-    });
-    */
-
-    return finalScore;
-}
 
 /**
- * Compute overall regime score from recent simulations
+ * Compute overall regime score from recent simulations (weighted average)
  *
- * Core logic:
- *   1. Selects the relevant set of recent simulations:
- *      - Prefers directional (long/short) if enough samples exist
- *      - Falls back to overall regime data otherwise
- *   2. Scores each individual simulation using scoreSingleSimulation()
+ * Core logic (2026+):
+ *   1. Selects relevant sims: prefers directional (long/short) if enough samples
+ *      Falls back to overall regime data otherwise
+ *   2. Scores each individual simulation using cache's computeSimulationScore()
  *   3. Applies exponential weighting:
- *      - Most recent sim gets highest weight (e.g. 2.0)
- *      - Weight decays for older simulations (e.g. 1.5, 1.2, 1.0, 0.8...)
- *      → Recent performance matters much more than old data
- *   4. Returns weighted average score + detailed breakdown
+ *      - Most recent sim gets highest weight (baseWeight)
+ *      - Weight decays exponentially for older sims
+ *      → Recent performance dominates regime advice
+ *   4. Returns weighted average score + breakdown (including directional timing stats)
  *
  * Why exponential weighting?
- *   - Scalping regimes change quickly — last 1–2 sims are far more predictive
- *   - Prevents old good/bad trades from dominating current advice
+ *   - Scalping regimes shift quickly — last 1–3 sims are far more predictive
+ *   - Prevents old good/bad trades from diluting current signal quality
  *
- * Tunable parameters (hardcoded for now – move to config later):
- *   - maxSims           = 5      → how many recent sims to consider
- *   - minDirectional    = 2      → min directional samples to prefer direction
- *   - baseWeight        = 2.0    → weight of most recent sim
- *   - weightDecayFactor = 0.75   → each older sim multiplies previous weight by this
+ * Tunable parameters (hardcoded – move to config later):
+ *   - MAX_SIMS           = 10      → max recent sims considered
+ *   - minDirectional     = 2       → min directional samples to prefer direction
+ *   - baseWeight         = 2.0     → weight of most recent sim
+ *   - weightDecay        = 0.8     → each older sim multiplies previous weight
  *
  * Safety features:
- *   - Handles missing/undefined fields gracefully (falls back to 0 score)
- *   - Returns safe defaults if no usable sims
- *   - Clamps final score to reasonable range (-2 to 5)
+ *   - Handles missing/undefined fields gracefully
+ *   - Returns safe neutral score if no usable sims
+ *   - Clamps final score to 0–5
  *
- * @param regime     - Full or lite regime object from cache
- * @param direction  - Intended trade direction ('long' | 'short')
- * @param maxSims    - Maximum number of recent sims to evaluate (default 5)
- * @returns ExcursionScore object with total weighted score + breakdown
+ * @param regime     Full or lite regime object from cache
+ * @param direction  Intended trade direction ('long' | 'short')
+ * @returns ExcursionScore with total weighted score + directional timing stats
  */
 function computeRegimeScore(
-    regime: ExcursionRegime,
-    direction: 'long' | 'short',
-): ExcursionScore {
-    // ────────────────────────────────────────────────────────────────
-    // 1. EARLY GUARD: No data at all → return safe neutral score
-    // ────────────────────────────────────────────────────────────────
+    regime: ExcursionRegime | ExcursionRegimeLite,
+    direction: 'long' | 'short'
+): ExcursionScore & {
+    directionalAvgDurationMs?: number;
+    directionalAvgTimeToMFE_ms?: number;
+    directionalAvgTimeToMAE_ms?: number;
+} {
+    // ── 1. Early guard: no data → safe neutral score ───────────────────────
     if (!regime || regime.recentSampleCount <= 0) {
-        logger.debug('computeRegimeScore: no samples available – returning neutral', {
+        logger.debug('computeRegimeScore: no samples – returning neutral', {
             symbol: regime?.symbol ?? 'unknown',
             direction,
         });
@@ -382,43 +220,38 @@ function computeRegimeScore(
         };
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // 2. SELECT RELEVANT SIMULATIONS (prefer directional when possible)
-    // ────────────────────────────────────────────────────────────────
-    let simsToScore: (SimulationHistoryEntry)[] = [];
+    // ── 2. Select relevant simulations (prefer directional) ─────────────────
+    let simsToScore: SimulationHistoryEntry[] = [];
+    let isDirectional = false;
 
-    // Try directional first (more specific)
+    // Prefer directional if enough samples
     if (direction === 'long' && regime.recentSampleCountLong && regime.recentSampleCountLong >= 2) {
-        // We have enough long-specific data → use directional long history if available
+        isDirectional = true;
         if ('historyJson' in regime && regime.historyJson) {
             simsToScore = regime.historyJson.filter(e => e.direction === 'buy');
         }
-        // Fallback: if no historyJson, we can't do directional → use overall
-        if (simsToScore.length === 0) {
-            simsToScore = regime.historyJson ?? [];
-        }
     } else if (direction === 'short' && regime.recentSampleCountShort && regime.recentSampleCountShort >= 2) {
+        isDirectional = true;
         if ('historyJson' in regime && regime.historyJson) {
             simsToScore = regime.historyJson.filter(e => e.direction === 'sell');
         }
-        if (simsToScore.length === 0) {
-            simsToScore = regime.historyJson ?? [];
-        }
-    } else {
-        // No sufficient directional data → use overall history
+    }
+
+    // Fallback to overall if no directional or no historyJson
+    if (simsToScore.length === 0) {
+        isDirectional = false;
         if ('historyJson' in regime && regime.historyJson) {
             simsToScore = regime.historyJson;
         }
     }
 
-    // Limit to maxSims most recent (already sorted newest first in cache)
+    // Limit to most recent MAX_SIMS
     simsToScore = simsToScore.slice(0, MAX_SIMS);
 
     if (simsToScore.length === 0) {
-        logger.debug('computeRegimeScore: no usable sims after filtering – neutral score', {
+        logger.debug('computeRegimeScore: no usable sims after filtering – neutral', {
             symbol: regime.symbol,
             direction,
-            availableSamples: regime.recentSampleCount,
         });
         return {
             totalScore: 0,
@@ -428,62 +261,84 @@ function computeRegimeScore(
         };
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // 3. SCORE EACH SIMULATION + COLLECT RAW SCORES
-    // ────────────────────────────────────────────────────────────────
+    // ── 3. Compute directional timing averages from selected sims ────────────
+    let directionalAvgDurationMs = regime.avgDurationMs ?? 0;
+    let directionalAvgTimeToMFE_ms = 0;
+    let directionalAvgTimeToMAE_ms = 0;
+
+    if (isDirectional && simsToScore.length > 0) {
+        // Avg duration from selected directional sims
+        directionalAvgDurationMs = simsToScore.reduce((sum, e) => sum + (e.durationMs ?? 0), 0) / simsToScore.length;
+
+        // Avg time-to-MFE (only valid >0 values)
+        const validMFE = simsToScore.filter(e => (e.timeToMFE_ms ?? 0) > 0);
+        if (validMFE.length > 0) {
+            directionalAvgTimeToMFE_ms = validMFE.reduce((sum, e) => sum + (e.timeToMFE_ms ?? 0), 0) / validMFE.length;
+        }
+
+        // Avg time-to-MAE
+        const validMAE = simsToScore.filter(e => (e.timeToMAE_ms ?? 0) > 0);
+        if (validMAE.length > 0) {
+            directionalAvgTimeToMAE_ms = validMAE.reduce((sum, e) => sum + (e.timeToMAE_ms ?? 0), 0) / validMAE.length;
+        }
+    }
+
+    // ── 4. Score each simulation using cache method + collect raw scores ─────
     const individualScores: number[] = [];
     let sumWeightedScore = 0;
     let sumWeights = 0;
 
-    // Exponential weighting: most recent = highest weight
-    const baseWeight = 2.0;           // weight of newest sim
-    const weightDecay = 0.8;         // each older sim multiplies previous weight by this
-
+    const baseWeight = 2.0;
+    const weightDecay = 0.8;
     let currentWeight = baseWeight;
 
     for (const entry of simsToScore) {
-        const rawScore = scoreSingleSimulation(entry);
-        individualScores.push(rawScore);
+        const { totalScore } = excursionCache.computeSimulationScore(entry);
+        individualScores.push(totalScore);
 
-        // Apply weight to this sim's score
-        sumWeightedScore += rawScore * currentWeight;
+        sumWeightedScore += totalScore * currentWeight;
         sumWeights += currentWeight;
 
-        // Decay weight for next (older) sim
-        currentWeight *= weightDecay;
+        currentWeight *= weightDecay; // exponential decay
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // 4. COMPUTE FINAL WEIGHTED AVERAGE SCORE
-    // ────────────────────────────────────────────────────────────────
+    // ── 5. Final weighted average score ─────────────────────────────────────
     const totalScore = sumWeights > 0 ? sumWeightedScore / sumWeights : 0;
+    const clampedScore = Math.max(0, Math.min(5, totalScore));
 
-    // Clamp final score to reasonable range (same as individual scores)
-    const clampedScore = Math.max(-2, Math.min(5, totalScore));
-
-    // ────────────────────────────────────────────────────────────────
-    // 5. BUILD & RETURN SCORE BREAKDOWN
-    // ────────────────────────────────────────────────────────────────
-    const result: ExcursionScore = {
+    // ── 6. Build enriched result ────────────────────────────────────────────
+    const result: ExcursionScore & {
+        directionalAvgDurationMs?: number;
+        directionalAvgTimeToMFE_ms?: number;
+        directionalAvgTimeToMAE_ms?: number;
+    } = {
         totalScore: clampedScore,
-        baseScore: totalScore, // for now – we can separate time modifiers later if needed
-        timeModifier: 0,       // placeholder – could compute average modifier if we want
+        baseScore: totalScore, // for compatibility
+        timeModifier: 0,       // not used at aggregate level
         individualScores,
     };
 
-    // Optional debug log – shows how score was built (uncomment during tuning)
-    /*
-    logger.debug('Regime score computed', {
+    // Add directional timing stats (useful for advice/alerts)
+    if (directionalAvgDurationMs > 0) {
+        result.directionalAvgDurationMs = directionalAvgDurationMs;
+    }
+    if (directionalAvgTimeToMFE_ms > 0) {
+        result.directionalAvgTimeToMFE_ms = directionalAvgTimeToMFE_ms;
+    }
+    if (directionalAvgTimeToMAE_ms > 0) {
+        result.directionalAvgTimeToMAE_ms = directionalAvgTimeToMAE_ms;
+    }
+
+    // Optional debug logging (uncomment during tuning)
+    logger.debug('Computed regime score', {
         symbol: regime.symbol,
         direction,
+        isDirectional,
         simCount: simsToScore.length,
+        totalScore: clampedScore.toFixed(2),
         individualScores: individualScores.map(s => s.toFixed(2)),
-        weights: simsToScore.map((_, i) => (baseWeight * Math.pow(weightDecay, i)).toFixed(2)),
-        weightedSum: sumWeightedScore.toFixed(2),
-        totalWeight: sumWeights.toFixed(2),
-        finalScore: clampedScore.toFixed(2),
+        directionalAvgDurationMin: directionalAvgDurationMs ? (directionalAvgDurationMs / 60000).toFixed(1) : 'n/a',
     });
-    */
 
     return result;
 }
@@ -497,21 +352,27 @@ function computeRegimeScore(
  *   - Explainable (why did we take/reverse/skip?)
  *   - Conservative by default (prefers skip over aggressive reverse)
  *
+ * Updated reverse sensitivity:
+ *   - Reverse triggers on finalScore ≤ 1.4
+ *   - AND at least 3 of the most recent 5 sims have score ≤ 1.5 (consistent recent bad performance)
+ *   - This captures MAE-dominant timeouts or fast clean losses more reliably
+ *   - Still conservative: requires clear recent adverse pattern
+ *
  * Score interpretation guide (2025 scalping defaults):
  *   ≥ 3.8     → strong take     (very high conviction – widen TP, boost confidence)
  *   3.0–3.79  → take           (solid edge – normal size, mild boost)
  *   2.0–2.99  → cautious take  (acceptable but reduce risk – tighten SL)
  *   1.0–1.99  → skip / minimal (weak signal – very small size or skip)
- *   ≤ 0.99    → reverse / skip (bad regime – flip direction or avoid entirely)
+ *   ≤ 1.4     → reverse if recent sims consistently bad, else skip
  *
  * Tunable thresholds (hardcoded for now – extract to config.strategy later):
  *   STRONG_TAKE_THRESHOLD   = 3.8
  *   TAKE_THRESHOLD          = 3.0
  *   CAUTIOUS_THRESHOLD      = 2.0
- *   REVERSE_THRESHOLD       = 0.99
- *   CONFIDENCE_BOOST_RANGE  = -0.30 to +0.30
- *   SL_MULTIPLIER_RANGE     = 0.60 to 1.20
- *   TP_MULTIPLIER_RANGE     = 0.90 to 1.40
+ *   REVERSE_SCORE_THRESHOLD = 1.4
+ *   REVERSE_BAD_SIM_THRESHOLD = 1.5  // individual sim score considered "bad"
+ *   REVERSE_RECENT_COUNT      = 5    // look at most recent N sims
+ *   REVERSE_MIN_BAD           = 3    // need at least this many bad recent sims
  *
  * Safety principles:
  *   - Never returns extreme multipliers (clamped)
@@ -519,7 +380,7 @@ function computeRegimeScore(
  *   - Returns base advice string for further embellishment in buildAdviceString
  *
  * @param score      - Result from computeRegimeScore (totalScore + breakdown)
- * @param direction  - Intended trade direction ('long' | 'short')
+ * @param _direction - Intended trade direction (unused for now – kept for future)
  * @returns ExcursionAdvice with action, adjustments, and base advice string
  */
 function mapScoreToAdvice(
@@ -536,22 +397,32 @@ function mapScoreToAdvice(
             adjustments: {
                 slMultiplier: 1.0,
                 tpMultiplier: 1.0,
-                confidenceBoost: -0.30, // heavy penalty for bad data
+                confidenceBoost: -0.30,
             },
             action: 'skip'
         };
     }
 
+    logger.error('mapScoreToAdvice received score', {
+        totalScore: score.totalScore,
+        baseScore: score.baseScore,
+        timeModifier: score.timeModifier,
+        individualScoresCount: score.individualScores.length,
+        individualScores: score.individualScores.map(s => s.toFixed(2)),
+    });
+
     const finalScore = score.totalScore;
 
     // ────────────────────────────────────────────────────────────────
     // 2. DEFINE THRESHOLDS & ADJUSTMENT MAPPINGS
-    //    All values are explicit and easy to change/tune
     // ────────────────────────────────────────────────────────────────
     const STRONG_TAKE_THRESHOLD = 3.8;
-    const TAKE_THRESHOLD = 3.0;
+    const TAKE_THRESHOLD = 2.5;
     const CAUTIOUS_THRESHOLD = 2.0;
-    const REVERSE_THRESHOLD = 0.99;
+    const REVERSE_SCORE_THRESHOLD = 1.4;
+    const REVERSE_BAD_SIM_THRESHOLD = 1.5; // individual sim ≤ this = "bad"
+    const REVERSE_RECENT_COUNT = 5;
+    const REVERSE_MIN_BAD = 3; // need at least this many bad recent sims
 
     let action: ExcursionAction = 'skip';
     let baseAdvice = '';
@@ -563,54 +434,46 @@ function mapScoreToAdvice(
     // 3. DECISION TREE – map score ranges to action & adjustments
     // ────────────────────────────────────────────────────────────────
     if (finalScore >= STRONG_TAKE_THRESHOLD) {
-        // Very strong regime – high conviction
         action = 'take';
         baseAdvice = `🟢 Strong regime (${finalScore.toFixed(2)}) – high conviction take`;
-        slMult = 1.10;          // slight loosen SL (momentum is strong)
-        tpMult = 1.40;          // widen TP to capture more
-        confBoost = 0.30;       // significant confidence increase
+        slMult = 1.10;
+        tpMult = 1.40;
+        confBoost = 0.30;
 
     } else if (finalScore >= TAKE_THRESHOLD) {
-        // Solid edge – proceed normally
         action = 'take';
         baseAdvice = `🟢 Good regime (${finalScore.toFixed(2)}) – take`;
-        slMult = 1.00;          // neutral SL
-        tpMult = 1.25;          // moderate TP expansion
-        confBoost = 0.15;       // mild boost
+        slMult = 1.00;
+        tpMult = 1.25;
+        confBoost = 0.15;
 
     } else if (finalScore >= CAUTIOUS_THRESHOLD) {
-        // Acceptable but risky – reduce exposure
         action = 'take';
         baseAdvice = `🟠 Cautious regime (${finalScore.toFixed(2)}) – take small/reduced`;
-        slMult = 0.85;          // tighten SL for protection
-        tpMult = 1.10;          // slight TP expansion only
-        confBoost = -0.05;      // small penalty
-
-    } else if (finalScore >= REVERSE_THRESHOLD) {
-        // Weak or neutral – better to skip
-        action = 'skip';
-        baseAdvice = `🟡 Weak regime (${finalScore.toFixed(2)}) – skip or minimal size`;
-        slMult = 0.75;          // much tighter SL if taken
-        tpMult = 0.90;          // reduce TP targets
-        confBoost = -0.20;      // confidence penalty
+        slMult = 0.85;
+        tpMult = 1.10;
+        confBoost = -0.05;
 
     } else {
-        // Bad regime – consider reverse or strong skip
-        // Only reverse if score is clearly negative AND directional data supports it
-        const shouldReverse = finalScore <= 0.5 && score.individualScores.length >= 6 && score.individualScores.filter(s => s <= 0).length >= 4;
+        // Weak to bad regime — decide between skip and reverse
+        // Check recent individual sims for consistent bad performance
+        const recentSims = score.individualScores.slice(0, REVERSE_RECENT_COUNT);
+        const badRecentCount = recentSims.filter(s => s <= REVERSE_BAD_SIM_THRESHOLD).length;
+
+        const shouldReverse = finalScore <= REVERSE_SCORE_THRESHOLD && badRecentCount >= REVERSE_MIN_BAD;
 
         if (shouldReverse) {
             action = 'reverse';
-            baseAdvice = `🔴 Poor regime (${finalScore.toFixed(2)}) – consider reverse`;
-            slMult = 0.70;      // very tight SL on reverse trade
-            tpMult = 1.30;      // reward potential reversal
-            confBoost = -0.10;  // still cautious on reverse
+            baseAdvice = `🔴 Adverse regime (${finalScore.toFixed(2)}) – reverse (${badRecentCount}/${recentSims.length} recent bad sims)`;
+            slMult = 0.70;
+            tpMult = 1.30;
+            confBoost = -0.10;
         } else {
             action = 'skip';
-            baseAdvice = `🔴 Bad regime (${finalScore.toFixed(2)}) – strong skip`;
-            slMult = 0.60;      // extremely tight if forced
-            tpMult = 0.80;      // minimal TP
-            confBoost = -0.30;  // heavy penalty
+            baseAdvice = `🟡 Weak regime (${finalScore.toFixed(2)}) – skip`;
+            slMult = 0.75;
+            tpMult = 0.90;
+            confBoost = -0.20;
         }
     }
 
@@ -662,15 +525,14 @@ function mapScoreToAdvice(
  *   ⚠️ = warning prefix
  *   ⚡ / 🚀 = fast momentum / quick wins
  *
- * Tunable elements (hardcoded for now – easy to extract later):
- *   - High/low score thresholds for emoji choice
- *   - Duration thresholds for "fast/slow" phrasing
- *   - Warning inclusion if confidenceBoost < -0.1 or slMultiplier < 0.9
+ * New additions:
+ *   - Directional timing stats (avg duration, time-to-MFE/MAE) when available
+ *   - More nuanced warnings and drivers
  *
- * @param score     - Computed regime score + breakdown
+ * @param score     - Computed regime score + breakdown (may include directional timing)
  * @param regime    - Regime data (for outcome counts, duration, MFE/MAE)
  * @param direction - Trade direction ('long' | 'short')
- * @returns Final human-readable advice string (e.g. "🟢 Strong regime (4.1) – fast wins + good MFE → take")
+ * @returns Final human-readable advice string
  */
 function buildAdviceString(
     score: ExcursionScore,
@@ -685,8 +547,6 @@ function buildAdviceString(
     }
 
     const finalScore = score.totalScore;
-    const avgDurationSec = (regime.avgDurationMs ?? 0) / 1000;
-    const avgDurationMin = avgDurationSec / 60;
 
     // ────────────────────────────────────────────────────────────────
     // 2. DETERMINE MAIN EMOJI & VERDICT BASED ON SCORE
@@ -721,16 +581,23 @@ function buildAdviceString(
     // ────────────────────────────────────────────────────────────────
     const drivers: string[] = [];
 
-    // 4.1 Duration insight
-    if (avgDurationMin > 0) {
-        if (avgDurationMin <= 4) {
-            drivers.push(`⚡ fast wins (${avgDurationMin.toFixed(1)} min avg)`);
-        } else if (avgDurationMin >= 7) {
-            drivers.push(`🐢 slow regime (${avgDurationMin.toFixed(1)} min avg)`);
+    // 4.1 Overall duration insight
+    const avgDurationMin = regime.avgDurationMs ? (regime.avgDurationMs / 60000).toFixed(1) : null;
+    if (avgDurationMin) {
+        if (Number(avgDurationMin) <= 4) {
+            drivers.push(`⚡ fast (${avgDurationMin} min avg)`);
+        } else if (Number(avgDurationMin) >= 7) {
+            drivers.push(`🐢 slow (${avgDurationMin} min avg)`);
         } else {
-            drivers.push(`normal duration (${avgDurationMin.toFixed(1)} min)`);
+            drivers.push(`duration ${avgDurationMin} min`);
         }
     }
+
+    // Directional duration if available (from computeRegimeScore enhancement)
+    // if (score.directionalAvgDurationMs) {
+    //     const dirMin = ((score as any).directionalAvgDurationMs / 60000).toFixed(1);
+    //     drivers.push(`dir avg ${dirMin} min`);
+    // }
 
     // 4.2 MFE/MAE summary
     const mfe = regime.recentMfe ?? 0;
@@ -745,7 +612,7 @@ function buildAdviceString(
         drivers.push(`high MAE (-${absMae.toFixed(1)}%)`);
     }
 
-    // 4.3 Outcome summary (only if meaningful counts)
+    // 4.3 Outcome summary
     const oc = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
     const totalOutcomes = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
     if (totalOutcomes >= 3) {
@@ -754,56 +621,47 @@ function buildAdviceString(
         drivers.push(`${tpPct}% wins / ${slPct}% SL`);
     }
 
-    // Add drivers to advice
+    // Add drivers
     if (drivers.length > 0) {
         advice += ` – ${drivers.join(' + ')}`;
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 5. ADD DIRECTIONAL CONTEXT (long/short specific)
+    // 5. DIRECTIONAL CONTEXT
     // ────────────────────────────────────────────────────────────────
-    if (direction === 'long') {
-        advice += ` (long bias)`;
-    } else if (direction === 'short') {
-        advice += ` (short bias)`;
-    }
+    advice += direction === 'long' ? ` (long bias)` : ` (short bias)`;
 
     // ────────────────────────────────────────────────────────────────
-    // 6. COLLECT & APPEND WARNINGS (if any risky factors)
+    // 6. WARNINGS
     // ────────────────────────────────────────────────────────────────
     const warnings: string[] = [];
 
-    // High drawdown warning
-    if (absMae >= 2.5) {
-        warnings.push(`high drawdown (-${absMae.toFixed(1)}%)`);
+    if (absMae >= 2.5) warnings.push(`high drawdown (-${absMae.toFixed(1)}%)`);
+    if (avgDurationMin && Number(avgDurationMin) > 7) warnings.push(`slow closure`);
+    if (regime.slStreak >= 2) warnings.push(`SL streak: ${regime.slStreak}`);
+    if (regime.timeoutRatio > 0.5) warnings.push(`high timeouts`);
+
+    // Directional timing warnings
+    if ((score as any).directionalAvgTimeToMFE_ms > 0) {
+        const sec = ((score as any).directionalAvgTimeToMFE_ms / 1000).toFixed(0);
+        if (Number(sec) > 180) warnings.push(`late MFE peak (${sec}s)`);
     }
 
-    // Slow regime warning
-    if (avgDurationMin > 7) {
-        warnings.push(`slow closure`);
+    if ((score as any).directionalAvgTimeToMAE_ms > 0) {
+        const sec = ((score as any).directionalAvgTimeToMAE_ms / 1000).toFixed(0);
+        if (Number(sec) <= 60 && absMae >= 1.0) warnings.push(`rapid meaningful drawdown (${sec}s)`);
     }
 
-    // High SL streak warning
-    if (regime.slStreak >= 2) {
-        warnings.push(`SL streak: ${regime.slStreak}`);
-    }
-
-    // Low confidence / high timeout warning
-    if (regime.timeoutRatio > 0.5) {
-        warnings.push(`high timeouts`);
-    }
-
-    // Append warnings if present
     if (warnings.length > 0) {
         advice += ` | ⚠️ ${warnings.join(' | ')}`;
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 7. FINAL TOUCH – action implication if strong/weak
+    // 7. ACTION IMPLICATION
     // ────────────────────────────────────────────────────────────────
     if (finalScore >= 3.8) {
         advice += ` → strong take`;
-    } else if (finalScore <= 0.99) {
+    } else if (finalScore <= 1.4) {
         advice += ` → skip or reverse`;
     } else if (finalScore >= 3.0) {
         advice += ` → take`;

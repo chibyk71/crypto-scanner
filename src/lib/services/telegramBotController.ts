@@ -8,7 +8,6 @@ import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
 import { Condition, type TradeSignal } from '../../types';
 import { closeAndCleanUp } from '../..';
-import { getExcursionAdvice } from '../utils/excursionUtils';
 import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('TelegramBot');
@@ -1852,22 +1851,30 @@ export class TelegramBotController {
     }
 
     /**
- * Sends a formatted Telegram alert for a generated signal.
- *
- * Now includes:
- *   - Average duration (overall + directional if available)
- *   - Time-to-MFE / Time-to-MAE (when present)
- *   - Timeout ratio warning if high
- *   - All previous fields (confidence, SL/TP, regime summary, advice, reasons)
- *
- * @param symbol Trading pair (e.g. 'BTC/USDT')
- * @param signal Final TradeSignal (buy/sell/hold)
- * @param price Current price
- */
+  * Sends a formatted Telegram alert for a generated signal.
+  *
+  * UPDATED DESIGN (2026+ centralized AutoTrade decisions):
+  *   • This method now receives the FINAL adjusted TradeSignal from AutoTradeService.
+  *   • The signal includes:
+  *       - Final direction (reversed if applicable)
+  *       - Adjusted SL/TP levels
+  *       - Extended reason array (technical reasons + excursion advice + adjustments + reversal note)
+  *   • Header reflects final direction + explicit "↔️ REVERSED" tag if reversal occurred.
+  *   • Excursion advice/adjustments are NO LONGER fetched fresh here – they are baked into the passed reason[].
+  *   • Regime summary & timing stats are still fetched fresh (always up-to-date view).
+  *   • Alert is sent regardless of whether a live trade was placed (simulation mode supported).
+  *   • All previous rich features preserved (confidence, ML, regime warnings, timing, reasons list).
+  *
+  * @param symbol Trading pair (e.g. 'BTC/USDT')
+  * @param signal FINAL adjusted TradeSignal (post-excursion: may be reversed/adjusted)
+  * @param price Current price at signal time
+  * @param tradeExecuted Optional flag indicating if a live order was actually placed (default: true)
+  */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
-        price: number
+        price: number,
+        tradeExecuted: boolean = true
     ): Promise<void> {
         // Robust MarkdownV2 escape
         const escape = (value: string | number | undefined): string => {
@@ -1878,12 +1885,19 @@ export class TelegramBotController {
 
         const lines: string[] = [];
 
-        // ── Header ────────────────────────────────────────────────────────────────
+        // ── Optional top note if no live trade was placed ─────────────────────────────
+        if (!tradeExecuted) {
+            lines.push('🔔 **SIGNAL ALERT ONLY** (auto-trade disabled or skipped)');
+        }
+
+        // ── Header with direction + reversal tag ───────────────────────────────────
         const signalEmoji =
             signal.signal === 'buy' ? '🟢 LONG' :
                 signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
 
-        lines.push(`**${signalEmoji} SIGNAL** ${escape(symbol)}`);
+        const wasReversed = signal.reason.some(r => r.includes('REVERSED') || r.includes('reverse'));
+
+        lines.push(`**${signalEmoji} SIGNAL** ${wasReversed ? '↔️ REVERSED ' : ''}${escape(symbol)}`);
         lines.push(`**Price:** $${escape(price.toFixed(6))}`);
 
         // ── Confidence & key levels ──────────────────────────────────────────────
@@ -1911,14 +1925,14 @@ export class TelegramBotController {
             lines.push(`**Trailing:** ${escape(signal.trailingStopDistance.toFixed(6))}`);
         }
 
-        // ── Regime Summary ───────────────────────────────────────────────────────
+        // ── Regime Summary (fresh fetch – always current) ────────────────────────
         const regime = excursionCache.getRegime(symbol);
 
         if (regime && regime.recentSampleCount > 0) {
             lines.push('');
             lines.push('**Regime Summary** 📊');
 
-            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} live)` : '';
+            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
             lines.push(`Samples: **${escape(regime.recentSampleCount)}${escape(liveNote)}**`);
 
             if (regime.recentReverseCount > 0) {
@@ -1929,7 +1943,7 @@ export class TelegramBotController {
             lines.push(`Ratio: **${escape(regime.recentExcursionRatio.toFixed(2))}**`);
 
             // Outcome warnings
-            const { tp, partial_tp, sl, timeout } = regime.outcomeCounts ?? { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
+            const { tp = 0, partial_tp = 0, sl = 0, timeout = 0 } = regime.outcomeCounts ?? {};
             const total = tp + partial_tp + sl + timeout;
 
             if (total > 0) {
@@ -1950,7 +1964,7 @@ export class TelegramBotController {
             lines.push('**No recent regime data** — limited history');
         }
 
-        // ── NEW: Regime Timing Stats ─────────────────────────────────────────────
+        // ── Regime Timing Stats (fresh) ───────────────────────────────────────────
         if (regime && regime.avgDurationMs > 0) {
             lines.push('');
             lines.push('**Regime Timing Stats** ⏱️');
@@ -1958,7 +1972,6 @@ export class TelegramBotController {
             const avgMin = (regime.avgDurationMs / 60000).toFixed(1);
             lines.push(`Avg Duration: **${escape(avgMin)} min**`);
 
-            // Directional duration if available
             if (regime.avgDurationLong && regime.recentSampleCountLong && regime.recentSampleCountLong >= 2) {
                 const longMin = (regime.avgDurationLong / 60000).toFixed(1);
                 lines.push(`Longs Avg: **${escape(longMin)} min**`);
@@ -1969,7 +1982,6 @@ export class TelegramBotController {
                 lines.push(`Shorts Avg: **${escape(shortMin)} min**`);
             }
 
-            // Simple comparison
             if (regime.avgDurationLong && regime.avgDurationShort) {
                 const diff = Math.abs(regime.avgDurationLong - regime.avgDurationShort) / 60000;
                 if (diff > 3) {
@@ -1977,9 +1989,8 @@ export class TelegramBotController {
                 }
             }
 
-            // Time-to-MFE / MAE if available (from individual recent sims if historyJson present)
             if ('historyJson' in regime && regime.historyJson && regime.historyJson.length > 0) {
-                const recent = regime.historyJson[0]; // most recent sim
+                const recent = regime.historyJson[0];
                 if (recent.timeToMFE_ms > 0) {
                     lines.push(`Recent Time-to-MFE: **${(recent.timeToMFE_ms / 1000).toFixed(0)} sec**`);
                 }
@@ -1989,31 +2000,10 @@ export class TelegramBotController {
             }
         }
 
-        // ── Fresh Excursion Advice ───────────────────────────────────────────────
-        if (regime && regime.recentSampleCount >= 2) {
-            const dir = signal.signal === 'buy' ? 'long' : 'short';
-            const adviceObj = getExcursionAdvice(regime, dir);
-
-            lines.push('');
-            lines.push(`**Excursion Advice:** ${escape(adviceObj.advice)}`);
-
-            const adj = adviceObj.adjustments;
-            const adjParts: string[] = [];
-            if (adj.slMultiplier !== 1) adjParts.push(`SL ×${escape(adj.slMultiplier.toFixed(2))}`);
-            if (adj.tpMultiplier !== 1) adjParts.push(`TP ×${escape(adj.tpMultiplier.toFixed(2))}`);
-            if (adj.confidenceBoost !== 0) {
-                adjParts.push(`Conf ${adj.confidenceBoost > 0 ? '+' : ''}${escape(adj.confidenceBoost.toFixed(2))}`);
-            }
-
-            if (adjParts.length > 0) {
-                lines.push(`**Adjustments:** ${adjParts.join(' \\| ')}`);
-            }
-        }
-
-        // ── Strategy Reasons ─────────────────────────────────────────────────────
+        // ── Strategy + Excursion Reasons (uses passed extended array) ─────────────
         if (signal.reason?.length > 0) {
             lines.push('');
-            lines.push('**Signal Reasons:**');
+            lines.push('**Signal Reasons & Excursion Notes:**');
             signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
         }
 
@@ -2027,7 +2017,9 @@ export class TelegramBotController {
 
         try {
             await this.sendMessage(message, { parse_mode: 'MarkdownV2' });
-            logger.info(`Signal alert sent for ${symbol} (${signal.signal})`);
+            logger.info(`Signal alert sent for ${symbol} (${signal.signal}${wasReversed ? ' REVERSED' : ''})`, {
+                tradeExecuted
+            });
         } catch (err) {
             logger.error('Failed to send signal alert', {
                 symbol,

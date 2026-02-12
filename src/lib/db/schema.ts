@@ -140,53 +140,6 @@ export const ohlcvHistory = mysqlTable('ohlcv_history', {
 
 /**
  * =============================================================================
- * ML TRAINING SAMPLES
- * =============================================================================
- *
- * Stores feature vectors and final 5-tier labels (-2 to +2) from simulated trades.
- * This is the primary dataset used to train the Random Forest model.
- *
- * Key features:
- *   • features: JSON array of normalized numbers (parsed to number[] in TS)
- *   • label: -2 (big loss) → +2 (strong win) based on R-multiple
- *   • Indexes on symbol, label, and createdAt for fast analytics and retraining
- *
- * Used by:
- *   • MLService – training, prediction, and performance reporting
- *   • DatabaseService – ingestion after every simulation
- */
-export const trainingSamples = mysqlTable(
-    'training_samples',
-    {
-        /** Auto-incrementing primary key */
-        id: int('id').primaryKey().autoincrement(),
-
-        /** Trading symbol the sample came from – for per-symbol analysis */
-        symbol: varchar('symbol', { length: 50 }).notNull(),
-
-        /** Normalized feature vector – stored as JSON, parsed to number[] */
-        features: json('features').$type<number[]>().notNull(),
-
-        /** Final 5-tier outcome label (-2 to +2) */
-        label: int('label').notNull(),
-
-        /** When the sample was created (simulation close time) */
-        createdAt: timestamp('created_at').defaultNow(),
-    },
-    (table) => ({
-        /** Index for per-symbol performance queries */
-        symbolIdx: index('idx_training_symbol').on(table.symbol),
-
-        /** Index for label distribution queries */
-        labelIdx: index('idx_training_label').on(table.label),
-
-        /** Index for chronological retrieval */
-        createdAtIdx: index('idx_training_created').on(table.createdAt),
-    })
-);
-
-/**
- * =============================================================================
  * EXECUTED TRADES (LIVE OR PAPER)
  * =============================================================================
  *
@@ -234,75 +187,134 @@ export const trades = mysqlTable(
 
 /**
  * =============================================================================
- * SIMULATED TRADES – CORE OF ML LABELING ENGINE
+ * SIMULATED TRADES – SINGLE SOURCE OF TRUTH FOR SIMULATIONS & ML TRAINING
  * =============================================================================
  *
- * Records every simulated trade with full outcome details.
- * This is the source of truth for ML training labels and excursion metrics.
+ * This table records **every simulated trade** from signal generation to outcome.
+ * It now serves as the **sole source** for:
+ *   - Simulation results (PnL, outcome, excursions, duration, etc.)
+ *   - Machine learning training data (when label IS NOT NULL)
  *
- * High-precision storage:
- *   • All prices/distances: ×1e8
- *   • MFE/MAE: ×1e4 (percentage of entry price)
- *   • PnL: ×1e8
- *   • R-multiple: ×1e4
+ * Important notes (2026 reality after removing training_samples table):
+ *   - No duplication: features, label, MFE/MAE, duration, etc. live only here
+ *   - ML training queries: SELECT * FROM simulated_trades WHERE label IS NOT NULL
+ *   - No extra flag needed: presence of label indicates row is usable for training
+ *   - Retention: consider adding cleanup job (e.g. delete rows >90 days old)
  *
- * Supports:
- *   • Partial take-profits (multiple levels)
- *   • Trailing stops
- *   • Timeout exits
- *   • Max Favorable/Adverse Excursion tracking
+ * High-precision storage rules:
+ *   • Prices, distances, PnL           → ×1e8 (float or bigint)
+ *   • Percentages (MFE/MAE, R-multiple) → ×1e4 (bigint)
+ *   • Timestamps                        → Unix ms (bigint)
+ *   • JSON arrays                       → structured objects/arrays
+ *
+ * Indexes are optimized for:
+ *   - Fast lookup by signalId (unique)
+ *   - Per-symbol queries (recent simulations, regime calculation)
+ *   - Filtering by outcome/label/closed time (ML training, reporting)
  */
 export const simulatedTrades = mysqlTable(
     'simulated_trades',
     {
+        /** Auto-incrementing primary key */
         id: int('id').primaryKey().autoincrement(),
 
-        /** UUID linking open → close operations */
+        /**
+         * UUID linking signal generation → simulation close
+         * Used to correlate logs, alerts, and database rows
+         */
         signalId: varchar('signal_id', { length: 36 }).notNull().unique(),
 
+        /** Trading pair (e.g. 'BTC/USDT', 'ETH/USDT') */
         symbol: varchar('symbol', { length: 50 }).notNull(),
-        side: varchar('side', { length: 10 }).$type<'buy' | 'sell'>().notNull(), // 'buy' | 'sell'
 
-        /** Entry price ×1e8 */
+        /** Trade direction */
+        side: varchar('side', { length: 10 }).$type<'buy' | 'sell'>().notNull(),
+
+        /** Entry price ×1e8 (high precision) */
         entryPrice: float('entry_price').notNull(),
 
-        stopLoss: float('stop_loss'),                    // Fixed SL ×1e8
-        trailingDist: float('trailing_dist'),            // Trailing distance ×1e8
+        /** Fixed stop-loss price ×1e8 (nullable if no SL) */
+        stopLoss: float('stop_loss'),
 
-        /** Partial TP levels – array of { price ×1e8, weight } */
-        tpLevels: json('tp_levels').$type<{ price: number; weight: number }[]>(),
+        /** Trailing stop distance ×1e8 (nullable if no trailing) */
+        trailingDist: float('trailing_dist'),
 
+        /**
+         * Partial take-profit levels
+         * Array of objects: { price: number ×1e8, weight: number (0-1) }
+         */
+        tpLevels: json('tp_levels').$type<{ price: number; weight: number }[] | null>(),
+
+        /** Unix ms timestamp when simulation started */
         openedAt: bigint('opened_at', { mode: 'number' }).notNull(),
+
+        /** Unix ms timestamp when simulation ended (TP/SL/timeout) */
         closedAt: bigint('closed_at', { mode: 'number' }),
 
-        outcome: varchar('outcome', { length: 15 }),     // 'tp', 'partial_tp', 'sl', 'timeout'
+        /**
+         * Final outcome of the simulated trade
+         * - 'tp'         : full take-profit hit
+         * - 'partial_tp' : partial TP(s) hit
+         * - 'sl'         : stop-loss hit
+         * - 'timeout'    : reached max duration without exit
+         */
+        outcome: varchar('outcome', { length: 15 }),
 
         /** Realized PnL ×1e8 */
         pnl: bigint('pnl', { mode: 'number' }).notNull(),
 
-        /** R-multiple ×1e4 */
+        /** Risk-adjusted return (PnL / initial risk) ×1e4 */
         rMultiple: bigint('r_multiple', { mode: 'number' }),
 
-        /** Final 5-tier label for ML */
+        /**
+         * Final ML training label (-2 to +2)
+         * NULL = simulation still open or not labeled
+         * NOT NULL = ready for ML training / regime stats
+         */
         label: int('label'),
 
-        /** Max Favorable Excursion as % ×1e4 */
-        maxFavorableExcursion: bigint('mfe', { mode: 'number' }),
+        /** Max Favorable Excursion (% of entry) ×1e4 */
+        maxFavorableExcursion: bigint('mfe', { mode: 'number' }).default(0),
 
-        /** Max Adverse Excursion as % ×1e4 */
-        maxAdverseExcursion: bigint('mae', { mode: 'number' }),
+        /** Max Adverse Excursion (% of entry) ×1e4 */
+        maxAdverseExcursion: bigint('mae', { mode: 'number' }).default(0),
 
+        /** Total duration of the simulation in milliseconds */
         durationMs: bigint('duration_ms', { mode: 'number' }).default(0),
+
+        /** Time from entry to max favorable excursion (ms) */
         timeToMFEMs: bigint('time_to_mfe_ms', { mode: 'number' }).default(0),
+
+        /** Time from entry to max adverse excursion (ms) */
         timeToMAEMs: bigint('time_to_mae_ms', { mode: 'number' }).default(0),
+
+        /**
+         * Feature vector used at signal time (indicators + regime stats)
+         * Stored as JSON array of numbers
+         * Only populated for rows where label IS NOT NULL
+         */
+        features: json('features').$type<number[] | null>(),
     },
     (table) => ({
+        /** Fast lookup by signal UUID */
         signalIdIdx: index('idx_sim_signal_id').on(table.signalId),
+
+        /** Per-symbol queries (recent trades, regime stats) */
         symbolIdx: index('idx_sim_symbol').on(table.symbol),
+
+        /** Time-based filtering (recent simulations) */
         openedAtIdx: index('idx_sim_opened').on(table.openedAt),
+
+        /** Outcome filtering (e.g. only timeouts or SLs) */
         outcomeIdx: index('idx_sim_outcome').on(table.outcome),
-        labelIdx: index('idx_sim_label').on(table.label),
+
+        /** ML training filter + per-symbol label stats */
+        labelIdx: index('idx_sim_label').on(table.symbol, table.label),
+
+        /** Closed time for recent results / cache warm-up */
         closedAtIdx: index('idx_sim_closed').on(table.closedAt),
+
+        /** Duration queries / long-trade detection */
         durationIdx: index('idx_sim_duration').on(table.durationMs),
     })
 );
@@ -356,9 +368,6 @@ export type Heartbeat = typeof heartbeat.$inferSelect;
 
 export type CoolDown = typeof coolDownTable.$inferSelect;
 export type NewCoolDown = typeof coolDownTable.$inferInsert;
-
-export type TrainingSample = typeof trainingSamples.$inferSelect;
-export type NewTrainingSample = typeof trainingSamples.$inferInsert;
 
 export type Trade = typeof trades.$inferSelect;
 export type NewTrade = typeof trades.$inferInsert;

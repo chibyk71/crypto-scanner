@@ -9,7 +9,7 @@ CREATE TABLE `alert` (
 	`last_alert_at` bigint DEFAULT 0,
 	CONSTRAINT `alert_id` PRIMARY KEY(`id`)
 );
---> statement-breakpoint
+
 CREATE TABLE `cool_down` (
 	`id` int AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(15),
@@ -17,20 +17,20 @@ CREATE TABLE `cool_down` (
 	CONSTRAINT `cool_down_id` PRIMARY KEY(`id`),
 	CONSTRAINT `cool_down_symbol_unique` UNIQUE(`symbol`)
 );
---> statement-breakpoint
+
 CREATE TABLE `heartbeat` (
 	`id` int NOT NULL,
 	`cycle_count` int NOT NULL DEFAULT 0,
 	`last_heartbeat_at` bigint NOT NULL DEFAULT 0,
 	CONSTRAINT `heartbeat_id` PRIMARY KEY(`id`)
 );
---> statement-breakpoint
+
 CREATE TABLE `locks` (
 	`id` int NOT NULL,
 	`is_locked` boolean NOT NULL DEFAULT false,
 	CONSTRAINT `locks_id` PRIMARY KEY(`id`)
 );
---> statement-breakpoint
+
 CREATE TABLE `ohlcv_history` (
 	`id` bigint AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(30) NOT NULL,
@@ -44,14 +44,14 @@ CREATE TABLE `ohlcv_history` (
 	CONSTRAINT `ohlcv_history_id` PRIMARY KEY(`id`),
 	CONSTRAINT `unique_candle` UNIQUE(`symbol`,`timeframe`,`timestamp`)
 );
---> statement-breakpoint
+
 CREATE TABLE `session` (
 	`id` varchar(255) NOT NULL,
 	`user_id` varchar(255) NOT NULL,
 	`expires_at` timestamp NOT NULL,
 	CONSTRAINT `session_id` PRIMARY KEY(`id`)
 );
---> statement-breakpoint
+
 CREATE TABLE `simulated_trades` (
 	`id` int AUTO_INCREMENT NOT NULL,
 	`signal_id` varchar(36) NOT NULL,
@@ -67,15 +67,16 @@ CREATE TABLE `simulated_trades` (
 	`pnl` bigint NOT NULL,
 	`r_multiple` bigint,
 	`label` int,
-	`mfe` bigint,
-	`mae` bigint,
+	`mfe` bigint DEFAULT 0,
+	`mae` bigint DEFAULT 0,
 	`duration_ms` bigint DEFAULT 0,
 	`time_to_mfe_ms` bigint DEFAULT 0,
 	`time_to_mae_ms` bigint DEFAULT 0,
+	`features` json,
 	CONSTRAINT `simulated_trades_id` PRIMARY KEY(`id`),
 	CONSTRAINT `simulated_trades_signal_id_unique` UNIQUE(`signal_id`)
 );
---> statement-breakpoint
+
 CREATE TABLE `trades` (
 	`id` int AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(50) NOT NULL,
@@ -87,16 +88,7 @@ CREATE TABLE `trades` (
 	`order_id` varchar(50) NOT NULL,
 	CONSTRAINT `trades_id` PRIMARY KEY(`id`)
 );
---> statement-breakpoint
-CREATE TABLE `training_samples` (
-	`id` int AUTO_INCREMENT NOT NULL,
-	`symbol` varchar(50) NOT NULL,
-	`features` json NOT NULL,
-	`label` int NOT NULL,
-	`created_at` timestamp DEFAULT (now()),
-	CONSTRAINT `training_samples_id` PRIMARY KEY(`id`)
-);
---> statement-breakpoint
+
 CREATE TABLE `user` (
 	`id` varchar(255) NOT NULL,
 	`age` int,
@@ -105,18 +97,15 @@ CREATE TABLE `user` (
 	CONSTRAINT `user_id` PRIMARY KEY(`id`),
 	CONSTRAINT `user_username_unique` UNIQUE(`username`)
 );
---> statement-breakpoint
-ALTER TABLE `session` ADD CONSTRAINT `session_user_id_user_id_fk` FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX `idx_symbol_time` ON `ohlcv_history` (`symbol`,`timeframe`,`timestamp`);--> statement-breakpoint
-CREATE INDEX `idx_sim_signal_id` ON `simulated_trades` (`signal_id`);--> statement-breakpoint
-CREATE INDEX `idx_sim_symbol` ON `simulated_trades` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_sim_opened` ON `simulated_trades` (`opened_at`);--> statement-breakpoint
-CREATE INDEX `idx_sim_outcome` ON `simulated_trades` (`outcome`);--> statement-breakpoint
-CREATE INDEX `idx_sim_label` ON `simulated_trades` (`label`);--> statement-breakpoint
-CREATE INDEX `idx_sim_closed` ON `simulated_trades` (`closed_at`);--> statement-breakpoint
-CREATE INDEX `idx_sim_duration` ON `simulated_trades` (`duration_ms`);--> statement-breakpoint
-CREATE INDEX `idx_trades_symbol` ON `trades` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
-CREATE INDEX `idx_training_symbol` ON `training_samples` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_training_label` ON `training_samples` (`label`);--> statement-breakpoint
-CREATE INDEX `idx_training_created` ON `training_samples` (`created_at`);
+
+ALTER TABLE `session` ADD CONSTRAINT `session_user_id_user_id_fk` FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON DELETE cascade ON UPDATE no action;
+CREATE INDEX `idx_symbol_time` ON `ohlcv_history` (`symbol`,`timeframe`,`timestamp`);
+CREATE INDEX `idx_sim_signal_id` ON `simulated_trades` (`signal_id`);
+CREATE INDEX `idx_sim_symbol` ON `simulated_trades` (`symbol`);
+CREATE INDEX `idx_sim_opened` ON `simulated_trades` (`opened_at`);
+CREATE INDEX `idx_sim_outcome` ON `simulated_trades` (`outcome`);
+CREATE INDEX `idx_sim_label` ON `simulated_trades` (`symbol`,`label`);
+CREATE INDEX `idx_sim_closed` ON `simulated_trades` (`closed_at`);
+CREATE INDEX `idx_sim_duration` ON `simulated_trades` (`duration_ms`);
+CREATE INDEX `idx_trades_symbol` ON `trades` (`symbol`);
+CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);

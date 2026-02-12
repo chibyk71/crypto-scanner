@@ -1,7 +1,7 @@
 // src/lib/services/exchange.ts
 
 import { config } from '../config/settings';
-import ccxt, { type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
+import ccxt, { type bybit, type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
 import { createLogger } from '../logger';
 import type { OhlcvData } from '../../types';
 // import { dbService } from '../db';
@@ -49,6 +49,8 @@ export class ExchangeService {
         if (config.exchange.apiKey && config.exchange.apiSecret) {
             this.exchange.apiKey = config.exchange.apiKey;
             this.exchange.secret = config.exchange.apiSecret;
+
+            (this.exchange as bybit).enableDemoTrading(config.exchange.testnet);
         }
     }
 
@@ -69,7 +71,9 @@ export class ExchangeService {
         return new exchangeClass({
             enableRateLimit: true,
             timeout: 60000,
-            options: { defaultType: 'futures' },
+            version: 'v5',
+
+            options: { defaultType: 'futures', "trade.type": "linear" },
         }) as Exchange;
     }
 

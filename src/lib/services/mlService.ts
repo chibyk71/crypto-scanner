@@ -23,6 +23,7 @@ import { config } from '../config/settings';
 import { dbService } from '../db';
 import type { StrategyInput, SignalLabel } from '../../types'; // ← Critical: from single source of truth
 import { computeIndicators } from '../utils/indicatorUtils';   // ← Centralized indicator calculations
+import { excursionCache } from './excursionHistoryCache';
 
 /**
  * Dedicated logger for all ML-related operations
@@ -49,14 +50,19 @@ export class MLService {
     private isModelLoaded = false;     // Has a valid model been loaded from disk?
     private isTrainingPaused = false;  // Manual pause (via /ml_pause command)
 
-    // Complete set of possible labels – used for probability calculation
-    private readonly ALL_LABELS: SignalLabel[] = [-2, -1, 0, 1, 2];
-
     // Hyperparameters – tuned for crypto market characteristics
     private readonly N_ESTIMATORS = 300;         // Number of trees (more = better but slower)
     private readonly MAX_DEPTH = 14;             // Tree depth limit (prevents overfitting)
     private readonly MIN_SAMPLES_SPLIT = 4;      // Minimum samples to split a node
     private readonly MAX_FEATURES = 0.85;        // Fraction of features per tree (randomness)
+
+    private readonly INTERNAL_TO_LABEL: Record<number, SignalLabel> = {
+        0: -2,
+        1: -1,
+        2: 0,
+        3: 1,
+        4: 2
+    };
 
     // =========================================================================
     // CONSTRUCTOR – Initialize classifier and attempt to load saved model
@@ -175,90 +181,122 @@ export class MLService {
         }
     }
 
-    // ===========================================================================
-    // FEATURE EXTRACTION – Build normalized prediction vector
-    // ===========================================================================
     /**
-     * Extracts a fixed-length feature vector from market data for ML prediction.
-     *
-     * Called from:
-     *   • Strategy.generateSignal() – for every potential signal
-     *   • simulateAndTrain() – to store features with simulation outcome
-     *
-     * Design:
-     *   • Uses centralized computeIndicators() → consistent with training data
-     *   • Combines technical indicators + symbol-specific excursion history
-     *   • All values normalized/scaled for better model convergence
-     *   • Async because it fetches excursion stats from DB
-     *
-     * Feature groups:
-     *   1. Technical indicators (latest values)
-     *   2. Historical excursion metrics (MFE/MAE from symbolHistory)
-     *   3. Market regime (volume, price scaling)
-     *
-     * @param input - Full market context (symbol, OHLCV, current price)
-     * @returns Fixed-length number[] ready for classifier.predict()
-     */
+ * Extracts a fixed-length feature vector from market data for ML prediction.
+ *
+ * Called from:
+ *   • Strategy.generateSignal() – for every potential signal (live prediction)
+ *   • simulateTrade() – to store features with simulation outcome (training data)
+ *
+ * Design principles:
+ *   - Fixed length: always returns the same number of features (currently ~19)
+ *   - Normalized values: most features scaled to [0,1] or small range for better convergence
+ *   - Consistent: uses same computeIndicators() as training → no train/test mismatch
+ *   - Async: fetches live excursion regime from DB/cache
+ *   - Defensive: no NaN/Infinity, safe fallbacks for missing data
+ *
+ * Feature groups (order matters — do not reorder without updating model):
+ *   1. Technical indicators (normalized latest values from primary + HTF)
+ *   2. Real-time excursion regime (MFE/MAE/ratio from recent simulations)
+ *   3. Market context (volume, price scaling)
+ *
+ * @param input Full market context at signal time
+ * @returns Fixed-length number[] ready for classifier.predict()
+ * @throws Error if feature length mismatch detected (critical for model integrity)
+ */
     public async extractFeatures(input: StrategyInput): Promise<number[]> {
         const { symbol, primaryData, htfData, price } = input;
+
+        // Safety: prevent division by zero or invalid price
+        if (price <= 0) {
+            logger.warn('Invalid price in extractFeatures – using fallback', { symbol, price });
+            return new Array(19).fill(0); // fallback neutral vector
+        }
+
         const f: number[] = [];
 
-        // === 1. Centralized technical indicators (primary + HTF) ===
+        // ── 1. Technical indicators (primary + HTF) ─────────────────────────────
         const indicators = computeIndicators(primaryData, htfData);
         const last = indicators.last;
 
+        // Normalize to avoid large value ranges
         f.push(
-            last.rsi / 100,
-            last.emaShort ? (price - last.emaShort) / price : 0,
+            last.rsi ? last.rsi / 100 : 0.5,                        // 0–1
+            last.emaShort ? (price - last.emaShort) / price : 0,    // relative deviation
             last.emaMid ? (price - last.emaMid) / price : 0,
             last.emaLong ? (price - last.emaLong) / price : 0,
-            last.macdLine,
-            last.macdSignal,
-            last.macdHistogram,
-            last.stochasticK / 100,
-            last.stochasticD / 100,
-            last.atr / price,
-            last.htfAdx / 100,
-            last.percentB,
-            last.bbBandwidth / 100,
-            last.momentum / price,
-            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0
+            last.macdLine ?? 0,                                     // raw (usually small)
+            last.macdSignal ?? 0,
+            last.macdHistogram ?? 0,
+            last.stochasticK ? last.stochasticK / 100 : 0.5,
+            last.stochasticD ? last.stochasticD / 100 : 0.5,
+            last.atr ? last.atr / price : 0,                        // volatility relative to price
+            last.htfAdx ? last.htfAdx / 100 : 0,                    // trend strength
+            last.percentB ?? 0.5,                                   // Bollinger position
+            last.bbBandwidth ? last.bbBandwidth / 100 : 0,          // volatility squeeze
+            last.momentum ? last.momentum / price : 0,              // momentum relative
+            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // categorical
         );
 
-        // === 2. REAL-TIME Excursion features (live + recent closed) ===
-        const regime = await dbService.getCurrentRegime(symbol);
-
-        if (regime.sampleCount > 0) {
-            const mfePct = regime.mfe;
-            const maePct = regime.mae; // negative
-            const ratio = regime.excursionRatio;
-
-            // Normalize to reasonable ranges
-            f.push(
-                mfePct / 10,           // e.g., 5% → 0.5
-                Math.abs(maePct) / 10, // MAE magnitude
-                ratio / 5              // e.g., ratio 3 → 0.6
-            );
-
-            logger.debug('Added real-time excursion features', {
-                symbol,
-                liveMfe: mfePct.toFixed(2),
-                liveMae: maePct.toFixed(2),
-                liveRatio: ratio.toFixed(2),
-                activeSims: regime.activeCount,
-            });
-        } else {
-            // No data yet → neutral
-            f.push(0, 0, 1); // ratio = 1 = balanced
+        // ── 2. Real-time excursion regime features (live + recent closed) ───────
+        let regime;
+        try {
+            regime = await excursionCache.getRegimeLite(symbol);
+        } catch (err) {
+            logger.warn('Failed to fetch regime in extractFeatures – using neutral', { symbol, err });
         }
 
-        // === 3. Market regime features – volume and price scaling ===
+        if (regime && regime.recentSampleCount > 0) {
+            const mfePct = regime.recentMfe ?? 0;
+            const maePct = regime.recentMae ?? 0; // negative
+            const ratio = regime.recentExcursionRatio ?? 1;
+
+            // Normalize to reasonable ranges (avoid extreme values breaking model)
+            f.push(
+                Math.min(10, Math.max(0, mfePct)) / 10,          // 0–1 (cap at 10%)
+                Math.min(10, Math.abs(maePct)) / 10,             // MAE magnitude 0–1
+                Math.min(10, ratio) / 5                          // ratio usually 0–5 → 0–1
+            );
+
+            if (logger.isDebugEnabled()) {
+                logger.debug('Added excursion regime features', {
+                    symbol,
+                    liveMfe: mfePct.toFixed(2),
+                    liveMae: maePct.toFixed(2),
+                    liveRatio: ratio.toFixed(2),
+                    activeSims: regime.activeCount,
+                    sampleCount: regime.recentSampleCount,
+                });
+            }
+        } else {
+            // No regime data yet → neutral values
+            f.push(0, 0, 0.2); // slight bias toward balanced ratio
+        }
+
+        // ── 3. Market context features (volume, scaling) ────────────────────────
         f.push(
-            last.obv / 1e9,
-            last.vwap / 1e6,
-            last.vwma / 1e6,
-            price / 1e5
+            last.obv ? last.obv / 1e9 : 0,           // OBV scaled down
+            last.vwap ? last.vwap / 1e6 : 0,         // VWAP scaled
+            last.vwma ? last.vwma / 1e6 : 0,         // VWMA scaled
+            price / 1e5                              // price scaled (e.g. BTC ~60k → 0.6)
         );
+
+        // ── Final validation: fixed length check (critical for model) ───────────
+        const expectedLength = 22; // Update this number if you add/remove features!
+        if (f.length !== expectedLength) {
+            logger.error('Feature length mismatch in extractFeatures', {
+                expected: expectedLength,
+                actual: f.length,
+                symbol,
+            });
+            throw new Error(`Feature vector length error: expected ${expectedLength}, got ${f.length}`);
+        }
+
+        // Optional: final NaN/Infinity guard (should never happen after above)
+        if (f.some(v => isNaN(v) || !isFinite(v))) {
+            logger.error('NaN or Infinity detected in final features', { symbol });
+            return new Array(expectedLength).fill(0);
+        }
 
         return f;
     }
@@ -288,15 +326,16 @@ export class MLService {
         }
 
         try {
-            // Initialize probability map for all labels
+            // Initialize probability map for all labels (original -2..2)
             const probabilities: Record<SignalLabel, number> = {
-                [-2]: 0, [-1]: 0, 0: 0, 1: 0, 2: 0,
+                [-2]: 0, [-1]: 0, [0]: 0, [1]: 0, [2]: 0,
             };
 
-            // Query probability for each possible label
-            for (const label of this.ALL_LABELS) {
-                const probArray = this.classifier.predictProbability([features], label);
-                probabilities[label] = probArray[0];  // Single-sample array
+            // Query probability for each possible internal label (0..4)
+            for (let internalLabel = 0; internalLabel < 5; internalLabel++) {
+                const probArray = this.classifier.predictProbability([features], internalLabel);
+                const originalLabel = this.INTERNAL_TO_LABEL[internalLabel];  // Map back to -2..2
+                probabilities[originalLabel] = probArray[0];  // Single-sample array
             }
 
             // Extract individual probabilities
@@ -328,118 +367,119 @@ export class MLService {
         }
     }
 
-    // ===========================================================================
-    // INGEST SIMULATED OUTCOME – Add new labeled sample from completed simulation
-    // ===========================================================================
     /**
-     * Stores a new training sample after a simulation finishes.
-     *
-     * Called from:
-     *   • MarketScanner.simulateAndTrain() – after closeSimulatedTrade()
-     *
-     * Responsibilities:
-     *   • Save to database (persistent)
-     *   • Trigger periodic retraining (every 20 new samples after threshold)
-     *   • Respect training pause state
-     *
-     * @param symbol - Trading pair
-     * @param features - Vector from extractFeatures() at signal time
-     * @param label - Final 5-tier outcome
-     * @param rMultiple - For logging
-     * @param pnlPercent - For logging
-     */
-    public async ingestSimulatedOutcome(
-        symbol: string,
-        features: number[],
-        label: SignalLabel,
-        rMultiple: number,
-        pnlPercent: number
-    ): Promise<void> {
-        // Respect manual pause (via /ml_pause)
+ * Retrains the Random Forest model using all labeled simulations from the DB.
+ *
+ * Called from:
+ *   • forceRetrain() – manually via Telegram /ml_train
+ *   • (Future: optional periodic trigger after N new samples)
+ *
+ * Current reality (after merging trainingSamples → simulatedTrades):
+ *   - Source table: simulatedTrades
+ *   - Filter: WHERE label IS NOT NULL
+ *   - Labels remapped internally (-2..2 → 0..4) to avoid ml-cart negative index crash
+ *   - Heavy filtering for clean data (NaN/Infinity, invalid labels)
+ *   - No separate ingestion step — simulations already stored complete
+ *
+ * @private – called internally or via force command
+ */
+    public async retrain(): Promise<void> {
         if (this.isTrainingPaused) {
-            logger.info('Training paused – skipping sample', { symbol, label });
+            logger.info('Training is paused — skipping retrain');
             return;
         }
 
         try {
-            // Persist sample to database
-            await dbService.addTrainingSample({
-                symbol,
-                features,
-                label,
-            });
+            // 1. Load all labeled simulations (WHERE label IS NOT NULL)
+            const allSamples = await dbService.getLabeledSimulations();
+            logger.info(`Loaded ${allSamples.length} labeled simulations for retraining`);
 
-            // Rich log for monitoring data quality
-            logger.info('New training sample ingested', {
-                symbol,
-                label,
-                rMultiple: rMultiple.toFixed(2),
-                pnl: `${(pnlPercent * 100).toFixed(2)}%`,
-                features: features.length,
-            });
-
-            // Periodic retraining trigger
-            const count = await dbService.getSampleCount();
-            if (count >= config.ml.minSamplesToTrain && count % 20 === 0) {
-                await this.retrain();
-            }
-        } catch (err) {
-            logger.error('Failed to ingest training sample', { error: err instanceof Error ? err.stack : err });
-        }
-    }
-
-    // ===========================================================================
-    // RETRAINING – Train model on all accumulated samples
-    // ===========================================================================
-    /**
-     * Retrains the Random Forest model using all stored training samples.
-     *
-     * Called from:
-     *   • ingestSimulatedOutcome() – periodically
-     *   • /ml_train command – manually
-     *
-     * Process:
-     *   • Load all samples from DB
-     *   • Skip if below minimum threshold
-     *   • Train classifier
-     *   • Save updated model to disk
-     *   • Log new label distribution
-     *
-     * @private – only called internally or via force command
-     */
-    private async retrain(): Promise<void> {
-        // Respect pause state
-        if (this.isTrainingPaused) return;
-
-        try {
-            // Load full dataset
-            const samples = await dbService.getTrainingSamples();
-            if (samples.length < config.ml.minSamplesToTrain) {
-                logger.warn(`Not enough samples to retrain (${samples.length})`);
+            if (allSamples.length < config.ml.minSamplesToTrain) {
+                logger.warn(`Not enough labeled samples to retrain (${allSamples.length} < ${config.ml.minSamplesToTrain})`);
                 return;
             }
 
-            // Prepare training matrices
-            const X = samples.map(s => s.features);  // Feature vectors
-            const y = samples.map(s => s.label);     // Labels
+            // 2. Label remapping: -2→0, -1→1, 0→2, 1→3, 2→4
+            const labelToInternal: Record<SignalLabel, number> = {
+                '-2': 0,
+                '-1': 1,
+                '0': 2,
+                '1': 3,
+                '2': 4
+            };
 
-            logger.info(`Retraining ML model on ${samples.length} samples...`);
+            // 3. Filter & clean samples (critical for stability)
+            const validSamples = allSamples.filter(sample => {
+                // Must have valid features array
+                if (!Array.isArray(sample.features) || sample.features.length === 0) {
+                    return false;
+                }
 
-            // Perform training
+                // No NaN/Infinity in features
+                const hasInvalidFeature = sample.features.some(v =>
+                    typeof v !== 'number' || isNaN(v) || !isFinite(v)
+                );
+
+                // Label must be valid integer -2..2
+                const label = sample.label;
+                const validLabel = typeof label === 'number' && Number.isInteger(label) && [-2, -1, 0, 1, 2].includes(label);
+
+                return !hasInvalidFeature && validLabel;
+            });
+
+            if (validSamples.length < allSamples.length) {
+                logger.warn(
+                    `Filtered out ${allSamples.length - validSamples.length} invalid samples ` +
+                    `(NaN/Infinity features or invalid labels)`
+                );
+            }
+
+            if (validSamples.length < Math.max(20, config.ml.minSamplesToTrain / 2)) {
+                logger.error(`Too few valid samples after filtering (${validSamples.length}) — cannot train`);
+                return;
+            }
+
+            // 4. Prepare training matrices
+            const X = validSamples.map(s => s.features).filter(f => Array.isArray(f) && f.length > 0) as number[][];
+            const y = validSamples.map(s => labelToInternal[s.label as SignalLabel]);
+
+            // Debug: internal label distribution (0–4)
+            const internalCounts = y.reduce((acc: Record<number, number>, lbl) => {
+                acc[lbl] = (acc[lbl] || 0) + 1;
+                return acc;
+            }, {});
+            logger.info('Internal label distribution (0–4):', internalCounts);
+
+            // Debug: original label distribution (-2..2)
+            const originalCounts = validSamples.reduce((acc: Record<number, number>, s) => {
+                acc[s.label!] = (acc[s.label!] || 0) + 1;
+                return acc;
+            }, {});
+            logger.info('Original label distribution (-2..+2):', originalCounts);
+
+            logger.info(`Starting training on ${X.length} clean samples (${X[0]?.length ?? 0} features)`);
+
+            // 5. Train the model
             this.classifier.train(X, y);
 
-            // Persist new model
+            logger.info('Training completed successfully');
+
+            // 6. Persist the model
             await this.saveModel();
             this.isModelLoaded = true;
 
-            // Report new class balance
+            // 7. Final report
             const dist = await dbService.getLabelDistribution();
             logger.info('Model retrained & saved', {
-                samples: samples.length,
-                distribution: dist.map(d => `${d.label}:${d.count}`).join(', '),
+                samplesUsed: X.length,
+                originalDistribution: dist.map(d => `${d.label}:${d.count}`).join(', ')
             });
+
         } catch (err) {
-            logger.error('Retraining failed', { error: err instanceof Error ? err.stack : err });
+            logger.error('Retraining failed', {
+                error: err instanceof Error ? err.stack : String(err),
+                message: err instanceof Error ? err.message : 'Unknown error'
+            });
         }
     }
 
@@ -541,41 +581,43 @@ export class MLService {
         ].join('\n');
     }
 
-    // =========================================================================
-    // REPORTING: Per-symbol training sample summary (Telegram friendly)
-    // =========================================================================
     /**
-     * Generates a formatted summary of training samples broken down by symbol.
-     *
-     * Called from:
-     *   • TelegramBotController – /ml_samples command
-     *
-     * Output format:
-     *   SYMBOL: X samples (B buys, S sells; W% wins)
-     *
-     * Details:
-     *   • Uses dbService.getSampleSummary() – efficient GROUP BY query
-     *   • Calculates win rate client-side for clean formatting
-     *   • Safe handling: empty dataset or DB error
-     *
-     * @returns Multi-line string ready for Telegram message
-     */
+ * Generates a formatted summary of labeled simulations broken down by symbol.
+ *
+ * Called from:
+ *   • TelegramBotController – /ml_samples command
+ *
+ * Output format (Telegram-friendly):
+ *   SYMBOL: X simulations (B buys, S sells; W% wins)
+ *
+ * Details:
+ *   • Uses dbService.getSimulationSummaryBySymbol() – efficient GROUP BY query
+ *   • Calculates win rate client-side (label >= 1 = win)
+ *   • Safe handling: empty result or DB error
+ *
+ * @returns Multi-line string ready for Telegram message
+ */
     public async getSampleSummary(): Promise<string> {
         try {
             // Fetch pre-aggregated per-symbol stats from DB
-            const summary = await dbService.getSampleSummary();
+            const summary = await dbService.getSimulationSummaryBySymbol();
 
-            // No data yet
-            if (summary.length === 0) return 'No training samples yet.';
+            if (summary.length === 0) {
+                return 'No labeled simulations yet.';
+            }
 
-            // Format each symbol line
+            // Format each symbol line (same style as before)
             return summary
-                .map(s => `${s.symbol}: ${s.total} samples (${s.buys} buys, ${s.sells} sells; ${((s.wins / s.total) * 100).toFixed(1)}% wins)`)
+                .map(s =>
+                    `${s.symbol}: ${s.total} simulations ` +
+                    `(${s.buys} buys, ${s.sells} sells; ${((s.wins / s.total) * 100).toFixed(1)}% wins)`
+                )
                 .join('\n');
         } catch (error) {
-            // Log full stack for debugging, return user-friendly message
-            logger.error('Failed to retrieve sample summary', { error: (error as Error).stack });
-            return 'Error retrieving sample summary';
+            logger.error('Failed to retrieve simulation summary', {
+                error: error instanceof Error ? error.stack : String(error),
+            });
+            return 'Error retrieving simulation summary.';
         }
     }
 
@@ -608,11 +650,11 @@ export class MLService {
             const totalTrades = samples.length;
 
             // Count profitable outcomes (label 1 or 2)
-            const wins = samples.filter(s => s.label >= 1).length;
+            const wins = samples.filter(s => s.label! >= 1).length;
             const winRate = ((wins / totalTrades) * 100).toFixed(1);
 
             // Per-symbol breakdown (reuses efficient query)
-            const bySymbol = await dbService.getSampleSummary();
+            const bySymbol = await dbService.getSimulationSummaryBySymbol();
 
             // Build formatted report
             return [

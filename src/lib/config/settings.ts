@@ -43,6 +43,7 @@ const ConfigSchema = z.object({
     EXCHANGE: z.enum(Object.values(exchanges) as unknown as string[]).default('bybit'),
     EXCHANGE_API_KEY: z.string().optional(),
     EXCHANGE_API_SECRET: z.string().optional(),
+    EXCHANGE_TESTNET: z.coerce.boolean().default(true),
 
     // ──────────────────────────────────────────────────────────────
     // Telegram Notifications
@@ -198,9 +199,8 @@ export const config = {
     autoTrade: {
         enabled: Boolean(
             rawConfig.AUTO_TRADE_ENABLED &&
-            rawConfig.EXCHANGE_API_KEY &&
-            rawConfig.EXCHANGE_API_SECRET
-
+            !!rawConfig.EXCHANGE_API_KEY &&
+            !!rawConfig.EXCHANGE_API_SECRET
         ),
         fixedTradeUsd: rawConfig.FIXED_TRADE_USD,
     },
@@ -215,6 +215,8 @@ export const config = {
         apiKey: rawConfig.EXCHANGE_API_KEY,
         /** API secret – required for live trading */
         apiSecret: rawConfig.EXCHANGE_API_SECRET,
+        /** Use testnet/sandbox environment */
+        testnet: rawConfig.EXCHANGE_TESTNET,
     },
 
     // =========================================================================
@@ -243,7 +245,7 @@ export const config = {
         /** Send heartbeat every N cycles */
         heartBeatInterval: rawConfig.HEARTBEAT_INTERVAL,
 
-        signalCooldownMs: 15 * 60 * 1000,
+        signalCooldownMs: 8 * 60 * 1000,
     },
 
     // =========================================================================

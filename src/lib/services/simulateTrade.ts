@@ -22,20 +22,98 @@ import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
 import { excursionCache } from './excursionHistoryCache';
+import { mlService } from './mlService';
 
 const logger = createLogger('simulateTrade');
 
+/**
+ * Full result of a completed trade simulation.
+ *
+ * This interface represents the outcome of running a simulation from entry to exit
+ * (via TP, partial TP, SL, or timeout). It serves as:
+ *   - Return type of simulateTrade()
+ *   - Input for DB insertion into simulatedTrades
+ *   - Source for ML label ingestion, excursion history updates, and regime stats
+ *
+ * All monetary/percentage values follow consistent scaling:
+ *   - Prices / PnL          → raw floating-point (or ×1e8 if stored as bigint)
+ *   - Percentages (MFE/MAE) → decimal fraction (e.g. 0.015 = 1.5%)
+ *   - Timestamps / durations → milliseconds since entry
+ *
+ * @remarks
+ *   - All fields are required except when explicitly marked optional
+ *   - Use this type consistently across simulation → DB → ML pipeline
+ */
 export interface SimulationResult {
+    /**
+     * Final outcome category of the simulated trade
+     */
     outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout';
+
+    /**
+     * Realized profit/loss in account currency units
+     * (positive = profit, negative = loss)
+     */
     pnl: number;
+
+    /**
+     * Realized PnL as percentage of entry capital risked
+     * (e.g. 2.35 = +2.35%, -0.8 = -0.8%)
+     */
     pnlPercent: number;
+
+    /**
+     * Risk-adjusted return (PnL / initial risk amount)
+     * e.g. +2.5 = won 2.5× the risked amount
+     */
     rMultiple: number;
+
+    /**
+     * ML training label (-2 = strong loss, ..., +2 = strong win)
+     * Computed based on rMultiple + duration + MFE/MAE profile
+     */
     label: -2 | -1 | 0 | 1 | 2;
+
+    /**
+     * Maximum favorable excursion (peak profit % during trade)
+     * Positive value or zero (never negative)
+     */
     maxFavorableExcursion: number;
+
+    /**
+     * Maximum adverse excursion (deepest drawdown % during trade)
+     * Negative value or zero (never positive)
+     */
     maxAdverseExcursion: number;
+
+    /**
+     * Total duration of the simulated trade in milliseconds
+     * From entry timestamp to exit timestamp
+     */
     duration_ms: number;
+
+    /**
+     * Time from entry until maximum favorable excursion was reached (ms)
+     * Useful for understanding momentum / time-to-peak
+     */
     timeToMaxMFE_ms: number;
+
+    /**
+     * Time from entry until maximum adverse excursion was reached (ms)
+     * Useful for risk profiling (how fast did it go wrong?)
+     */
     timeToMaxMAE_ms: number;
+
+    /**
+     * Optional: raw exit price (can be useful for debugging / verification)
+     */
+    exitPrice?: number;
+
+    /**
+     * Optional: whether partial take-profits were hit
+     * (helps distinguish full TP from partial)
+     */
+    partialTpHit?: boolean;
 }
 
 /**
@@ -64,7 +142,8 @@ export async function simulateTrade(
     exchangeService: ExchangeService,
     symbol: string,
     signal: TradeSignal,
-    entryPrice: number
+    entryPrice: number,
+    features: number[]
 ): Promise<SimulationResult> {
     // ────────────────────────────────────────────────────────────────
     // 0. EARLY VALIDATION – prevent invalid simulations early
@@ -83,10 +162,7 @@ export async function simulateTrade(
     // 1. START DATABASE RECORD – generate unique signalId
     //    We log simulation start before entering the loop
     // ────────────────────────────────────────────────────────────────
-    const signalId = await startSimulationInDatabase(symbol, signal, entryPrice);
-
     logger.info(`[SIM] ${symbol} ${isLong ? 'LONG' : 'SHORT'} started`, {
-        signalId,
         entryPrice: entryPrice.toFixed(8),
         stopLoss: signal.stopLoss?.toFixed(8) ?? 'none',
         takeProfit: signal.takeProfit?.toFixed(8) ?? 'none',
@@ -115,7 +191,7 @@ export async function simulateTrade(
         // Get latest candle high/low
         const candle = getCurrentCandle(exchangeService, symbol);
         if (!candle) {
-            logger.warn(`No candle data yet for ${symbol} – waiting`, { signalId });
+            logger.warn(`No candle data yet for ${symbol} – waiting`);
             continue;
         }
 
@@ -123,7 +199,7 @@ export async function simulateTrade(
 
         // Validate candle (protect against exchange glitches, NaN, absurd spikes)
         if (!validateCandle(high, low, entryPrice)) {
-            logger.warn(`Invalid candle skipped`, { symbol, signalId, high, low });
+            logger.warn(`Invalid candle skipped`, { symbol, high, low });
             continue;
         }
 
@@ -162,19 +238,19 @@ export async function simulateTrade(
 
             // If position fully closed via partials → exit with partial_tp
             if (tracking.remainingPosition <= 0.01) {
-                return await finalizeSimulation(
-                    'partial_tp',
-                    signalId,
+                return await storeAndFinalizeSimulation({
+                    outcome: 'partial_tp',
                     startTime,
-                    tracking.totalPnL,
+                    totalPnL: tracking.totalPnL,
                     entryPrice,
-                    isLong,
-                    tracking.bestFavorablePrice,
-                    tracking.bestAdversePrice,
-                    tracking.timeOfMaxFavorable,
-                    tracking.timeOfMaxAdverse,
-                    symbol
-                );
+                    signal,
+                    bestFavorablePrice: tracking.bestFavorablePrice,
+                    bestAdversePrice: tracking.bestAdversePrice,
+                    timeOfMaxFavorable: tracking.timeOfMaxFavorable,
+                    timeOfMaxAdverse: tracking.timeOfMaxAdverse,
+                    symbol,
+                    features
+                });
             }
         }
 
@@ -184,19 +260,19 @@ export async function simulateTrade(
                 ? (signal.takeProfit! - entryPrice) / entryPrice * tracking.remainingPosition
                 : (entryPrice - signal.takeProfit!) / entryPrice * tracking.remainingPosition);
 
-            return await finalizeSimulation(
-                'tp',
-                signalId,
+            return await storeAndFinalizeSimulation({
+                outcome: 'tp',
                 startTime,
-                fullTpPnL,
+                totalPnL: fullTpPnL,
                 entryPrice,
-                isLong,
-                tracking.bestFavorablePrice,
-                tracking.bestAdversePrice,
-                tracking.timeOfMaxFavorable,
-                tracking.timeOfMaxAdverse,
-                symbol
-            );
+                signal,
+                bestFavorablePrice: tracking.bestFavorablePrice,
+                bestAdversePrice: tracking.bestAdversePrice,
+                timeOfMaxFavorable: tracking.timeOfMaxFavorable,
+                timeOfMaxAdverse: tracking.timeOfMaxAdverse,
+                symbol,
+                features
+            });
         }
 
         // ── Check stop-loss (fixed only – no trailing) ─────────────────
@@ -205,19 +281,19 @@ export async function simulateTrade(
                 ? (tracking.currentStopLoss! - entryPrice) / entryPrice * tracking.remainingPosition
                 : (entryPrice - tracking.currentStopLoss!) / entryPrice * tracking.remainingPosition);
 
-            return await finalizeSimulation(
-                'sl',
-                signalId,
+            return await storeAndFinalizeSimulation({
+                outcome: 'sl',
                 startTime,
-                slPnL,
+                totalPnL: slPnL,
                 entryPrice,
-                isLong,
-                tracking.bestFavorablePrice,
-                tracking.bestAdversePrice,
-                tracking.timeOfMaxFavorable,
-                tracking.timeOfMaxAdverse,
-                symbol
-            );
+                signal,
+                bestFavorablePrice: tracking.bestFavorablePrice,
+                bestAdversePrice: tracking.bestAdversePrice,
+                timeOfMaxFavorable: tracking.timeOfMaxFavorable,
+                timeOfMaxAdverse: tracking.timeOfMaxAdverse,
+                symbol,
+                features
+            });
         }
 
         // If we reached here → candle processed, increment counter
@@ -241,123 +317,19 @@ export async function simulateTrade(
         ? (exitPrice - entryPrice) / entryPrice * tracking.remainingPosition
         : (entryPrice - exitPrice) / entryPrice * tracking.remainingPosition;
 
-    return await finalizeSimulation(
-        'timeout',
-        signalId,
+    return await storeAndFinalizeSimulation({
+        outcome: 'timeout',
         startTime,
-        timeoutPnL,
+        totalPnL: timeoutPnL,
         entryPrice,
-        isLong,
-        tracking.bestFavorablePrice,
-        tracking.bestAdversePrice,
-        tracking.timeOfMaxFavorable,
-        tracking.timeOfMaxAdverse,
-        symbol
-    );
-}
-
-/**
- * Records the start of a new simulated trade in the database.
- *
- * Purpose:
- *   - Creates a persistent record of every simulation for later analysis,
- *     auditing, ML training sample lookup, and debugging.
- *   - Generates a unique signalId that will be used throughout the simulation
- *     lifecycle (updates, final close, linking to excursions).
- *   - Stores all relevant signal parameters at the moment of generation.
- *
- * Why we do this early:
- *   - Even if simulation crashes or times out early, we still have the entry.
- *   - Allows correlating live trades back to their originating simulation.
- *
- * What gets stored (based on current DB schema expectations):
- *   - symbol, side (buy/sell), entry price
- *   - stop loss (if any)
- *   - take profit levels (single + multi-level if present)
- *   - trailing distance (kept for reference even though disabled in sim)
- *   - NEW: placeholders for duration_ms, timeToMFE_ms, timeToMAE_ms
- *     → these will be filled on closeSimulatedTrade()
- *   - timestamp (implicit via DB)
- *
- * @param symbol - Trading pair (e.g. 'BTC/USDT')
- * @param signal - Full TradeSignal object containing direction, SL, TP(s), etc.
- * @param entryPrice - Exact price at which the signal was generated
- * @returns signalId - Unique identifier for this simulation run
- * @throws Error if DB write fails (caught higher up in simulateTrade)
- */
-async function startSimulationInDatabase(
-    symbol: string,
-    signal: TradeSignal,
-    entryPrice: number
-): Promise<string> {
-    try {
-        // Prepare TP levels for storage – support both single TP and multi-level
-        const tpLevelsForDb: { price: number; weight: number }[] = [];
-
-        // Add single takeProfit if present (weight = 1.0 = full position)
-        if (signal.takeProfit) {
-            tpLevelsForDb.push({
-                price: Number(signal.takeProfit.toFixed(8)),
-                weight: 1.0
-            });
-        }
-
-        // Add multi-level take profits if configured
-        if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
-            tpLevelsForDb.push(
-                ...signal.takeProfitLevels.map(level => ({
-                    price: Number(level.price.toFixed(8)),
-                    weight: level.weight
-                }))
-            );
-        }
-
-        // Call the database service to create the simulation record
-        // This should return a unique ID (string or UUID depending on your DB setup)
-        const signalId = await dbService.startSimulatedTrade({
-            symbol: symbol.trim().toUpperCase(), // Normalize symbol for consistency
-            side: signal.signal as 'buy' | 'sell', // Enforce type
-            entryPrice: Number(entryPrice.toFixed(8)), // High precision storage
-            stopLoss: signal.stopLoss ? Number(signal.stopLoss.toFixed(8)) : null,
-            trailingDist: signal.trailingStopDistance
-                ? Number(signal.trailingStopDistance.toFixed(8))
-                : null, // Kept for reference even if not used in sim
-            tpLevels: tpLevelsForDb.length > 0 ? tpLevelsForDb : null,
-            durationMs: 0,
-            timeToMFEMs: 0,
-            timeToMAEMs: 0,
-        });
-
-        // Basic validation – make sure we got a valid ID back
-        if (!signalId || typeof signalId !== 'string' || signalId.length < 4) {
-            throw new Error(`Database returned invalid signalId: ${signalId}`);
-        }
-
-        logger.debug(`Simulation record created in DB`, {
-            symbol,
-            signalId,
-            side: signal.signal,
-            entryPrice: entryPrice.toFixed(8),
-            tpCount: tpLevelsForDb.length,
-            // Optional: log the new placeholders
-            hasDurationPlaceholder: true,
-            hasTimeToMFEPlaceholder: true,
-            hasTimeToMAEPlaceholder: true
-        });
-
-        return signalId;
-
-    } catch (err: any) {
-        // Critical failure – we cannot continue simulation without DB record
-        logger.error(`Failed to start simulated trade in database`, {
-            symbol,
-            entryPrice: entryPrice.toFixed(8),
-            error: err.message,
-            stack: err.stack?.slice(0, 300) // truncate long stacks
-        });
-
-        throw new Error(`Database error while starting simulation for ${symbol}: ${err.message}`);
-    }
+        signal,
+        bestFavorablePrice: tracking.bestFavorablePrice,
+        bestAdversePrice: tracking.bestAdversePrice,
+        timeOfMaxFavorable: tracking.timeOfMaxFavorable,
+        timeOfMaxAdverse: tracking.timeOfMaxAdverse,
+        symbol,
+        features
+    });
 }
 
 /**
@@ -1120,123 +1092,163 @@ function checkStopLoss(
 }
 
 /**
- * FINAL FINALIZER – called by all exit points in the simulation
+ * FINALIZER & DB WRITER – called once at the end of every simulation
  *
- * This is the SINGLE place where we:
- *   - Finalize all calculations (excursions, duration, times, R-multiple, label)
- *   - Apply safety bounds & fallbacks
- *   - Update the excursion cache (critical for regime advice)
- *   - Close the DB simulation record
- *   - Log a consistent, structured summary
- *   - Return the complete SimulationResult object
+ * This is now the SINGLE entry point where a simulation is finalized and persisted:
+ *   1. Computes all final metrics (excursions, duration, times, R-multiple, label)
+ *   2. Applies safety bounds & fallbacks
+ *   3. Stores complete row in simulatedTrades (atomic INSERT)
+ *   4. Updates excursion cache (critical for regime advice)
+ *   5. Logs structured summary
+ *   6. Returns SimulationResult for caller
  *
- * @param outcome - Final outcome type ('tp', 'partial_tp', 'sl', 'timeout')
- *                  Must be passed correctly by the caller based on exit condition
- * @param signalId - DB unique ID for this simulation
- * @param startTime - Timestamp when simulation began
- * @param totalPnL - Final realized + unrealized PnL at exit
- * @param entryPrice - Original entry price
- * @param isLong - true = long/buy trade
- * @param bestFavorablePrice - Best favorable price reached
- * @param bestAdversePrice - Worst adverse price reached
- * @param timeOfMaxFavorable - When best favorable was reached
- * @param timeOfMaxAdverse - When worst adverse was reached
- * @param symbol - Trading pair
+ * Replaces:
+ *   - startSimulatedTrade
+ *   - closeSimulatedTrade
+ *   - finalizeSimulation
+ *
+ * Design benefits:
+ *   - Atomic: full row or nothing — no incomplete/orphan records
+ *   - Single DB write (instead of two)
+ *   - No need to track signalId across calls
+ *   - All data (entry + outcome + metrics + features) stored together
+ *   - High-precision scaling consistent with schema (×1e8 / ×1e4)
+ *
+ * @param params Complete simulation context & results
  * @returns Complete SimulationResult object
  */
-async function finalizeSimulation(
-    outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout',
-    signalId: string,
-    startTime: number,
-    totalPnL: number,
-    entryPrice: number,
-    isLong: boolean,
-    bestFavorablePrice: number,
-    bestAdversePrice: number,
-    timeOfMaxFavorable: number,
-    timeOfMaxAdverse: number,
-    symbol: string
+async function storeAndFinalizeSimulation(
+    params: {
+        symbol: string;
+        signal: TradeSignal;                    // original signal for context
+        entryPrice: number;                     // raw float
+        startTime: number;                      // Unix ms
+        outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout';
+        totalPnL: number;                       // final realized PnL (decimal)
+        bestFavorablePrice: number;
+        bestAdversePrice: number;
+        timeOfMaxFavorable: number;
+        timeOfMaxAdverse: number;
+        features?: number[];                    // optional – signal-time features
+    }
 ): Promise<SimulationResult> {
-    // ────────────────────────────────────────────────────────────────
-    // 1. Calculate final duration (wall-clock ms from entry to exit)
-    // ────────────────────────────────────────────────────────────────
-    const endTime = Date.now();
-    const duration_ms = endTime - startTime;
-
-    // ────────────────────────────────────────────────────────────────
-    // 2. Compute excursions as percentages (MFE ≥ 0, MAE ≤ 0)
-    // ────────────────────────────────────────────────────────────────
-    const rawMfeDelta = isLong
-        ? bestFavorablePrice - entryPrice
-        : entryPrice - bestFavorablePrice;
-
-    const finalMfePct = (rawMfeDelta / entryPrice) * 100;
-
-    const rawMaeDelta = isLong
-        ? entryPrice - bestAdversePrice
-        : bestAdversePrice - entryPrice;
-
-    const finalMaePctRaw = (rawMaeDelta / entryPrice) * 100;
-    const finalMaePct = -Math.abs(finalMaePctRaw); // convention: MAE negative or zero
-
-    // Bound extremes to prevent outliers from corrupting regime stats
-    const MAX_MFE_CAP = 1000;
-    const MAX_MAE_FLOOR = -1000;
-    const boundedMfePct = Math.max(0, Math.min(MAX_MFE_CAP, finalMfePct));
-    const boundedMaePct = Math.max(MAX_MAE_FLOOR, Math.min(0, finalMaePct));
-
-    // ────────────────────────────────────────────────────────────────
-    // 3. Time-to-extremes (how long it took to reach best/worst points)
-    // ────────────────────────────────────────────────────────────────
-    const timeToMaxMFE_ms = timeOfMaxFavorable - startTime;
-    const timeToMaxMAE_ms = timeOfMaxAdverse - startTime;
-
-    // Safety: clamp times (should never be negative)
-    const clampedTimeMFE = Math.max(0, timeToMaxMFE_ms);
-    const clampedTimeMAE = Math.max(0, timeToMaxMAE_ms);
-
-    // ────────────────────────────────────────────────────────────────
-    // 4. R-multiple & ML label
-    // ────────────────────────────────────────────────────────────────
-    const FALLBACK_RISK_PCT = 0.015;
-    const rMultiple = totalPnL / FALLBACK_RISK_PCT;
-    const label = computeLabel(rMultiple);
-
-    // ────────────────────────────────────────────────────────────────
-    // 5. Update excursion cache
-    // ────────────────────────────────────────────────────────────────
-    excursionCache.updateOrAdd(symbol, signalId, {
-        outcome,
-        rMultiple,
-        label,
-        durationMs: duration_ms,
-        mfe: boundedMfePct,
-        mae: boundedMaePct,
-        timeToMFE_ms: clampedTimeMFE,
-        timeToMAE_ms: clampedTimeMAE,
-        direction: isLong ? 'buy' : 'sell',
-        timestamp: endTime,
-    });
-
-    // ────────────────────────────────────────────────────────────────
-    // 6. Close the simulation record in database
-    // ────────────────────────────────────────────────────────────────
-    await dbService.closeSimulatedTrade(
-        signalId,
+    const {
+        symbol,
+        signal,
+        entryPrice,
+        startTime,
         outcome,
         totalPnL,
-        rMultiple,
-        label,
         bestFavorablePrice,
         bestAdversePrice,
         timeOfMaxFavorable,
         timeOfMaxAdverse,
-        duration_ms
-    );
+        features,
+    } = params;
 
-    // ────────────────────────────────────────────────────────────────
-    // 7. Consistent structured logging across all outcomes
-    // ────────────────────────────────────────────────────────────────
+    const endTime = Date.now();
+    const durationMs = endTime - startTime;
+    const signalId = crypto.randomUUID(); // generated here – caller doesn't need to know
+
+    // ── 1. Compute excursions as percentages ────────────────────────────────
+    const isLong = signal.signal === 'buy';
+
+    const rawMfeDelta = isLong
+        ? bestFavorablePrice - entryPrice
+        : entryPrice - bestFavorablePrice;
+    const mfePct = (rawMfeDelta / entryPrice) * 100;
+
+    const rawMaeDelta = isLong
+        ? entryPrice - bestAdversePrice
+        : bestAdversePrice - entryPrice;
+    const maePctRaw = (rawMaeDelta / entryPrice) * 100;
+    const maePct = -Math.abs(maePctRaw); // convention: MAE negative or zero
+
+    // Bound extremes (protect stats from outliers)
+    const boundedMfe = Math.max(0, Math.min(10000, mfePct));
+    const boundedMae = Math.max(-10000, Math.min(0, maePct));
+
+    // ── 2. Time-to-extremes ─────────────────────────────────────────────────
+    const timeToMfeMs = Math.max(0, timeOfMaxFavorable - startTime);
+    const timeToMaeMs = Math.max(0, timeOfMaxAdverse - startTime);
+
+    // ── 3. R-multiple (fallback risk % if no real risk defined) ─────────────
+    const FALLBACK_RISK_PCT = 0.015; // 1.5% default risk
+    const rMultiple = totalPnL / FALLBACK_RISK_PCT;
+
+    // ── 4. Compute label using new excursion-dominant scoring ───────────────
+    const scoreResult = excursionCache.computeSimulationScore({
+        signalId,
+        timestamp: endTime,
+        direction: isLong ? 'buy' : 'sell',
+        outcome,
+        rMultiple,
+        mfe: boundedMfe,
+        mae: boundedMae,
+        durationMs,
+        timeToMFE_ms: timeToMfeMs,
+        timeToMAE_ms: timeToMaeMs,
+    });
+
+    const label = excursionCache.mapScoreToLabel(scoreResult.totalScore);
+
+    // ── 5. Atomic DB insert – everything in one row ─────────────────────────
+    try {
+        dbService.storeCompletedSimulation({
+            signalId,
+            symbol: symbol.trim().toUpperCase(),
+            side: isLong ? 'buy' : 'sell',
+            entryPrice,
+            stopLoss: signal.stopLoss,
+            trailingDist: signal.trailingStopDistance,
+            tpLevels: signal.takeProfitLevels ?? undefined,
+            openedAt: startTime,
+            closedAt: endTime,
+            outcome,
+            pnl: Math.round(totalPnL * 1e8),
+            rMultiple: Math.round(rMultiple * 1e4),
+            label,
+            maxFavorableExcursion: Math.round(boundedMfe * 1e4),
+            maxAdverseExcursion: Math.round(boundedMae * 1e4),
+            durationMs,
+            timeToMFEMs: timeToMfeMs,
+            timeToMAEMs: timeToMaeMs,
+            features: features ?? [],
+        })
+    } catch (err) {
+        logger.error('Failed to store completed simulation in DB', {
+            symbol,
+            signalId,
+            outcome,
+            error: err instanceof Error ? err.message : String(err),
+        });
+        throw err; // Let caller handle (e.g., retry or skip cache)
+    }
+
+    // Periodic retraining trigger
+    if (config.ml.trainingEnabled) {
+        const count = await dbService.getSampleCount();
+        if (count >= config.ml.minSamplesToTrain && count % 20 === 0) {
+            await mlService.retrain();
+        }
+    }
+
+    // ── 6. Update excursion cache (now that DB is safe) ─────────────────────
+    excursionCache.addCompletedSimulation(symbol, {
+        signalId,
+        timestamp: endTime,
+        direction: isLong ? 'buy' : 'sell',
+        outcome,
+        rMultiple,
+        label,
+        mfe: boundedMfe,
+        mae: boundedMae,
+        durationMs,
+        timeToMFE_ms: timeToMfeMs,
+        timeToMAE_ms: timeToMaeMs,
+    });
+
+    // ── 7. Structured final log ─────────────────────────────────────────────
     logger.info(`[SIM] ${symbol} FINALIZED – ${outcome.toUpperCase()}`, {
         signalId,
         side: isLong ? 'LONG' : 'SHORT',
@@ -1244,29 +1256,26 @@ async function finalizeSimulation(
         pnlPct: (totalPnL * 100).toFixed(2) + '%',
         rMultiple: rMultiple.toFixed(3),
         label,
-        durationMin: (duration_ms / 60000).toFixed(2),
-        mfePct: boundedMfePct.toFixed(2),
-        maePct: boundedMaePct.toFixed(2),
-        timeToMFE: (clampedTimeMFE / 1000).toFixed(1) + 's',
-        timeToMAE: (clampedTimeMAE / 1000).toFixed(1) + 's',
-        start: new Date(startTime).toISOString(),
-        end: new Date(endTime).toISOString()
+        score: scoreResult.totalScore.toFixed(2),
+        durationMin: (durationMs / 60000).toFixed(2),
+        mfePct: boundedMfe.toFixed(2),
+        maePct: boundedMae.toFixed(2),
+        timeToMFE: (timeToMfeMs / 1000).toFixed(1) + 's',
+        timeToMAE: (timeToMaeMs / 1000).toFixed(1) + 's',
     });
 
-    // ────────────────────────────────────────────────────────────────
-    // 8. Return clean result object for caller
-    // ────────────────────────────────────────────────────────────────
+    // ── 8. Return clean result ──────────────────────────────────────────────
     return {
         outcome,
         pnl: totalPnL,
         pnlPercent: totalPnL * 100,
         rMultiple,
         label,
-        maxFavorableExcursion: boundedMfePct,
-        maxAdverseExcursion: boundedMaePct,
-        duration_ms,
-        timeToMaxMFE_ms: clampedTimeMFE,
-        timeToMaxMAE_ms: clampedTimeMAE
+        maxFavorableExcursion: boundedMfe,
+        maxAdverseExcursion: boundedMae,
+        duration_ms: durationMs,
+        timeToMaxMFE_ms: timeToMfeMs,
+        timeToMaxMAE_ms: timeToMaeMs,
     };
 }
 

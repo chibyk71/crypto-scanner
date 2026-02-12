@@ -175,17 +175,6 @@ export interface TradeSignal {
 
     /** Max Adverse Excursion – worst unrealized drawdown */
     mae?: number;
-
-    /**
-     * NEW CHANGE: Pre-excursion potential signal direction
-     *   - Set in strategy.generateSignal based on raw scores/ML before applying excursion checks.
-     *   - Used by scanner.processSymbol to trigger simulations even if the final signal is 'hold'
-     *     due to excursion criteria not being met (e.g., low samples, poor ratio/gap).
-     *   - Allows continuous simulation and history population for better future excursion decisions.
-     *   - Value: 'buy'|'sell'|'hold' – mirrors the would-be signal without excursion filtering.
-     *   - If 'hold', no simulation is triggered (no potential detected).
-     */
-    potentialSignal: 'buy' | 'sell' | 'hold';
 }
 
 /**

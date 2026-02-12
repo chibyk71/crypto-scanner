@@ -19,14 +19,12 @@
 //   • Realistic position sizing with leverage caps and confidence scaling
 // =============================================================================
 
-import type { OhlcvData, SignalLabel, TradeSignal } from '../types';
+import type { OhlcvData, PartialTPLevel, SignalLabel, TradeSignal } from '../types';
 import { createLogger } from './logger';
 import { MLService } from './services/mlService';
 import { config } from './config/settings';
 import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
-import { getExcursionAdvice } from './utils/excursionUtils';
 import { detectEngulfing } from './indicators';
-import { excursionCache } from './services/excursionHistoryCache';
 
 // Dedicated logger – all strategy-related messages tagged 'Strategy'
 const logger = createLogger('Strategy');
@@ -124,19 +122,17 @@ const MAX_ATR_MULTIPLIER = 5;
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.35;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.25;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 20;
 
-const MIN_BB_BANDWIDTH_PCT = 0.3;             // ← Minimum Bollinger Band width percentage to avoid flat markets
+const MIN_BB_BANDWIDTH_PCT = 0.12;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
 const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative volume check
 
 const MIN_DI_DIFF = 4;                       // ← Minimum difference between +DI and -DI for trend dominance
 
-const MIN_ADX = 18;                          // ← Minimum ADX for trend dominance
+const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
-
-const MIN_GAP = 0.20;                        // ← Minimum gap between MFE and |MAE| for bullishness
 
 /**
  * Strategy – Core signal generation engine
@@ -429,6 +425,7 @@ export class Strategy {
 
         // -------------------- ATR VOLATILITY RANGE --------------------
         const atrPct = (indicators.last.atr / input.price) * 100;
+        logger.info(`ATR Analysis for ${input.symbol}: ATR=${indicators.last.atr.toFixed(4)}, Price=${input.price.toFixed(4)}, ATR%=${atrPct.toFixed(2)}%`);
         if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) {
             buyScore += ATR_POINTS;
             sellScore += ATR_POINTS;
@@ -662,6 +659,7 @@ export class Strategy {
         positionSizeUsd: number;
         positionSizeMultiplier?: number;
         riskAmountUsd: number;
+        takeProfitLevels: PartialTPLevel[]
     } {
         // No signal → zero risk
         if (signal === 'hold') {
@@ -673,6 +671,7 @@ export class Strategy {
                 positionSizeUsd: 0,
                 positionSizeMultiplier: 0,
                 riskAmountUsd: 0,
+                takeProfitLevels: []
             };
         }
 
@@ -686,7 +685,7 @@ export class Strategy {
         const baseRiskPercent = trendBias === 'bearish' ? BASE_RISK_PERCENT_BEAR : BASE_RISK_PERCENT_BULL;
 
         // Confidence bonus: scales risk upward for high-confidence setups
-        const confidenceFactor = Math.min((confidence - 70) / 30, 1); // 0-1 range
+        const confidenceFactor = Math.min((confidence - 50) / 30, 1); // 0-1 range
         const bonusRiskPercent = confidenceFactor * MAX_RISK_BONUS_CONFIDENCE;
 
         const finalRiskPercent = baseRiskPercent + bonusRiskPercent;
@@ -708,6 +707,7 @@ export class Strategy {
                 positionSizeUsd: 0,
                 positionSizeMultiplier: 0,
                 riskAmountUsd: 0,
+                takeProfitLevels: []
             };
         }
 
@@ -725,6 +725,14 @@ export class Strategy {
         // ──────────────────────────────────────────────────────────────
         const stopLoss = signal === 'buy' ? price - riskDistance : price + riskDistance;
         const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
+        const takeProfitLevels: PartialTPLevel[] = [];
+
+        for (let index = 1; index < riskRewardTarget; index++) {
+            takeProfitLevels.push({
+                price: signal === 'buy' ? price + riskDistance * index : price - riskDistance * index,
+                weight: index / riskRewardTarget,
+            });
+        }
 
         // ──────────────────────────────────────────────────────────────
         // 5. Trailing stop – 75% of initial risk (aggressive for scalping)
@@ -746,254 +754,165 @@ export class Strategy {
             positionSizeUsd: Number(positionSizeUsd.toFixed(2)),
             positionSizeMultiplier: Number(positionSizeMultiplier.toFixed(3)),
             riskAmountUsd: Number(riskAmountUsd.toFixed(2)),
+            takeProfitLevels
         };
     }
 
     /**
-   * Primary method – generates a complete TradeSignal for a symbol.
-   *
-   * CRITICAL DESIGN GOALS (2026 regime-aware scalping philosophy):
-   *   1. NEVER alert or trade unless we have strong excursion evidence
-   *      → final `signal` = 'hold' when regime is missing, weak, or dangerous
-   *   2. ALWAYS collect high-quality simulation data as early as possible
-   *      → even when we skip alerting, we still run realistic simulations
-   *      → this is how the bot bootstraps itself from zero to profitable
-   *
-   * How we achieve both:
-   *   • potentialSignal = pure technical + ML direction (pre-excursion)
-   *   • signal          = final decision after excursion filtering (for alerts/trading)
-   *   • Base (unadjusted) SL/TP are ALWAYS computed when potentialSignal exists
-   *   • Excursion multipliers (slMultiplier/tpMultiplier) are ONLY applied when we actually trust the regime (signal !== 'hold')
-   *
-   * Result:
-   *   - Alerts & live trades: extremely strict, only on proven regimes
-   *   - Simulations: always have realistic exits → fast, accurate regime building
-   */
+     * Primary method – generates a complete TradeSignal for a symbol.
+     *
+     * NEW DESIGN PHILOSOPHY (2026+ pure technical scalping):
+     *   • This method is now PURELY technical + ML driven.
+     *   • NO excursion/regime logic whatsoever — all regime-based decisions (skip, reverse, adjust SL/TP)
+     *     are moved to AutoTradeService (single source of truth for live execution + alerting).
+     *   • We generate the raw, unfiltered signal with base (unadjusted) SL/TP levels.
+     *   • This ensures:
+     *       - Simulations always use realistic, unbiased base exits → clean excursion history building.
+     *       - Scanner can forward every meaningful signal to AutoTradeService without early filtering.
+     *       - AutoTradeService can apply regime adjustments, validate, alert, and optionally trade.
+     *   • Result: More opportunities for data collection, simpler Strategy code, no duplicated regime logic.
+     */
     public async generateSignal(input: StrategyInput): Promise<TradeSignal> {
         const reasons: string[] = [];
         const { symbol, primaryData, htfData, price, atrMultiplier, riskRewardTarget } = input;
 
         try {
-            // === 1. Centralized indicators ===
+            // === 1. Compute all centralized indicators (EMA, VWMA, MACD, RSI, etc.) ===
+            // This is the foundation for all scoring.
             const indicators = computeIndicators(primaryData, htfData);
-            this.lastAtr = indicators.last.atr;
+            this.lastAtr = indicators.last.atr; // Exposed for debugging/monitoring
 
-            // === 2. Trend + volume analysis (early exit if no trend) ===
+            // === 2. Early trend + volume analysis ===
+            // If no clear trending market (ADX + DI dominance), we immediately hold.
+            // This prevents signals in choppy/range-bound conditions.
             const trendAndVolume = this._analyzeTrendAndVolume(primaryData, indicators, price);
             if (!trendAndVolume.isTrending) {
-                reasons.push('No trending market – holding');
+                reasons.push('No trending market (weak ADX/DI) – holding');
                 return this._buildFinalSignal({
                     symbol,
                     signal: 'hold',
                     confidence: 0,
                     reasons,
                     features: [],
-                    potentialSignal: 'hold'
+                    stopLoss: undefined,
+                    takeProfit: undefined,
+                    trailingStopDistance: undefined,
+                    positionSizeMultiplier: undefined,
+                    mlConfidence: this.mlService.isReady() ? 0 : undefined
                 });
             }
 
             // === 3. Flat market filter (Bollinger Bandwidth) ===
+            // Avoid signals in extremely low-volatility/squeezed markets.
             if (indicators.last.bbBandwidth < MIN_BB_BANDWIDTH_PCT) {
-                reasons.push(`Flat market: BB Bandwidth ${indicators.last.bbBandwidth.toFixed(2)}%`);
+                reasons.push(`Flat market: BB Bandwidth ${indicators.last.bbBandwidth.toFixed(2)}% < ${MIN_BB_BANDWIDTH_PCT * 100}%`);
                 return this._buildFinalSignal({
                     symbol,
                     signal: 'hold',
                     confidence: 0,
                     reasons,
                     features: [],
-                    potentialSignal: 'hold'
+                    stopLoss: undefined,
+                    takeProfit: undefined,
+                    trailingStopDistance: undefined,
+                    positionSizeMultiplier: undefined,
+                    mlConfidence: this.mlService.isReady() ? 0 : undefined
                 });
             }
 
-            // === 4. Scoring + ML prediction ===
+            // === 4. Technical scoring + ML prediction ===
+            // This returns buy/sell scores, feature vector, and ML confidence bonus.
             const scoringResult = await this._computeScores(indicators, trendAndVolume, input, reasons);
-            let buyScore = scoringResult.buyScore;
-            let sellScore = scoringResult.sellScore;
+            const buyScore = scoringResult.buyScore;
+            const sellScore = scoringResult.sellScore;
             const features = scoringResult.features;
-            const mlConfidence = scoringResult.mlConfidence;
+            const mlConfidence = scoringResult.mlConfidence; // 0-1 probability from ML model
 
-            // === 5. Determine pre-excursion potentialSignal (this is what drives simulation) ===
+            // === 5. Risk eligibility check ===
+            // Ensures ATR/volatility is in a sane range for scalping (not too quiet or explosive).
             const riskEligible = this._isRiskEligible(price, indicators.last.atr);
 
-            const preExcursion = this._determineSignal(
+            // === 6. Final signal decision (pure technical + ML) ===
+            // Uses the scored points, trend bias, and risk eligibility.
+            // No excursion influence here — this is the raw signal.
+            const decision = this._determineSignal(
                 buyScore,
                 sellScore,
                 trendAndVolume.trendBias,
                 riskEligible,
-                []
+                reasons // reasons may be appended here (e.g., counter-trend penalty)
             );
 
-            let potentialSignal: 'buy' | 'sell' | 'hold' = 'hold';
-            if (preExcursion.signal !== 'hold') {
-                potentialSignal = preExcursion.signal;
-                reasons.push(
-                    `Pre-excursion potential: ${potentialSignal.toUpperCase()} ` +
-                    `(buy ${buyScore.toFixed(0)}, sell ${sellScore.toFixed(0)})`
-                );
-            }
+            const finalSignal = decision.signal; // 'buy' | 'sell' | 'hold'
+            const finalConfidence = decision.confidence; // Normalized 0-100%
 
-            // === 6. EARLY RISK PARAMETER CALCULATION (BASE LEVEL) ===
-            // This is the key change: we compute base SL/TP BEFORE any skip logic
-            // This guarantees simulation always has realistic exits
-            let baseRiskParams = null;
-            let baseStopLoss: number | undefined = undefined;
-            let baseTakeProfit: number | undefined = undefined;
-            let baseTrailingStopDistance: number | undefined = undefined;
+            // Add a clear reason summarizing the raw score direction
+            reasons.push(
+                `Raw technical direction: ${finalSignal.toUpperCase()} ` +
+                `(buy score ${buyScore.toFixed(0)}, sell score ${sellScore.toFixed(0)})`
+            );
 
-            if (potentialSignal !== 'hold') {
-                baseRiskParams = this._computeRiskParams(
-                    potentialSignal,
+            // === 7. Compute BASE risk parameters (unadjusted SL/TP) ===
+            // We ONLY compute these if we have a valid buy/sell signal.
+            // These base levels will be used for:
+            //   • Simulation (always realistic exits)
+            //   • AutoTradeService (starting point for any regime-based adjustments)
+            let stopLoss: number | undefined = undefined;
+            let takeProfit: number | undefined = undefined;
+            let trailingStopDistance: number | undefined = undefined;
+            let positionSizeMultiplier: number | undefined = undefined;
+            let tplevels: PartialTPLevel[] = [];
+
+            if (finalSignal !== 'hold') {
+                const baseRiskParams = this._computeRiskParams(
+                    finalSignal,
                     price,
                     atrMultiplier,
                     riskRewardTarget,
-                    preExcursion.confidence, // use pre-excursion confidence
+                    finalConfidence,
                     indicators.last.atr,
                     trendAndVolume.trendBias
                 );
 
-                baseStopLoss = baseRiskParams.stopLoss;
-                baseTakeProfit = baseRiskParams.takeProfit;
-                baseTrailingStopDistance = baseRiskParams.trailingStopDistance;
-            }
-
-            // === 7. Excursion regime analysis ===
-            const regime = excursionCache.getRegime(symbol);
-
-            let tpMultiplier = 1.0;
-            let slMultiplier = 1.0;
-            let confidenceBoost = 0;
-            let isReversed = false;
-            let finalSignal: 'buy' | 'sell' | 'hold' = 'hold';
-            let finalConfidence = 0;
-
-            if (regime !== null) {
-                const intendedDirection: 'long' | 'short' = buyScore > sellScore ? 'long' : 'short';
-                const adviceObj = getExcursionAdvice(regime, intendedDirection);
-
-                reasons.push(adviceObj.advice);
-
-                tpMultiplier *= adviceObj.adjustments.tpMultiplier;
-                slMultiplier *= adviceObj.adjustments.slMultiplier;
-                confidenceBoost += adviceObj.adjustments.confidenceBoost;
-
-                if (adviceObj.action === 'skip') {
-                    reasons.push('Excursion analysis → skip (alert/trade prevented)');
-                    finalSignal = 'hold';
-                    // → continue: we will use base SL/TP for simulation only
-                }
-                else if (adviceObj.action === 'reverse') {
-                    isReversed = true;
-                    reasons.push('Excursion analysis → reverse direction');
-
-                    const originalWasBuy = buyScore > sellScore;
-                    if (originalWasBuy) {
-                        buyScore /= 2;
-                        sellScore *= 2;
-                    } else {
-                        sellScore /= 2;
-                        buyScore *= 2;
-                    }
-                    reasons.push(`Reversal score adjustment: buy=${buyScore.toFixed(0)}, sell=${sellScore.toFixed(0)}`);
-
-                    const gap = regime.recentMfe - Math.abs(regime.recentMae);
-                    const postAdjust = this._determineSignal(
-                        buyScore,
-                        sellScore,
-                        trendAndVolume.trendBias,
-                        riskEligible,
-                        reasons
-                    );
-
-                    if (postAdjust.signal === 'hold' || gap < MIN_GAP) {
-                        reasons.push(`Reversal failed validation (gap ${gap.toFixed(2)} < ${MIN_GAP})`);
-                        finalSignal = 'hold';
-                        potentialSignal = originalWasBuy ? 'sell' : 'buy'; // still simulate the attempted reversal
-                    } else {
-                        finalSignal = postAdjust.signal;
-                        finalConfidence = postAdjust.confidence;
-                        potentialSignal = finalSignal; // successful reversal
-                    }
-                }
-                else {
-                    // action === 'take' → proceed normally
-                    const finalDecision = this._determineSignal(
-                        buyScore + confidenceBoost * 20,
-                        sellScore + confidenceBoost * 20,
-                        trendAndVolume.trendBias,
-                        riskEligible,
-                        reasons
-                    );
-                    finalSignal = finalDecision.signal;
-                    finalConfidence = finalDecision.confidence;
-                }
-            } else {
-                // No regime data at all → conservative skip
-                reasons.push('No excursion history available → alert/trade prevented');
-                finalSignal = 'hold';
-                // → simulation still runs with base SL/TP if potentialSignal exists
-            }
-
-            // === 8. Final risk parameters (with excursion adjustments only if alerting) ===
-            let stopLoss = baseStopLoss;
-            let takeProfit = baseTakeProfit;
-            let trailingStopDistance = baseTrailingStopDistance;
-            let positionSizeMultiplier: number | undefined = baseRiskParams?.positionSizeMultiplier;
-
-            if (finalSignal !== 'hold' && baseRiskParams) {
-                // Only apply multipliers when we actually trust the regime enough to alert/trade
-                const baseSlDistance = Math.abs(price - (baseStopLoss ?? price));
-                const baseTpDistance = Math.abs((baseTakeProfit ?? price) - price);
-
-                stopLoss = finalSignal === 'buy'
-                    ? price - baseSlDistance * slMultiplier
-                    : price + baseSlDistance * slMultiplier;
-
-                takeProfit = finalSignal === 'buy'
-                    ? price + baseTpDistance * tpMultiplier
-                    : price - baseTpDistance * tpMultiplier;
-
-                if (isReversed) {
-                    positionSizeMultiplier = (positionSizeMultiplier ?? 1.0) * 0.7;
-                    reasons.push('Position size reduced ×0.7 for reversal trade');
-                }
+                stopLoss = baseRiskParams.stopLoss ?? 0;
+                takeProfit = baseRiskParams.takeProfit ?? 0;
+                trailingStopDistance = baseRiskParams.trailingStopDistance;
+                positionSizeMultiplier = baseRiskParams.positionSizeMultiplier;
+                tplevels = baseRiskParams.takeProfitLevels;
 
                 reasons.push(
-                    `SL adjusted ×${slMultiplier.toFixed(2)}, ` +
-                    `TP adjusted ×${tpMultiplier.toFixed(2)}`
+                    `Base risk levels: SL $${stopLoss.toFixed(6)}, TP $${takeProfit.toFixed(6)} ` +
+                    `(≈${(Math.abs(takeProfit - price) / Math.abs(price - stopLoss)).toFixed(1)}R)`
                 );
             }
 
-            // === 9. Final logging ===
+            // === 8. Logging (technical-only for clarity) ===
             logger.info(`Signal: ${finalSignal.toUpperCase()} ${symbol} @ ${price.toFixed(8)}`, {
                 confidence: finalConfidence.toFixed(2),
                 buyScore: buyScore.toFixed(1),
                 sellScore: sellScore.toFixed(1),
-                liveSamples: regime?.recentSampleCount ?? 0,
-                excursionRatio: regime?.recentExcursionRatio?.toFixed(2) ?? 'N/A',
-                TPx: tpMultiplier.toFixed(2),
-                SLx: slMultiplier.toFixed(2),
-                reversed: isReversed,
-                potential: potentialSignal,
-                finalSignal,
-                willSimulate: potentialSignal !== 'hold'
+                mlConfidence: this.mlService.isReady() ? mlConfidence.toFixed(3) : 'N/A',
+                willTradeOrAlert: finalSignal !== 'hold' ? 'forwarded to AutoTradeService' : 'hold (no action)'
             });
 
-            // === 10. Return complete signal ===
+            // === 9. Return the pure technical TradeSignal ===
+            // SL/TP are base (unadjusted) — AutoTradeService may modify them later.
             return this._buildFinalSignal({
                 symbol,
                 signal: finalSignal,
                 confidence: finalConfidence,
                 reasons,
                 features,
-                potentialSignal,
                 stopLoss,
                 takeProfit,
                 trailingStopDistance,
                 positionSizeMultiplier,
-                mlConfidence: this.mlService.isReady() ? mlConfidence : undefined
+                mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
+                tplevels
             });
 
         } catch (err) {
+            // === Error fallback – always return a safe 'hold' ===
             logger.error(`Signal generation failed for ${symbol}`, { error: (err as Error).stack });
             reasons.push(`Exception: ${(err as Error).message}`);
             return this._buildFinalSignal({
@@ -1002,52 +921,69 @@ export class Strategy {
                 confidence: 0,
                 reasons,
                 features: [],
-                potentialSignal: 'hold'
+                stopLoss: undefined,
+                takeProfit: undefined,
+                trailingStopDistance: undefined,
+                positionSizeMultiplier: undefined,
+                mlConfidence: undefined
             });
         }
     }
 
     /**
-     * Helper to build the final TradeSignal object consistently
-     * Ensures all fields are set correctly based on current state
-     */
+ * Helper to build the final TradeSignal object consistently
+ * Ensures all fields are set correctly based on the new pure technical strategy.
+ *
+ * KEY CHANGES:
+ *   • potentialSignal field is COMPLETELY REMOVED (no longer needed).
+ *   • SL/TP/trailingStopDistance/positionSizeMultiplier are attached ONLY when signal !== 'hold'.
+ *     This matches the new philosophy: base (unadjusted) levels are provided for valid signals,
+ *     for use in simulation and as a starting point for AutoTradeService adjustments.
+ *   • For 'hold' signals: all risk levels are undefined (no simulation or trade possible).
+ *   • reasons array is preserved (technical explanations – very useful for final alert in AutoTradeService).
+ */
     private _buildFinalSignal(params: {
         symbol: string;
         signal: 'buy' | 'sell' | 'hold';
         confidence: number;
         reasons: string[];
         features: number[];
-        potentialSignal: 'buy' | 'sell' | 'hold';
         stopLoss?: number;
         takeProfit?: number;
         trailingStopDistance?: number;
         positionSizeMultiplier?: number;
         mlConfidence?: number;
+        tplevels?: PartialTPLevel[];
     }): TradeSignal {
         const {
-            symbol, signal, confidence, reasons, features, potentialSignal,
-            stopLoss, takeProfit, trailingStopDistance, positionSizeMultiplier, mlConfidence
+            symbol,
+            signal,
+            confidence,
+            reasons,
+            features,
+            stopLoss,
+            takeProfit,
+            trailingStopDistance,
+            positionSizeMultiplier,
+            mlConfidence
         } = params;
+
+        // Only attach risk levels if we have a valid buy/sell signal
+        const hasValidSignal = signal !== 'hold';
 
         return {
             symbol,
             signal,
             confidence,
-            reason: reasons,
+            reason: reasons,              // Array of technical reasons (will be shown in final alert)
             features,
-            potentialSignal,
-            // Attach SL/TP for simulation whenever we have a meaningful direction
-            stopLoss: (potentialSignal !== 'hold' || signal !== 'hold')
-                ? Number(stopLoss?.toFixed(8))
-                : undefined,
-            takeProfit: (potentialSignal !== 'hold' || signal !== 'hold')
-                ? Number(takeProfit?.toFixed(8))
-                : undefined,
-            trailingStopDistance: (potentialSignal !== 'hold' || signal !== 'hold')
-                ? trailingStopDistance
-                : undefined,
-            positionSizeMultiplier: signal !== 'hold' ? positionSizeMultiplier : undefined,
-            mlConfidence
+            // Base (unadjusted) levels – AutoTradeService may modify them based on excursion regime
+            stopLoss: hasValidSignal ? Number(stopLoss?.toFixed(8)) : undefined,
+            takeProfit: hasValidSignal ? Number(takeProfit?.toFixed(8)) : undefined,
+            trailingStopDistance: hasValidSignal ? trailingStopDistance : undefined,
+            positionSizeMultiplier: hasValidSignal ? positionSizeMultiplier : undefined,
+            mlConfidence,
+            takeProfitLevels: hasValidSignal ? params.tplevels ?? [] : []
         };
     }
 }
