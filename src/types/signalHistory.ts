@@ -1,11 +1,11 @@
 // src/lib/types/signalHistory.ts
 
-import type { SignalLabel, TradeSignal } from './index';
+import type { SignalLabel, SimulationOutcome, TradeSignal } from './index';
 
 export interface SimulationHistoryEntry {
     timestamp: number;
     direction: 'buy' | 'sell';
-    outcome: 'partial_tp' | 'sl' | 'timeout' | 'tp';
+    outcome: SimulationOutcome;
     rMultiple: number;
     label: SignalLabel;
     durationMs: number;

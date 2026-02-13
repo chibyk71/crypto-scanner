@@ -1887,7 +1887,7 @@ export class TelegramBotController {
 
         // ── Optional top note if no live trade was placed ─────────────────────────────
         if (!tradeExecuted) {
-            lines.push('🔔 **SIGNAL ALERT ONLY** (auto-trade disabled or skipped)');
+            lines.push('🔔 **SIGNAL ALERT ONLY** \\(auto\\-trade disabled or skipped\\)');
         }
 
         // ── Header with direction + reversal tag ───────────────────────────────────
@@ -1949,10 +1949,10 @@ export class TelegramBotController {
             if (total > 0) {
                 const slRatio = sl / total;
                 if (slRatio > 0.6 || sl >= 3) {
-                    lines.push(`⚠️ High SL rate (${escape(sl)}/${escape(total)})`);
+                    lines.push(`⚠️ High SL rate \\(${escape(sl)}/${escape(total)}\\)`);
                 }
                 if (timeout / total > 0.5 || timeout >= 3) {
-                    lines.push(`⚠️ High timeouts (${escape(timeout)})`);
+                    lines.push(`⚠️ High timeouts \\(${escape(timeout)}\\)`);
                 }
             }
 
@@ -1992,10 +1992,10 @@ export class TelegramBotController {
             if ('historyJson' in regime && regime.historyJson && regime.historyJson.length > 0) {
                 const recent = regime.historyJson[0];
                 if (recent.timeToMFE_ms > 0) {
-                    lines.push(`Recent Time-to-MFE: **${(recent.timeToMFE_ms / 1000).toFixed(0)} sec**`);
+                    lines.push(`Recent Time\\-to\\-MFE: **${(recent.timeToMFE_ms / 1000).toFixed(0)} sec**`);
                 }
                 if (recent.timeToMAE_ms > 0) {
-                    lines.push(`Recent Time-to-MAE: **${(recent.timeToMAE_ms / 1000).toFixed(0)} sec**`);
+                    lines.push(`Recent Time\\-to\\-MAE: **${(recent.timeToMAE_ms / 1000).toFixed(0)} sec**`);
                 }
             }
         }

@@ -9,6 +9,7 @@ import * as fs from 'fs/promises';
 import { config } from './config/settings';
 import { TelegramBotController } from './services/telegramBotController';
 import { MLService } from './services/mlService';
+import { excursionCache } from './services/excursionHistoryCache';
 
 /**
  * Logger instance for worker-related events and errors.
@@ -161,7 +162,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             try {
                 await exchange.initialize();
                 supportedSymbols = exchange.getSupportedSymbols();
-                logger.info('Exchange initialized', { mode: exchange.isAutoTradeEnvSet() ? 'live' : 'testnet', symbols: supportedSymbols.length });
+                logger.info('Exchange initialized', { mode: exchange.isAutoTradeEnvSet() ? 'live' : 'testnet', symbols: supportedSymbols.length, });
                 break;
             } catch (err: any) {
                 logger.error(`Exchange initialization attempt ${attempt} failed`, { error: err });
@@ -177,6 +178,10 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             if (config.env == "prod") {
                 telegram = new TelegramBotController(exchange, mlService);
                 logger.info('TelegramBotController initialized');
+
+                excursionCache.warmUpFromDb().catch(err => {
+                    logger.error('Failed to warm up excursion cache from database', { error: err });
+                });
             }
         } catch (err: any) {
             logger.error('Failed to initialize TelegramBotController', { error: err });

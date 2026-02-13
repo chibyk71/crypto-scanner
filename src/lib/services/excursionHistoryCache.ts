@@ -13,7 +13,9 @@
 import { createLogger } from '../logger';
 import { config } from '../config/settings';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
-import type { SignalLabel } from '../../types';
+import type { SignalLabel, SimulationOutcome } from '../../types';
+import type { SimulatedTrade } from '../db/schema';
+import { dbService } from '../db';
 
 const logger = createLogger('ExcursionCache');
 
@@ -997,6 +999,98 @@ export class ExcursionHistoryCache {
 
         // ── STEP 8: Return the stripped lightweight object ───────────────────────────
         return liteRegime as ExcursionRegimeLite;
+    }
+
+    /**
+ * Warms up the in-memory excursion cache from the database on startup.
+ *
+ * Purpose:
+ *   - After bot restart, restore recent simulation history so regime advice,
+ *     scoring, and ML features work immediately (no cold start)
+ *   - Loads only **labeled + closed** simulations (ready for training)
+ *   - Respects the same limits as normal operation (last N hours + max 10 per symbol)
+ *   - Reuses `addCompletedSimulation()` so scoring, label mapping, pruning,
+ *     and aggregate recomputation happen automatically
+ *
+ * When to call:
+ *   - Once during application startup (after dbService.initialize())
+ *   - Optionally on a schedule (e.g. every 30–60 minutes) for safety
+ *
+ * @param recencyHours - How far back to load (default = RECENT_WINDOW_HOURS_DEFAULT)
+ */
+    public async warmUpFromDb(recencyHours: number = RECENT_WINDOW_HOURS_DEFAULT): Promise<void> {
+        const cutoffTime = Date.now() - recencyHours * 60 * 60 * 1000;
+
+        try {
+            logger.info(`=== Starting cache warm-up from database ===`);
+            logger.info(`Loading labeled simulations from last ${recencyHours} hours...`);
+
+            // 1. Fetch recent labeled + closed simulations from DB
+            const recentSims = await dbService.getRecentLabeledSimulations(cutoffTime);
+
+            if (recentSims.length === 0) {
+                logger.info('No recent labeled simulations found in DB – cache will start empty');
+                return;
+            }
+
+            logger.info(`Found ${recentSims.length} recent labeled simulations in DB`);
+
+            // 2. Group by symbol and keep only the newest MAX_CLOSED_SIMS_PER_SYMBOL per symbol
+            const bySymbol = new Map<string, SimulatedTrade[]>();
+
+            for (const row of recentSims) {
+                if (!bySymbol.has(row.symbol)) {
+                    bySymbol.set(row.symbol, []);
+                }
+
+                const arr = bySymbol.get(row.symbol)!;
+                if (arr.length < MAX_CLOSED_SIMS_PER_SYMBOL) {
+                    arr.push(row);
+                }
+            }
+
+            // 3. Convert DB rows → cache entries and add them
+            let totalLoaded = 0;
+
+            for (const [symbol, sims] of bySymbol) {
+                for (const sim of sims) {
+                    // Build full cache entry (must match CachedSimulationEntry)
+                    const cacheEntry: CachedSimulationEntry = {
+                        signalId: sim.signalId,
+                        timestamp: sim.closedAt!,           // use closedAt as completion time
+                        direction: sim.side as 'buy' | 'sell',
+                        outcome: sim.outcome! as SimulationOutcome,
+                        rMultiple: (sim.rMultiple ?? 0) / 10000,   // unscale from DB
+                        label: sim.label! as SignalLabel,
+                        mfe: (sim.maxFavorableExcursion ?? 0) / 10000,
+                        mae: (sim.maxAdverseExcursion ?? 0) / 10000,
+                        durationMs: sim.durationMs ?? 0,
+                        timeToMFE_ms: sim.timeToMFEMs ?? 0,
+                        timeToMAE_ms: sim.timeToMAEMs ?? 0,
+                    };
+
+                    // Add to cache → this will compute score, label, prune, and recompute aggregates
+                    this.addCompletedSimulation(symbol, cacheEntry);
+
+                    totalLoaded++;
+                }
+            }
+
+            // 4. Final summary
+            logger.info(`Cache warm-up completed successfully`, {
+                symbolsLoaded: bySymbol.size,
+                totalSimulationsLoaded: totalLoaded,
+                recencyHours,
+                cutoffTime: new Date(cutoffTime).toISOString(),
+            });
+
+        } catch (err) {
+            logger.error('Cache warm-up from database FAILED', {
+                error: err instanceof Error ? err.message : String(err),
+                stack: err instanceof Error ? err.stack : undefined,
+            });
+            // Continue startup with empty cache — better than crashing the bot
+        }
     }
 
     /**

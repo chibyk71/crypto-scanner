@@ -1167,6 +1167,66 @@ class DatabaseService {
         }
     }
 
+    /**
+ * Fetches recent labeled & closed simulations for cache warm-up on startup.
+ *
+ * This is the main DB query used by `excursionCache.warmUpFromDb()`.
+ *
+ * Filters:
+ *   - label IS NOT NULL          → only simulations ready for ML/training
+ *   - closedAt IS NOT NULL       → only completed simulations
+ *   - closedAt >= cutoffTime     → respects recency window (default 3 hours)
+ *
+ * Returns newest first (DESC closedAt)
+ * Safety limit: max 2000 rows (prevents loading millions of old rows on startup)
+ */
+    public async getRecentLabeledSimulations(cutoffTime: number): Promise<SimulatedTrade[]> {
+        try {
+            const MAX_ROWS = 2000; // safety limit — prevents huge queries on first run
+
+            const rows = await this.db
+                .select()
+                .from(simulatedTrades)
+                .where(and(
+                    isNotNull(simulatedTrades.label),
+                    isNotNull(simulatedTrades.closedAt),
+                    gte(simulatedTrades.closedAt, cutoffTime)
+                ))
+                .orderBy(desc(simulatedTrades.closedAt))
+                .limit(MAX_ROWS)
+                .execute();
+
+            // Safely parse features (DB may return string or already-parsed array)
+            const parsed = rows.map(row => ({
+                ...row,
+                features: row.features
+                    ? (typeof row.features === 'string'
+                        ? JSON.parse(row.features)
+                        : Array.isArray(row.features)
+                            ? row.features
+                            : [])
+                    : [], // fallback: empty array
+            }));
+
+            logger.info(`Fetched recent labeled simulations for cache warm-up`, {
+                count: parsed.length,
+                cutoffTime: new Date(cutoffTime).toISOString(),
+                maxRowsApplied: parsed.length === MAX_ROWS,
+            });
+
+            return parsed;
+
+        } catch (err) {
+            logger.error('Failed to fetch recent labeled simulations for warm-up', {
+                cutoffTime: new Date(cutoffTime).toISOString(),
+                error: err instanceof Error ? err.message : String(err),
+            });
+
+            // Fail-safe: return empty array so warm-up continues gracefully
+            return [];
+        }
+    }
+
     // =========================================================================
     // SIMULATION ANALYTICS: Top performing symbols by average R-multiple
     // =========================================================================
