@@ -2,6 +2,10 @@
 
 import type { SignalLabel, SimulationOutcome, TradeSignal } from './index';
 
+/**
+ * Single completed simulation entry — raw per-trade data
+ * Already purely directional (has 'direction' field) — no changes needed
+ */
 export interface SimulationHistoryEntry {
     timestamp: number;
     direction: 'buy' | 'sell';
@@ -16,55 +20,92 @@ export interface SimulationHistoryEntry {
     /** Max Adverse Excursion (% of entry, negative or zero) */
     mae: number;
 
-    // ── NEW: Timing metrics from 2025 scalping simulation ────────────────────────
-    // These measure how quickly the best/worst price excursions were reached
-    // All in milliseconds since entry
-    timeToMFE_ms: number;     // Time from entry to peak favorable excursion
-    timeToMAE_ms: number;     // Time from entry to peak adverse excursion (worst drawdown)
+    /** Time from entry to peak favorable excursion (ms) */
+    timeToMFE_ms: number;
+
+    /** Time from entry to peak adverse excursion (ms) */
+    timeToMAE_ms: number;
 }
 
+/**
+ * Aggregated directional statistics for one symbol
+ *
+ * 2026+ PURE DIRECTIONAL DESIGN:
+ *   - All statistics (MFE/MAE/ratio/win rate/duration/reversals/outcomes)
+ *     exist ONLY inside buy/sell nested objects
+ *   - NO combined aggregates except recentSampleCount (used exclusively
+ *     for the "total ≥ 3 → send alert" gate in AutoTradeService)
+ *   - If a side is missing or has sampleCount < 3 → decision MUST be 'skip'
+ *   - No fallback to combined stats allowed anywhere in scoring/advice
+ */
 export interface SymbolHistory {
     symbol: string;
+
+    /** Raw recent simulations (newest first) — source for filtering by direction */
     lastSimulations: SimulationHistoryEntry[];
 
-    // Lifetime
-    avgR: number;
-    winRate: number;
-    reverseCount: number;
-    avgMfe: number;
-    avgMae: number;
-    avgExcursionRatio: number;
-
-    avgMfeLong: number;
-    avgMaeLong: number;
-    avgMfeShort: number;
-    avgMaeShort: number;
-    winRateLong: number;
-    winRateShort: number;
-
-    // Recent (~3h → now 2h in cache)
-    recentMfe: number;
-    recentMae: number;
+    // ── ONLY combined field allowed — used SOLELY for alert gate ───────────────
+    /** Total recent completed simulations (buy + sell) – ONLY for deciding whether to send alert */
     recentSampleCount: number;
 
-    recentMfeLong?: number;
-    recentMaeLong?: number;
-    recentMfeShort?: number;
-    recentMaeShort?: number;
-    recentSampleCountLong?: number;
-    recentSampleCountShort?: number;
+    // ── Pure directional statistics – the ONLY source for decisions ─────────────
+    /** Buy / Long side statistics */
+    buy?: {
+        sampleCount: number;
+        mfe: number;
+        mae: number;
+        excursionRatio: number;
+        avgDurationMs: number;
+        winRate: number;
+        reverseCount: number;
+        outcomeCounts: {
+            tp: number;
+            partial_tp: number;
+            sl: number;
+            timeout: number;
+        };
+        /** Optional: consecutive SL streak for buy side only */
+        slStreak?: number;
+    };
 
-    recentReverseCount: number;
-    recentReverseCountLong?: number;
-    recentReverseCountShort?: number;
+    /** Sell / Short side statistics */
+    sell?: {
+        sampleCount: number;
+        mfe: number;
+        mae: number;
+        excursionRatio: number;
+        avgDurationMs: number;
+        winRate: number;
+        reverseCount: number;
+        outcomeCounts: {
+            tp: number;
+            partial_tp: number;
+            sl: number;
+            timeout: number;
+        };
+        /** Optional: consecutive SL streak for sell side only */
+        slStreak?: number;
+    };
 
+    /** Last trade direction (for quick context / UI) */
     lastDirection: 'buy' | 'sell' | null;
+
+    /** Warning level (derived from directional data) */
     warningLevel: WarningLevel;
+
+    /** Last update timestamp */
     updatedAt: number;
 }
 
+/**
+ * Simplified warning levels (can be computed from directional aggregates)
+ */
 export type WarningLevel = 'safe' | 'caution' | 'high_risk';
 
+/**
+ * Trade signal enriched with pure-directional history
+ * (used when passing signal + regime to AutoTrade or alerts)
+ */
 export interface TradeSignalWithHistory extends TradeSignal {
     history?: SymbolHistory;
 }

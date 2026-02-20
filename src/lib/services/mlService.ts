@@ -24,6 +24,7 @@ import { dbService } from '../db';
 import type { StrategyInput, SignalLabel } from '../../types'; // ← Critical: from single source of truth
 import { computeIndicators } from '../utils/indicatorUtils';   // ← Centralized indicator calculations
 import { excursionCache } from './excursionHistoryCache';
+import path from 'path';
 
 /**
  * Dedicated logger for all ML-related operations
@@ -145,39 +146,74 @@ export class MLService {
     // MODEL PERSISTENCE – Save current model to disk
     // =========================================================================
     /**
-     * Serializes and saves the current trained model to disk.
-     *
-     * Called from:
-     *   • retrain() – after successful training
-     *
-     * Why important:
-     *   • Persists learned knowledge across bot restarts
-     *   • Enables long-term adaptation to market changes
-     *
-     * Behavior:
-     *   • Converts classifier to JSON string
-     *   • Writes atomically to config.ml.modelPath
-     *   • Throws on failure (caller should handle)
-     *
-     * @private – only called after retraining
-     * @throws Error if write fails (disk full, permissions, etc.)
-     */
+ * MLService.ts (excerpt: saveModel method)
+ *
+ * This private method serializes the trained machine learning classifier (e.g., Random Forest) to a JSON file and saves it to disk.
+ * It ensures the model persists across application restarts, allowing the crypto trading bot to retain learned patterns from historical data
+ * for ongoing predictions (e.g., market signals for auto-trading).
+ *
+ * Features / Problems Solved:
+ * - Atomic file write: Overwrites the existing model file safely using fs.writeFile, minimizing corruption risks during saves.
+ * - Directory assurance: Checks and creates the target directory (recursive) if it doesn't exist, preventing ENOENT errors (no such file or directory).
+ * - JSON serialization: Converts the classifier object to a pretty-printed JSON string for readability and easy debugging/loading.
+ * - Configurable path: Uses config.ml.modelPath (e.g., from environment vars or config file) for flexibility in development/production (recommend absolute paths in prod to avoid relative path issues).
+ * - Robust error handling: Catches and logs specific FS errors (e.g., permissions, disk full), re-throws for caller (e.g., retrain()) to handle gracefully (e.g., fallback to in-memory model or alert admin via Telegram).
+ * - Asynchronous I/O: Uses promises for non-blocking operation, suitable for Node.js event loop in a bot environment where responsiveness is key.
+ * - Security: No user input involved; path is config-driven—ensure config.ml.modelPath is sanitized/validated at startup to prevent path traversal (not handled here; assume upstream).
+ * - Performance: Minimal—JSON.stringify is efficient for typical ML models; file write is O(1) for small models (<1MB assumed for RF classifiers in crypto data).
+ *
+ * Fits into the ML Module:
+ * - Called exclusively from retrain() and forceRetrain() after successful model training, as part of the adaptation pipeline.
+ * - Integrates with loadModel() (counterpart for deserialization on startup/reload).
+ * - Supports the bot's long-term learning: Retraining on new market data (e.g., via historical OHLCV from Bybit) updates the model, which is then saved here.
+ * - Aligns with error-resilient design: If save fails, the bot can continue with the in-memory model until next restart; critical logs trigger monitoring/alerts.
+ * - Production considerations: In Docker/K8s deployments, map /models dir to persistent volume; use absolute paths (e.g., '/app/models/rf_model.json') via env vars to avoid build-time relative issues.
+ *
+ * Dependencies:
+ * - Node.js 'fs/promises' and 'path' for async FS ops.
+ * - Assumes 'config' is a loaded config object (e.g., from config.ts) with ml.modelPath (string, e.g., './models/rf_model.json').
+ * - 'logger' (e.g., winston) for structured logging.
+ * - ML library (e.g., ml-random-forest) where this.classifier is JSON-serializable; if not, extend with custom toJSON().
+ *
+ * Potential Improvements (not implemented here):
+ * - Backup old model before overwrite (e.g., to .bak) for rollback.
+ * - Compression (e.g., gzip) if models grow large.
+ * - Validation: Post-save, read back and verify JSON integrity.
+ */
     private async saveModel(): Promise<void> {
         try {
-            // Serialize entire classifier (trees, hyperparameters, etc.)
-            const json = JSON.stringify(this.classifier);
+            // Resolve full path and ensure directory exists
+            const modelPath = path.resolve(config.ml.modelPath); // Use resolve for absolute path safety
+            const modelDir = path.dirname(modelPath);
+            await fs.mkdir(modelDir, { recursive: true }); // Create dir if missing (idempotent)
 
-            // Write to configured path (overwrites old model)
-            await fs.writeFile(config.ml.modelPath, json, 'utf-8');
+            // Serialize classifier to JSON (pretty-printed for human readability)
+            const json = JSON.stringify(this.classifier, null, 2);
 
-            // Confirm success
-            logger.info('ML model saved', { path: config.ml.modelPath });
-        } catch (err) {
-            // Critical error – model knowledge would be lost on restart
-            logger.error('Failed to save ML model', {
-                error: err instanceof Error ? err.stack : err
+            // Atomic write (overwrites if exists)
+            await fs.writeFile(modelPath, json, 'utf-8');
+
+            // Log success for monitoring
+            logger.info('ML model saved successfully', { path: modelPath });
+        } catch (err: any) {
+            // Enhanced error classification for better debugging/alerting
+            let errorMessage = 'Failed to save ML model';
+            if (err.code === 'ENOENT') {
+                errorMessage = 'Directory or file path not found';
+            } else if (err.code === 'EACCES') {
+                errorMessage = 'Permission denied';
+            } else if (err.code === 'ENOSPC') {
+                errorMessage = 'Disk full—no space left';
+            } else if (err instanceof SyntaxError) { // JSON.stringify failure
+                errorMessage = 'Model serialization failed (non-JSON-serializable data)';
+            }
+
+            logger.error(errorMessage, {
+                path: config.ml.modelPath,
+                error: err.stack || err.message,
             });
-            throw err; // Let caller decide how to handle (e.g., alert admin)
+
+            throw new Error(`${errorMessage}: ${err.message}`); // Re-throw with context for caller
         }
     }
 

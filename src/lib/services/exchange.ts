@@ -361,25 +361,74 @@ export class ExchangeService {
      */
     public async placeOrder(symbol: string, side: 'buy' | 'sell', amount: number, stopLoss?: number, takeProfit?: number, trailingStopDistance?: number): Promise<Order> {
         if (!this.isAutoTradeEnvSet()) {
-            Promise.reject(new Error('Auto-trade environment is not set. Cannot place orders.'));
+            return Promise.reject(new Error('Auto-trade environment is not set. Cannot place orders.'));
         }
 
         try {
-            if (!await this.validateSymbol(symbol)) {
+            // Load markets if not already loaded (ccxt caches internally)
+            const markets = await this.exchange.loadMarkets();
+            const market = markets[symbol];
+            if (!market || !await this.validateSymbol(symbol)) {
                 logger.error(`Invalid symbol for order: ${symbol}`);
                 throw new Error(`Symbol ${symbol} is not supported`);
             }
 
-            const params: { [key: string]: any } = {};
+            // Fetch current ticker for price-based validations (e.g., min notional)
+            const ticker = await this.exchange.fetchTicker(symbol);
+            const price = ticker.last || ticker.ask || ticker.bid; // Fallback to ask/bid if last unavailable
+            if (!price) {
+                throw new Error(`Unable to fetch price for ${symbol}`);
+            }
+
+            // 1. Calculate Min Quantity more safely
+            let minQty = market.limits.amount?.min ?? 0;
+            const minCost = market.limits.cost?.min || 5;
+
+            if (minCost > 0 && price > 0) {
+                // Instead of Math.ceil, get the raw min, then format it to valid precision
+                const rawMinFromCost = minCost / price;
+                const formattedMin = this.exchange.amountToPrecision(symbol, rawMinFromCost);
+                minQty = Math.max(minQty, parseFloat(formattedMin));
+            }
+
+            // 2. Validate
+            if (amount < minQty) {
+                throw new Error(`Amount ${amount} too small; minimum is ${minQty} (based on ${minCost} USDT min cost)`);
+            }
+
+            // 3. Calculate Determine step size safely
+            const precision = market.precision.amount ?? 0;
+            const stepSize = Math.pow(10, -precision);
+
+            // Align to step size (CRITICAL FIX)
+            const steppedAmount = Math.floor(amount / stepSize) * stepSize;
+
+            if (steppedAmount < minQty || steppedAmount <= 0) {
+                throw new Error(
+                    `Invalid quantity. Adjusted amount ${steppedAmount} < minQty ${minQty}`
+                );
+            }
+
+            // Final precision-safe formatting
+            const finalAmount = parseFloat(
+                this.exchange.amountToPrecision(symbol, steppedAmount)
+            );
+
+
+            // Prepare unified params (ccxt handles mapping to Bybit-specific keys)
+            const params: { [key: string]: any } = {
+                category: 'linear', // Required for Bybit v5 unified API
+            };
             if (stopLoss) params.stopLossPrice = stopLoss;
             if (takeProfit) params.takeProfitPrice = takeProfit;
-            if (trailingStopDistance) params.trailingStop = trailingStopDistance;
+            // if (trailingStopDistance) params.trailingAmount = trailingStopDistance;
 
+            // Place the order with retries
             const order = await this.withRetries(
-                () => this.exchange.createMarketOrder(symbol, side, amount, undefined, params),
+                () => this.exchange.createOrder(symbol, 'market', side, finalAmount, undefined, params),
                 3
             );
-            logger.info(`Placed ${side} order for ${amount} ${symbol} in live mode`, {
+            logger.info(`Placed ${side} order for ${finalAmount} ${symbol} in live mode`, {
                 stopLoss,
                 takeProfit,
                 trailingStopDistance,
@@ -387,7 +436,7 @@ export class ExchangeService {
             });
             return order;
         } catch (error) {
-            logger.error(`Failed to place ${side} order for ${symbol}`, { error });
+            logger.error(`Failed to place ${side} order for ${symbol}`, { error: (error as Error).message });
             throw error;
         }
     }

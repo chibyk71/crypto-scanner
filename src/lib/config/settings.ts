@@ -278,6 +278,7 @@ export const config = {
          * If a symbol's historical drawdown exceeds this, we skip or reduce size
          */
         maxMaePct: rawConfig.MAX_MAE_PCT,
+        minExcursionSamples: 3, // Minimum samples required to trust excursion stats for a symbol
 
         /**
          * Minimum MFE/MAE ratio required for confidence boost

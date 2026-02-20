@@ -28,15 +28,57 @@ const MAX_CLOSED_SIMS_PER_SYMBOL = 10;
 const MIN_SAMPLES_FOR_TRUST_DEFAULT = 3;
 
 /**
- * Cached entry – strictly for completed simulations only
- * This is the internal representation stored in the cache Map
+ * Direction of a trade (used consistently across cache, regime, and advice)
+ */
+type Direction = 'buy' | 'sell';
+
+/**
+ * Long/short mapping for advice calls (more semantic than 'buy'/'sell')
+ */
+type LongShort = 'long' | 'short';
+
+/**
+ * Reusable structure for aggregates of **one single direction** (buy or sell)
+ * All decision-relevant stats live here — no combined fallback allowed
+ */
+interface DirectionalAggregates {
+    /** Number of completed simulations in this exact direction */
+    sampleCount: number;
+
+    /** Average maximum favorable excursion (always ≥ 0) */
+    mfe: number;
+
+    /** Average maximum adverse excursion (always ≤ 0) */
+    mae: number;
+
+    /** Ratio MFE / |MAE| — higher = better regime for this direction */
+    excursionRatio: number;
+
+    /** Average trade duration in milliseconds for this direction */
+    avgDurationMs: number;
+
+    /** Outcome distribution — only for this direction */
+    outcomeCounts: {
+        tp: number;
+        partial_tp: number;
+        sl: number;
+        timeout: number;
+    };
+
+    /** Optional derived win rate (e.g. (tp + partial_tp) / total) */
+    winRate?: number;
+}
+
+/**
+ * Cached entry – strictly for completed simulations only.
+ * Internal representation stored in the cache Map.
  */
 interface CachedSimulationEntry extends SimulationHistoryEntry {
     signalId: string;
-    timestamp: number;          // completion timestamp
-    direction: 'buy' | 'sell';
+    timestamp: number;          // completion timestamp (ms since epoch)
+    direction: Direction;       // 'buy' or 'sell' – used to split into directional buckets
 
-    // ── NEW: Required timing fields from finalizeSimulation (scalping 2025)
+    // Timing fields from simulation (critical for scalping analysis)
     durationMs: number;         // total trade duration in milliseconds
     timeToMFE_ms: number;       // ms from entry to peak favorable excursion
     timeToMAE_ms: number;       // ms from entry to peak adverse excursion
@@ -53,75 +95,62 @@ interface SimulationScore {
 }
 
 /**
- * Full regime – includes capped history + outcome-enriched aggregates
- * This is what getRegime() returns (with historyJson)
+ * Full regime – returned by getRegime(symbol)
+ *
+ * 2026+ pure directional design:
+ *   - All meaningful aggregates (MFE/MAE/ratio/duration/outcomes) live **only** inside buy/sell
+ *   - Combined fields are minimal — used **only** for:
+ *     • Alert gate: recentSampleCount >= 3
+ *     • Overview warnings: slStreak, timeoutRatio
+ *   - No combined MFE/MAE/ratio/avgDurationMs — no fallback allowed
+ *   - Decision logic must use buy or sell aggregates exclusively
  */
 export interface ExcursionRegime {
     symbol: string;
-    historyJson?: SimulationHistoryEntry[]; // newest first, max 5
 
-    // Core aggregates from recent completed simulations
-    recentAvgR: number;
-    recentWinRate: number;
-    recentReverseCount: number;
-    recentMae: number;           // ≤ 0
-    recentMfe: number;           // ≥ 0
-    recentExcursionRatio: number;
+    /** Optional: most recent entries shown in alerts (newest first, capped) */
+    historyJson?: SimulationHistoryEntry[];
+
+    // ── Minimal combined fields – ONLY for alert gate & basic warnings ───────────
+    /** Total recent completed simulations (buy + sell) – used ONLY for alert gate */
     recentSampleCount: number;
 
-    // Directional aggregates (completed only)
-    recentMfeLong?: number;
-    recentMaeLong?: number;
-    recentSampleCountLong?: number;
+    /** Consecutive SL streak across all directions (from newest) */
+    slStreak: number;
 
-    recentMfeShort?: number;
-    recentMaeShort?: number;
-    recentSampleCountShort?: number;
+    /** Overall timeout ratio (timeout / total) – overview only */
+    timeoutRatio: number;
 
-    // Outcome statistics
-    outcomeCounts: {
-        tp: number;
-        partial_tp: number;
-        sl: number;
-        timeout: number;
-    };
-    outcomeCountsLong?: {
-        tp: number;
-        partial_tp: number;
-        sl: number;
-        timeout: number;
-    };
-    outcomeCountsShort?: {
-        tp: number;
-        partial_tp: number;
-        sl: number;
-        timeout: number;
-    };
+    // ── Pure directional aggregates – these are the source of truth ──────────────
+    /** Buy / Long side statistics – used for long signals */
+    buy?: DirectionalAggregates;
 
-    slStreak: number;           // consecutive SL from newest entry
-    timeoutRatio: number;       // timeoutCount / total (0–1)
+    /** Sell / Short side statistics – used for short signals */
+    sell?: DirectionalAggregates;
 
-    // ── NEW: Duration aggregates (average in milliseconds)
-    avgDurationMs: number;           // overall average trade duration
-    avgDurationLong?: number;        // average for long trades only
-    avgDurationShort?: number;       // average for short trades only
+    // Optional directional streaks (can be populated if needed later)
+    slStreakBuy?: number;
+    slStreakSell?: number;
 
-    activeCount: 0;             // permanently 0 – no live simulations
+    // ── Fixed ────────────────────────────────────────────────────────────────────
+    /** Always 0 – no live tracking here */
+    activeCount: 0;
 
+    /** Last computation time */
     updatedAt: Date;
 }
 
 /**
- * Lightweight version – no historyJson array (used in getRegimeLite)
- * Automatically inherits all new avgDuration* fields via Omit
+ * Lightweight version – no historyJson array
+ * Used in performance-critical paths (advice, status checks)
  */
 export interface ExcursionRegimeLite
     extends Omit<ExcursionRegime, 'historyJson'> { }
 
 /**
- * Tunable thresholds for 2026 scalping scoring (excursion-dominant)
- * Move to config later for live tuning
- */
+* Tunable thresholds for 2026 scalping scoring (excursion-dominant)
+* Move to config later for live tuning
+*/
 const SCORE_THRESHOLDS = {
     mfeGood: 0.5,               // % — meaningful favorable excursion
     mfeDecent: 0.25,
@@ -155,30 +184,55 @@ export class ExcursionHistoryCache {
     // ──────────────────────────────────────────────────────────────────────────────
     // Constructor – initialize storage & start periodic cleanup
     // ──────────────────────────────────────────────────────────────────────────────
-
     constructor() {
-        this.cache = new Map();
-        this.aggregates = new Map();
+        // ────────────────────────────────────────────────────────────────
+        // 1. Initialize internal storage
+        //    - cache: stores raw completed simulation entries per symbol
+        //    - aggregates: precomputed directional + combined regime stats
+        // ────────────────────────────────────────────────────────────────
+        this.cache = new Map<string, CachedSimulationEntry[]>();
+        this.aggregates = new Map<string, ExcursionRegime>();
 
-        // Apply config with safe defaults
-        const windowHours = Math.max(1, RECENT_WINDOW_HOURS_DEFAULT);
+        // ────────────────────────────────────────────────────────────────
+        // 2. Apply configuration with safe defaults
+        //    All values are clamped to prevent invalid states
+        // ────────────────────────────────────────────────────────────────
+        const windowHours = Math.max(1, RECENT_WINDOW_HOURS_DEFAULT); // min 1 hour
         this.recentWindowMs = windowHours * 60 * 60 * 1000;
 
-        this.maxClosedSims = MAX_CLOSED_SIMS_PER_SYMBOL;
+        // Max simulations kept per symbol (total, not per side yet)
+        // In future we might split to max per direction
+        this.maxClosedSims = Math.max(5, MAX_CLOSED_SIMS_PER_SYMBOL ?? 10);
 
-        logger.info('ExcursionHistoryCache initialized (completed-only mode)', {
-            recentWindowHours: windowHours,
-            recentWindowMs: this.recentWindowMs,
+        // Cleanup runs every 30 minutes by default
+        // Can be made configurable later if needed
+        this.cleanupIntervalMs = 30 * 60 * 1000;
+
+        // ────────────────────────────────────────────────────────────────
+        // 3. Log initialization details for debugging & monitoring
+        // ────────────────────────────────────────────────────────────────
+        logger.info('ExcursionHistoryCache initialized (completed simulations only)', {
+            recentWindowHours: this.recentWindowMs / (60 * 60 * 1000),
             maxClosedSimsPerSymbol: this.maxClosedSims,
-            cleanupIntervalMin: this.cleanupIntervalMs / 60_000,
+            cleanupIntervalMinutes: this.cleanupIntervalMs / 60_000,
+            note: 'Directional (buy/sell) aggregates will be computed separately'
         });
 
-        // Start periodic cleanup
+        // ────────────────────────────────────────────────────────────────
+        // 4. Start periodic background cleanup
+        //    - Removes old entries outside the time window
+        //    - Caps number of stored simulations
+        //    - Recomputes aggregates after pruning
+        // ────────────────────────────────────────────────────────────────
         this.cleanupTimer = setInterval(() => {
             try {
                 this.cleanup();
             } catch (err) {
-                logger.error('Periodic cleanup failed', { error: err });
+                logger.error('Periodic cleanup failed – continuing anyway', {
+                    error: err instanceof Error ? err.message : String(err),
+                    stack: err instanceof Error ? err.stack : undefined
+                });
+                // Do NOT re-throw → keep the interval alive
             }
         }, this.cleanupIntervalMs);
     }
@@ -303,22 +357,23 @@ export class ExcursionHistoryCache {
         return { baseScore, timeModifier, totalScore };
     }
 
-    // =========================================================================
-    // PRIMARY WRITE METHOD: Add completed simulation to cache
-    // =========================================================================
     /**
      * Adds a newly completed simulation to the per-symbol cache.
-     * - Validates required fields
+     * - Validates required fields (strict integrity check)
      * - Computes nuanced 0–5 score + ML label
      * - Enriches entry with score/label
-     * - Ensures newest first order
-     * - Prunes (time window + max size)
-     * - Triggers aggregate recompute
+     * - Maintains newest-first order
+     * - Prunes old entries (time window) and caps total size
+     * - Triggers directional + combined aggregate recompute
      *
-     * Called from: simulateTrade (after DB insert)
-     * Design: Add-only (no updates — simulations are final/immutable)
-     */
+     * Called from: simulateTrade (after successful DB insert)
+     * Design notes:
+     *   - Simulations are immutable → add-only, no updates
+     *   - Pruning is total (combined buy+sell) for simplicity
+     *   - Directional separation happens downstream in recomputeAggregates
+    */
     public addCompletedSimulation(symbol: string, entry: Partial<CachedSimulationEntry>): void {
+        // ── 1. Early validation ────────────────────────────────────────────────
         if (!entry || typeof entry !== 'object') {
             logger.warn('addCompletedSimulation received invalid entry – rejected');
             return;
@@ -326,44 +381,48 @@ export class ExcursionHistoryCache {
 
         symbol = symbol.trim().toUpperCase();
         if (!symbol) {
-            logger.warn('Missing symbol in simulation entry – rejected');
+            logger.warn('Missing or empty symbol in simulation entry – rejected');
             return;
         }
 
-        // Required fields validation (strict for data integrity)
+        // Required fields – strict check for data quality
         const missingFields = [
-            !entry.signalId ? 'signalId' : null,
-            !entry.timestamp ? 'timestamp' : null,
-            !entry.direction || !['buy', 'sell'].includes(entry.direction) ? 'direction' : null,
-            !entry.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(entry.outcome) ? 'outcome' : null,
-            entry.mfe === undefined ? 'mfe' : null,
-            entry.mae === undefined ? 'mae' : null,
-            entry.durationMs == null ? 'durationMs' : null,
-            entry.timeToMFE_ms == null ? 'timeToMFE_ms' : null,
-            entry.timeToMAE_ms == null ? 'timeToMAE_ms' : null,
-        ].filter(Boolean);
+            !entry.signalId && 'signalId',
+            entry.timestamp == null && 'timestamp',
+            (!entry.direction || !['buy', 'sell'].includes(entry.direction)) && 'direction',
+            (!entry.outcome || !['tp', 'partial_tp', 'sl', 'timeout'].includes(entry.outcome)) && 'outcome',
+            entry.mfe === undefined && 'mfe',
+            entry.mae === undefined && 'mae',
+            entry.durationMs == null && 'durationMs',
+            entry.timeToMFE_ms == null && 'timeToMFE_ms',
+            entry.timeToMAE_ms == null && 'timeToMAE_ms',
+        ].filter(Boolean) as string[];
 
         if (missingFields.length > 0) {
-            logger.warn('Incomplete simulation data – entry rejected', {
+            logger.warn('Incomplete simulation entry – rejected', {
                 symbol,
-                signalId: entry.signalId,
+                signalId: entry.signalId ?? 'unknown',
+                direction: entry.direction ?? 'missing',
                 missingFields,
             });
             return;
         }
 
-        // Compute score & label
-        const { totalScore } = this.computeSimulationScore(entry as CachedSimulationEntry);
+        // Type assertion – safe after validation
+        const validatedEntry = entry as CachedSimulationEntry;
+
+        // ── 2. Compute score & label ───────────────────────────────────────────
+        const { totalScore } = this.computeSimulationScore(validatedEntry);
         const label = this.mapScoreToLabel(totalScore);
 
-        // Enrich entry
+        // Enrich with computed values
         const enrichedEntry: CachedSimulationEntry & { score: number; label: SignalLabel } = {
-            ...entry as CachedSimulationEntry,
+            ...validatedEntry,
             score: totalScore,
             label,
         };
 
-        // Suspicious timing warning (defensive)
+        // ── 3. Defensive timing sanity check ──────────────────────────────────
         if (
             enrichedEntry.durationMs < 0 ||
             enrichedEntry.timeToMFE_ms < 0 ||
@@ -371,653 +430,538 @@ export class ExcursionHistoryCache {
             enrichedEntry.timeToMFE_ms > enrichedEntry.durationMs ||
             enrichedEntry.timeToMAE_ms > enrichedEntry.durationMs
         ) {
-            logger.warn('Suspicious timing values in simulation entry', {
+            logger.warn('Suspicious timing values detected in simulation', {
                 symbol,
                 signalId: enrichedEntry.signalId,
+                direction: enrichedEntry.direction,
                 durationMs: enrichedEntry.durationMs,
                 timeToMFE_ms: enrichedEntry.timeToMFE_ms,
                 timeToMAE_ms: enrichedEntry.timeToMAE_ms,
             });
+            // Still accept — just warn (data might still be useful)
         }
 
-        // Get or initialize cache
+        // ── 4. Add to cache ────────────────────────────────────────────────────
         let sims = this.cache.get(symbol) ?? [];
 
-        // Add new entry
         sims.push(enrichedEntry);
 
-        // Sort newest first (defensive)
+        // Keep newest first
         sims.sort((a, b) => b.timestamp - a.timestamp);
 
-        // Prune
-        const cutoff = Date.now() - RECENT_WINDOW_HOURS_DEFAULT * 60 * 60 * 1000;
+        // ── 5. Prune old / excess entries ──────────────────────────────────────
+        const cutoff = Date.now() - this.recentWindowMs;
         sims = sims.filter(s => s.timestamp >= cutoff);
-        if (sims.length > MAX_CLOSED_SIMS_PER_SYMBOL) {
-            sims = sims.slice(0, MAX_CLOSED_SIMS_PER_SYMBOL);
+
+        // Cap total simulations per symbol (combined buy + sell)
+        if (sims.length > this.maxClosedSims) {
+            sims = sims.slice(0, this.maxClosedSims);
         }
 
-        // Update cache
+        // ── 6. Update storage ──────────────────────────────────────────────────
         if (sims.length === 0) {
             this.cache.delete(symbol);
             this.aggregates.delete(symbol);
+            logger.debug(`Cache emptied for symbol after prune`, { symbol });
         } else {
             this.cache.set(symbol, sims);
         }
 
-        // Recompute aggregates
+        // ── 7. Recompute aggregates (directional + combined) ───────────────────
         this.recomputeAggregates(symbol);
 
-        logger.info(`Added & scored simulation to cache`, {
+        // ── 8. Log success ─────────────────────────────────────────────────────
+        logger.info(`Added & scored new simulation`, {
             symbol,
             signalId: enrichedEntry.signalId,
+            direction: enrichedEntry.direction,
             outcome: enrichedEntry.outcome,
             score: totalScore.toFixed(2),
             label,
-            cacheSize: sims.length,
+            cacheSizeAfter: sims.length,
+            note: 'Aggregates recomputed (buy/sell split applied)'
         });
     }
 
     /**
-    * Private method: Recomputes all aggregate statistics and outcome-derived fields
-    * for a single symbol based on its current (pruned) list of completed simulations.
-    *
-    * Called from:
-    *   1. updateOrAdd() — immediately after any write/prune
-    *   2. cleanup() — after pruning a symbol during periodic maintenance
-    *   3. Potentially from getRegime() if aggregates are missing (cache miss)
-    *
-    * Responsibilities in strict order:
-    *   A. Early exit if no entries exist (clean up stale aggregate cache)
-    *   B. Get the current pruned entries (already newest → oldest)
-    *   C. Compute core aggregates (MFE/MAE averages, ratio, win rate, etc.)
-    *   D. Compute outcome counts (tp / sl / timeout / partial_tp) — overall + directional
-    *   E. Compute streaks (slStreak from newest entries)
-    *   F. Compute directional breakdowns (long/short where possible)
-    *   G. Compute **NEW** duration averages (overall + long/short) — key for scalping freshness
-    *   H. Build a fresh ExcursionRegime object
-    *   I. Store it in this.aggregates Map (overwriting old one)
-    *   J. Log key results for observability (debug/info depending on change size)
-    *
-    * Important invariants this method must guarantee:
-    *   - All stats are computed **only from completed simulations** (no live blending)
-    *   - All values are safe (no NaN, no division by zero → defaults to 0 or undefined)
-    *   - Directional fields are optional (undefined if no data in that direction)
-    *   - activeCount is **always 0** — we no longer track live simulations
-    *   - historyJson in full regime contains **only the capped/recent entries**
-    *   - Computation is deterministic and cheap (max 5 entries → trivial math)
-    *
-    * Performance note:
-    *   - O(n) where n ≤ 5 → negligible even if called frequently
-    *   - No external calls, no I/O — pure in-memory math
-    *
-    * @param symbol - Normalized uppercase symbol (e.g. 'BTC/USDT')
-    */
+ * Private method: Recomputes all aggregate statistics and outcome-derived fields
+ * for a single symbol based on its current (pruned) list of completed simulations.
+ *
+ * Called from:
+ *   - addCompletedSimulation() — after every new entry/prune
+ *   - cleanup() — after periodic pruning
+ *   - Potentially from getRegime() on cache miss (future-proof)
+ *
+ * Key design principles for directional regime (2026+):
+ *   - Combined stats (recentSampleCount, slStreak, timeoutRatio) used for alert gate & overview
+ *   - All decision-critical stats (MFE/MAE/ratio/outcomes/duration) computed PER DIRECTION
+ *   - Directional fields are optional (undefined if zero samples in that direction)
+ *   - activeCount permanently 0 — only completed simulations matter
+ *   - Computation remains fast (O(n) with n ≤ 10)
+ *
+ * @param symbol Normalized uppercase symbol (e.g. 'BTC/USDT')
+ */
     private recomputeAggregates(symbol: string): void {
-        // ── STEP 1: Early exit if symbol has no entries at all ───────────────────────
+        // ── STEP 1: Early exit if no entries ───────────────────────────────────────
         const entries = this.cache.get(symbol);
 
         if (!entries || entries.length === 0) {
             const hadAggregate = this.aggregates.delete(symbol);
             if (hadAggregate) {
-                logger.debug('Removed stale aggregate cache for symbol with no entries', { symbol });
+                logger.debug('Removed stale aggregate for symbol with no entries', { symbol });
             }
-            logger.debug('recomputeAggregates skipped — no entries exist', { symbol });
             return;
         }
 
-        // ── STEP 2: Log entry point for observability ────────────────────────────────
-        logger.debug('Starting aggregate recomputation', {
-            symbol,
-            entryCount: entries.length,
-            newestTimestamp: entries[0]?.timestamp ? new Date(entries[0].timestamp).toISOString() : 'none',
-            oldestTimestamp: entries[entries.length - 1]?.timestamp
-                ? new Date(entries[entries.length - 1].timestamp).toISOString()
-                : 'none',
-        });
+        // ── STEP 2: Split entries by direction ──────────────────────────────────────
+        const buyEntries = entries.filter(e => e.direction === 'buy');
+        const sellEntries = entries.filter(e => e.direction === 'sell');
 
-        // ── STEP 3: Safe average helper (used many times below) ──────────────────────
-        // Prevents NaN when dividing by zero or empty array
-        // Always returns 0 on empty → conservative default
-        const safeAvg = (values: number[]): number => {
-            if (values.length === 0) return 0;
-            const sum = values.reduce((acc, val) => acc + val, 0);
-            return sum / values.length;
+        const combinedCount = entries.length;
+
+        // ── STEP 3: Helper to compute aggregates for one direction ──────────────────
+        const computeDirectional = (dirEntries: CachedSimulationEntry[]): DirectionalAggregates | undefined => {
+            if (dirEntries.length === 0) return undefined;
+
+            const mfeValues = dirEntries.map(e => e.mfe ?? 0);
+            const maeValues = dirEntries.map(e => Math.abs(e.mae ?? 0)); // absolute for averaging
+            const durationMs = dirEntries.map(e => e.durationMs ?? 0);
+
+            const mfe = this.safeAvg(mfeValues);
+            const mae = -this.safeAvg(maeValues); // back to negative
+            const ratio = mfe / (Math.abs(mae) || 1); // avoid div/0
+
+            const outcomeCounts = { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
+            dirEntries.forEach(e => {
+                const o = e.outcome;
+                if (o && o in outcomeCounts) outcomeCounts[o as keyof typeof outcomeCounts]++;
+            });
+
+            return {
+                sampleCount: dirEntries.length,
+                mfe,
+                mae,
+                excursionRatio: ratio,
+                avgDurationMs: this.safeAvg(durationMs),
+                outcomeCounts,
+            };
         };
 
-        // ── STEP 4: Core aggregates (overall) ────────────────────────────────────────
-        const mfeValues = entries.map(e => e.mfe ?? 0);
-        const maeValues = entries.map(e => e.mae ?? 0);
-        const rValues = entries.map(e => e.rMultiple ?? 0);
+        const buyAgg = computeDirectional(buyEntries);
+        const sellAgg = computeDirectional(sellEntries);
 
-        const recentMfe = safeAvg(mfeValues);
-        const recentMae = safeAvg(maeValues);
-        const recentAvgR = safeAvg(rValues);
-        const recentSampleCount = entries.length;
-
-        const recentExcursionRatio = ExcursionHistoryCache.computeExcursionRatio(recentMfe, recentMae);
-
-        const winCount = entries.filter(e => (e.label ?? 0) >= 1).length;
-        const recentWinRate = recentSampleCount > 0 ? winCount / recentSampleCount : 0;
-
-        const reverseCount = entries.filter(
-            e => (e.rMultiple ?? 0) < 0 && Math.abs(e.label ?? 0) >= 1
-        ).length;
-
-        // ── STEP 5: Outcome counts (overall) ─────────────────────────────────────────
-        const outcomeCounts = { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
-        entries.forEach(entry => {
-            const outcome = entry.outcome;
-            if (outcome && outcome in outcomeCounts) {
-                outcomeCounts[outcome as keyof typeof outcomeCounts]++;
-            }
-        });
-
-        const timeoutRatio = recentSampleCount > 0
-            ? outcomeCounts.timeout / recentSampleCount
-            : 0;
-
-        // ── STEP 6: SL streak (consecutive stop-losses from newest entry) ────────────
+        // ── STEP 4: Combined stats (for alert gate & overview) ──────────────────────
         let slStreak = 0;
-        for (const entry of entries) {
-            if (entry.outcome === 'sl') {
-                slStreak++;
-            } else {
-                break;
-            }
+        for (const e of entries) { // newest first
+            if (e.outcome === 'sl') slStreak++;
+            else break;
         }
 
-        // ── STEP 7: Directional breakdowns (long / short) ────────────────────────────
-        const longs = entries.filter(e => e.direction === 'buy');
-        const shorts = entries.filter(e => e.direction === 'sell');
+        const totalTimeouts = (buyAgg?.outcomeCounts.timeout ?? 0) + (sellAgg?.outcomeCounts.timeout ?? 0);
+        const timeoutRatio = combinedCount > 0 ? totalTimeouts / combinedCount : 0;
 
-        const recentMfeLong = longs.length ? safeAvg(longs.map(e => e.mfe)) : undefined;
-        const recentMaeLong = longs.length ? safeAvg(longs.map(e => e.mae)) : undefined;
-        const recentSampleCountLong = longs.length || undefined;
-
-        const recentMfeShort = shorts.length ? safeAvg(shorts.map(e => e.mfe)) : undefined;
-        const recentMaeShort = shorts.length ? safeAvg(shorts.map(e => e.mae)) : undefined;
-        const recentSampleCountShort = shorts.length || undefined;
-
-        const outcomeCountsLong = longs.length ? this._computeOutcomeCounts(longs) : undefined;
-        const outcomeCountsShort = shorts.length ? this._computeOutcomeCounts(shorts) : undefined;
-
-        // ── NEW: STEP 7.5 – Duration aggregates (average trade length) ───────────────
-        // Very important for scalping: short duration + good outcome = strong momentum
-        const durationValues = entries.map(e => e.durationMs ?? 0);
-        const avgDurationMs = safeAvg(durationValues);
-
-        const longDurations = longs.map(e => e.durationMs ?? 0);
-        const shortDurations = shorts.map(e => e.durationMs ?? 0);
-
-        const avgDurationLong = longs.length ? safeAvg(longDurations) : undefined;
-        const avgDurationShort = shorts.length ? safeAvg(shortDurations) : undefined;
-
-        // Optional safety check: warn if average duration looks unrealistic
-        if (avgDurationMs > 30 * 60 * 1000) { // > 30 minutes — suspicious for 10-candle max
-            logger.warn('Unusually long average duration detected', {
-                symbol,
-                avgDurationMs,
-                avgDurationSec: (avgDurationMs / 1000).toFixed(1),
-                sampleCount: recentSampleCount,
-            });
-        }
-
-        // ── STEP 8: Build the fresh regime object ────────────────────────────────────
+        // ── STEP 5: Build fresh regime object ───────────────────────────────────────
         const freshRegime: ExcursionRegime = {
             symbol,
+            historyJson: entries.map(e => ({ ...e }) as SimulationHistoryEntry).slice(0, 5), // cap for alerts
 
-            historyJson: entries.map(e => ({ ...e }) as SimulationHistoryEntry),
-
-            recentAvgR,
-            recentWinRate,
-            recentReverseCount: reverseCount,
-            recentMae,
-            recentMfe,
-            recentExcursionRatio,
-            recentSampleCount,
-
-            recentMfeLong,
-            recentMaeLong,
-            recentSampleCountLong,
-
-            recentMfeShort,
-            recentMaeShort,
-            recentSampleCountShort,
-
-            outcomeCounts,
-            outcomeCountsLong,
-            outcomeCountsShort,
-
+            recentSampleCount: combinedCount,
             slStreak,
             timeoutRatio,
 
-            // ── NEW: Duration averages
-            avgDurationMs,
-            avgDurationLong,
-            avgDurationShort,
+            buy: buyAgg,
+            sell: sellAgg,
 
             activeCount: 0,
             updatedAt: new Date(),
         };
 
-        // ── STEP 9: Store the new aggregate in cache ─────────────────────────────────
+        // ── STEP 6: Store & log ─────────────────────────────────────────────────────
         this.aggregates.set(symbol, freshRegime);
 
-        // ── STEP 10: Observability logging – include new duration metrics ────────────
-        logger.debug('Aggregates recomputed successfully', {
+        logger.debug('Directional aggregates recomputed', {
             symbol,
-            samples: recentSampleCount,
-            ratio: recentExcursionRatio.toFixed(2),
-            winRatePct: (recentWinRate * 100).toFixed(1) + '%',
+            totalSamples: combinedCount,
+            buySamples: buyAgg?.sampleCount ?? 0,
+            sellSamples: sellAgg?.sampleCount ?? 0,
+            buyMfeMae: buyAgg ? `${buyAgg.mfe.toFixed(3)} / ${buyAgg.mae.toFixed(3)}` : 'n/a',
+            sellMfeMae: sellAgg ? `${sellAgg.mfe.toFixed(3)} / ${sellAgg.mae.toFixed(3)}` : 'n/a',
             slStreak,
-            timeoutRatio: timeoutRatio.toFixed(2),
-            outcomeSummary: `${outcomeCounts.tp} TP / ${outcomeCounts.sl} SL / ${outcomeCounts.timeout} TO`,
-            directional: {
-                longSamples: recentSampleCountLong ?? 0,
-                shortSamples: recentSampleCountShort ?? 0,
-            },
-            // NEW: duration metrics in seconds and minutes for readability
-            avgDurationSec: (avgDurationMs / 1000).toFixed(1),
-            avgDurationMin: (avgDurationMs / 60000).toFixed(2),
-            avgLongSec: avgDurationLong ? (avgDurationLong / 1000).toFixed(1) : 'n/a',
-            avgShortSec: avgDurationShort ? (avgDurationShort / 1000).toFixed(1) : 'n/a',
+            timeoutRatio: timeoutRatio.toFixed(3),
+            avgDurationSec: buyAgg || sellAgg ?
+                ((buyAgg?.avgDurationMs ?? 0) + (sellAgg?.avgDurationMs ?? 0)) / (combinedCount || 1) / 1000 : 'n/a',
         });
     }
 
     /**
- * Tiny internal helper to count outcomes for a subset of entries (e.g. only longs)
- */
-    private _computeOutcomeCounts(entries: CachedSimulationEntry[]): {
-        tp: number;
-        partial_tp: number;
-        sl: number;
-        timeout: number;
-    } {
-        const counts = { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
+     * Safe average helper: computes the mean of an array of numbers.
+     *
+     * - Returns 0 if the array is empty (prevents division by zero / NaN)
+     * - Handles undefined/null values gracefully by skipping them (via ?? 0)
+     * - Used extensively in directional aggregate calculations
+     *
+     * @param values Array of numbers to average
+     * @param defaultValue Value to return if array is empty (default: 0)
+     * @returns The arithmetic mean, or defaultValue if empty
+     */
+    private safeAvg(values: number[], defaultValue: number = 0): number {
+        if (!values || values.length === 0) {
+            return defaultValue;
+        }
 
-        entries.forEach(e => {
-            const outcome = e.outcome;
-            if (outcome && outcome in counts) {
-                counts[outcome as keyof typeof counts]++;
-            }
-        });
+        // Sum only valid numbers (extra safety, though mfe/mae/duration are validated upstream)
+        const sum = values.reduce((acc, val) => acc + (val ?? 0), 0);
 
-        return counts;
+        return sum / values.length;
     }
 
     /**
  * Private helper: Prune (remove) old entries and enforce the maximum number of
- * completed simulations allowed per symbol.
+ * completed simulations allowed per symbol (combined buy + sell).
  *
- * Called from two places:
- *   1. Immediately after adding/updating an entry in updateOrAdd()
- *   2. During periodic cleanup() on every symbol
+ * Called from:
+ *   - addCompletedSimulation() — right after adding a new entry
+ *   - cleanup() — during periodic maintenance on each symbol
  *
- * Responsibilities in order:
- *   A. Remove entries older than the recency window (~6 hours)
- *   B. If still more entries than allowed (maxClosedSims = 5), truncate to newest 5
- *   C. Mutate the passed array in place (no return value)
+ * Responsibilities:
+ *   A. Remove entries older than the recency window (this.recentWindowMs)
+ *   B. If still exceeding maxClosedSims, keep only the newest ones
+ *   C. Mutate the array in place (no return value)
  *
- * Important invariants this method must preserve:
- *   - Array remains sorted: newest entry first (index 0), oldest last
- *   - No live entries exist (we already reject them in updateOrAdd)
- *   - After pruning, length ≤ maxClosedSims AND all remaining entries are within window
- *   - Safe to call multiple times (idempotent)
+ * Invariants preserved:
+ *   - Array remains sorted: newest first (index 0)
+ *   - All remaining entries are within time window
+ *   - Final length ≤ this.maxClosedSims
+ *   - Safe & idempotent (multiple calls = no harm)
  *
- * Why mutate in place?
- *   - Avoids unnecessary array allocations
- *   - Keeps code simpler in calling methods (updateOrAdd just calls this then uses the array)
- *
- * Performance:
- *   - O(n) worst case (single reverse pass to remove old entries)
- *   - Usually very fast — n ≤ 5–10 in practice
- *
- * @param entries - Mutable array of completed simulation entries for ONE symbol
- *                  **MUST already be sorted newest → oldest** before calling
- * @param now     - Current timestamp (Date.now()) — passed in so we can test with fixed time
+ * @param entries Mutable array of CachedSimulationEntry[] for ONE symbol
+ *                MUST be pre-sorted newest → oldest before calling
+ * @param now Current timestamp (Date.now()) — injectable for testing
  */
     private _pruneEntries(entries: CachedSimulationEntry[], now: number): void {
-        // ── STEP 1: Calculate the cutoff timestamp ───────────────────────────────────
-        // Anything older than this is considered "stale" and should be removed
-        // Example: if window = 6 hours, cutoff = now - 6*60*60*1000
-        const cutoffTimestamp = now - this.recentWindowMs;
+        if (!entries || entries.length === 0) {
+            return; // nothing to prune
+        }
 
-        logger.debug('Starting _pruneEntries', {
-            symbol: 'N/A (private method)',
-            beforeCount: entries.length,
-            cutoffTime: new Date(cutoffTimestamp).toISOString(),
-            windowHours: this.recentWindowMs / (60 * 60 * 1000),
-        });
-
-        // ── STEP 2: Remove old entries (reverse iteration for safe splicing) ─────────
-        // We iterate BACKWARDS so that removing elements doesn't mess up indices
-        // This is the classic safe way to remove items while iterating an array
-        let removedCount = 0;
+        // ── STEP 1: Remove old entries (reverse iteration for safe splice) ───────────
+        const cutoff = now - this.recentWindowMs;
+        let removedByTime = 0;
 
         for (let i = entries.length - 1; i >= 0; i--) {
             const entry = entries[i];
 
-            // If this entry's completion timestamp is BEFORE the cutoff → it's too old
-            if (entry.timestamp < cutoffTimestamp) {
-                // Remove it from the array
+            // Defensive: skip if timestamp invalid/missing
+            if (typeof entry.timestamp !== 'number' || entry.timestamp <= 0) {
+                logger.warn('Invalid timestamp in cache entry – removing', {
+                    symbol: 'N/A (prune)',
+                    signalId: entry.signalId ?? 'unknown',
+                    timestamp: entry.timestamp
+                });
                 entries.splice(i, 1);
-                removedCount++;
+                removedByTime++;
+                continue;
+            }
 
-                // Optional: log individual removal (only in debug to avoid spam)
+            if (entry.timestamp < cutoff) {
+                entries.splice(i, 1);
+                removedByTime++;
+
                 if (logger.isDebugEnabled()) {
-                    logger.debug('Pruned old simulation entry', {
+                    logger.debug('Pruned stale entry', {
                         signalId: entry.signalId,
+                        direction: entry.direction,
                         ageHours: ((now - entry.timestamp) / (60 * 60 * 1000)).toFixed(1),
-                        outcome: entry.outcome,
-                        reason: 'outside recency window',
+                        outcome: entry.outcome
                     });
                 }
             }
         }
 
-        // ── STEP 3: Enforce maximum allowed simulations (truncate if needed) ─────────
-        // After removing old ones, we might still have too many recent ones
-        // (e.g. 7 simulations all happened in the last 30 minutes)
-        // We keep only the newest 5 (since array is already sorted newest first)
-        if (entries.length > this.maxClosedSims) {
-            const excess = entries.length - this.maxClosedSims;
+        // ── STEP 2: Enforce maximum total simulations (truncate oldest) ──────────────
+        let removedByLimit = 0;
 
-            logger.info('Enforcing maxClosedSims limit — truncating oldest entries', {
+        if (entries.length > this.maxClosedSims) {
+            removedByLimit = entries.length - this.maxClosedSims;
+
+            logger.info('Enforcing maxClosedSims limit – truncating oldest', {
                 before: entries.length,
                 maxAllowed: this.maxClosedSims,
-                removing: excess,
+                removing: removedByLimit
             });
 
-            // Simply slice off the end (oldest entries)
-            // Because array is sorted newest → oldest, entries[maxClosedSims] and beyond are oldest
+            // Slice keeps newest (since sorted newest → oldest)
             entries.length = this.maxClosedSims;
+        }
 
-            // Optional: log which ones were dropped (debug only)
-            if (logger.isDebugEnabled()) {
-                logger.debug('Truncated oldest simulations', {
-                    keptNewest: this.maxClosedSims,
-                    droppedOldest: excess,
-                    oldestKeptTimestamp: entries[entries.length - 1]?.timestamp,
+        // ── STEP 3: Final logging & directional summary (for observability) ──────────
+        const finalCount = entries.length;
+
+        if (removedByTime > 0 || removedByLimit > 0) {
+            // Count directions after prune (helps spot imbalances)
+            const buyCount = entries.filter(e => e.direction === 'buy').length;
+            const sellCount = entries.filter(e => e.direction === 'sell').length;
+
+            logger.info('Prune completed', {
+                removedByTime,
+                removedByLimit,
+                finalCount,
+                buyCount,
+                sellCount,
+                withinWindow: finalCount === 0 || entries.every(e => e.timestamp >= cutoff),
+                newestTimestamp: entries[0]?.timestamp ? new Date(entries[0].timestamp).toISOString() : 'none'
+            });
+        } else if (logger.isDebugEnabled()) {
+            logger.debug('No pruning needed – entries valid', {
+                count: finalCount,
+                buyCount: entries.filter(e => e.direction === 'buy').length,
+                sellCount: entries.filter(e => e.direction === 'sell').length
+            });
+        }
+
+        // ── Optional debug assertion (only in dev/debug mode) ────────────────────────
+        if (logger.isDebugEnabled()) {
+            const allRecent = entries.every(e => e.timestamp >= cutoff);
+            const lengthOk = entries.length <= this.maxClosedSims;
+            if (!allRecent || !lengthOk) {
+                logger.warn('Prune invariants violated – investigate', {
+                    allWithinWindow: allRecent,
+                    lengthOk,
+                    finalCount: entries.length,
+                    maxAllowed: this.maxClosedSims
                 });
             }
         }
-
-        // ── STEP 4: Final logging / validation ───────────────────────────────────────
-        const afterCount = entries.length;
-
-        if (removedCount > 0 || afterCount < entries.length) {
-            logger.info('Prune operation completed', {
-                removedByTime: removedCount,
-                truncatedByLimit: Math.max(0, (entries.length + removedCount) - this.maxClosedSims),
-                finalCount: afterCount,
-                stillWithinWindow: afterCount === 0 || entries.every(e => e.timestamp >= cutoffTimestamp),
-                newestTimestamp: entries[0]?.timestamp ? new Date(entries[0].timestamp).toISOString() : 'none',
-            });
-        } else {
-            logger.debug('No pruning needed — entries already valid', {
-                count: afterCount,
-                withinWindow: true,
-            });
-        }
-
-        // ── End of method ────────────────────────────────────────────────────────────
-        // The array has now been mutated:
-        //   - All remaining entries are recent (timestamp >= cutoff)
-        //   - Length <= maxClosedSims
-        //   - Still sorted newest first (splice doesn't break order)
     }
 
     /**
  * Public read method: Retrieves the **full** excursion regime for a given symbol.
  *
- * This is the richer version of the regime data — it includes:
- *   • All computed aggregates (MFE/MAE averages, ratio, win rate, reverse count...)
- *   • Outcome counts (tp/sl/timeout/partial_tp) — overall + directional
- *   • SL streak and timeout ratio
- *   • The actual array of recent completed simulations (`historyJson`) — newest first, max 5
+ * Returns the richer regime object including:
+ *   - Combined overview (total samples, SL streak, timeout ratio)
+ *   - Directional aggregates (buy / sell) with MFE/MAE, ratio, durations, outcomes
+ *   - Recent simulation history (`historyJson`) — newest first, capped for display
  *
- * When to use this method (vs getRegimeLite):
- *   - When you need to see the raw recent simulation history (e.g. debugging, last-two checks)
- *   - When displaying detailed excursion info in logs/alerts/UI
- *   - When ML feature extraction needs the individual entries
+ * When to use this vs `getRegimeLite`:
+ *   - Need raw recent entries (debugging, alerts, detailed UI)
+ *   - Need full directional breakdown for logging or analysis
  *
- * Performance characteristics:
- *   - O(1) in the common case (aggregates already cached after a write)
- *   - O(n) only on cache miss (n ≤ 5 → recompute is extremely fast)
- *   - Thread-safe for concurrent reads (Map.get is atomic in JS)
+ * Performance:
+ *   - O(1) most of the time (cached aggregates)
+ *   - O(n) on cache miss (n ≤ maxClosedSims → fast)
  *
- * Behavior on edge cases:
- *   - No data at all for symbol → returns `null`
- *   - Cache miss but entries exist → computes fresh aggregates automatically
- *   - Symbol had data but all pruned (too old) → returns `null` and cleans up
+ * Edge cases:
+ *   - No data → null
+ *   - All entries pruned → null + cleanup
+ *   - Cache miss → auto-recompute
  *
- * @param symbol - Trading pair (e.g. 'BTC/USDT') — case-insensitive, will be normalized
- * @returns Full `ExcursionRegime` object or `null` if no recent completed simulations exist
+ * @param symbol Trading pair (e.g. 'BTC/USDT') — normalized internally
+ * @returns ExcursionRegime or null if no recent completed simulations
  */
     public getRegime(symbol: string): ExcursionRegime | null {
-        // ── STEP 1: Normalize the symbol (same as in updateOrAdd) ─────────────────────
-        // Prevents bugs from inconsistent casing or whitespace
+        // ── STEP 1: Normalize symbol (consistent casing) ───────────────────────────────
         const normalized = symbol.trim().toUpperCase();
-
-        // ── STEP 2: Fast path — check if we already have fresh aggregates cached ──────
-        // Because we recompute aggregates immediately after every write/prune,
-        // this should be hit 99%+ of the time in production.
-        let regime = this.aggregates.get(normalized);
-
-        if (regime) {
-            // Quick sanity check (should never fail in correct code)
-            if (regime.symbol !== normalized) {
-                logger.warn('Cached regime symbol mismatch — this should never happen', {
-                    requested: normalized,
-                    cached: regime.symbol,
-                });
-                // Still return it — better than crashing
-            }
-
-            logger.debug('Returning cached full regime (fast path)', {
-                symbol: normalized,
-                sampleCount: regime.recentSampleCount,
-                slStreak: regime.slStreak,
-                ratio: regime.recentExcursionRatio.toFixed(2),
-                cachedAt: regime.updatedAt.toISOString(),
-            });
-
-            return regime;
-        }
-
-        // ── STEP 3: Cache miss — check if we even have raw entries to work with ───────
-        const entries = this.cache.get(normalized);
-
-        if (!entries || entries.length === 0) {
-            // No raw data → definitely no regime
-            // Clean up any stale aggregate reference just in case
-            this.aggregates.delete(normalized);
-
-            logger.debug('getRegime returning null — no simulation data exists', {
-                symbol: normalized,
-            });
-
+        if (!normalized) {
+            logger.warn('getRegime called with invalid/empty symbol');
             return null;
         }
 
-        // ── STEP 4: Entries exist but aggregates missing → force recomputation ────────
-        // This is the slow path — but because max 5 entries, it's still very fast
-        logger.debug('Cache miss on full regime — triggering recomputeAggregates', {
+        // ── STEP 2: Fast path – return cached regime if available ──────────────────────
+        let regime = this.aggregates.get(normalized);
+
+        if (regime) {
+            logger.debug('Returning cached full regime (fast path)', {
+                symbol: normalized,
+                totalSamples: regime.recentSampleCount,
+                buySamples: regime.buy?.sampleCount ?? 0,
+                sellSamples: regime.sell?.sampleCount ?? 0,
+                slStreak: regime.slStreak,
+                timeoutRatio: regime.timeoutRatio?.toFixed(3) ?? 'n/a',
+                cachedAt: regime.updatedAt.toISOString(),
+            });
+            return regime;
+        }
+
+        // ── STEP 3: Check if we have raw entries to recompute from ─────────────────────
+        const entries = this.cache.get(normalized);
+
+        if (!entries || entries.length === 0) {
+            // No data → clean up any stale aggregate and return null
+            this.aggregates.delete(normalized);
+            logger.debug('getRegime returning null – no simulation data', { symbol: normalized });
+            return null;
+        }
+
+        // ── STEP 4: Cache miss – force recompute aggregates ────────────────────────────
+        logger.debug('Cache miss on full regime – recomputing aggregates', {
             symbol: normalized,
             entryCount: entries.length,
             newest: entries[0]?.timestamp ? new Date(entries[0].timestamp).toISOString() : 'none',
+            oldest: entries[entries.length - 1]?.timestamp
+                ? new Date(entries[entries.length - 1].timestamp).toISOString()
+                : 'none',
         });
 
-        // This call will:
-        //   - Recompute everything from the current entries
-        //   - Store fresh result in this.aggregates
-        //   - Log key metrics
         this.recomputeAggregates(normalized);
 
-        // ── STEP 5: Retrieve the freshly computed regime ─────────────────────────────
+        // ── STEP 5: Retrieve fresh regime after recompute ──────────────────────────────
         regime = this.aggregates.get(normalized);
 
         if (!regime) {
-            // This should almost never happen unless recomputeAggregates failed silently
-            logger.error('recomputeAggregates ran but no regime was stored — possible bug', {
+            // Rare failure case – log error but don't crash
+            logger.error('recomputeAggregates ran but no regime stored – possible bug', {
                 symbol: normalized,
                 entryCount: entries.length,
             });
             return null;
         }
 
-        // ── STEP 6: Final success logging (info level since it's a cache miss) ───────
+        // ── STEP 6: Success logging (info level on miss) ───────────────────────────────
         logger.info('Full regime computed on cache miss and returned', {
             symbol: normalized,
-            samples: regime.recentSampleCount,
-            ratio: regime.recentExcursionRatio.toFixed(2),
-            winRatePct: (regime.recentWinRate * 100).toFixed(1) + '%',
+            totalSamples: regime.recentSampleCount,
+            buySamples: regime.buy?.sampleCount ?? 0,
+            sellSamples: regime.sell?.sampleCount ?? 0,
+            buyMfeMae: regime.buy ? `${regime.buy.mfe.toFixed(3)} / ${regime.buy.mae.toFixed(3)}` : 'n/a',
+            sellMfeMae: regime.sell ? `${regime.sell.mfe.toFixed(3)} / ${regime.sell.mae.toFixed(3)}` : 'n/a',
             slStreak: regime.slStreak,
-            timeoutRatio: regime.timeoutRatio.toFixed(2),
-            outcomeSummary: `${regime.outcomeCounts.tp} TP / ${regime.outcomeCounts.sl} SL / ${regime.outcomeCounts.timeout} TO`,
+            timeoutRatio: regime.timeoutRatio?.toFixed(3) ?? 'n/a',
+            avgDurationSec: regime.buy?.avgDurationMs || regime.sell?.avgDurationMs
+                ? (((regime.buy?.avgDurationMs ?? 0) + (regime.sell?.avgDurationMs ?? 0)) /
+                    (regime.recentSampleCount || 1) / 1000).toFixed(1)
+                : 'n/a',
             computedAt: regime.updatedAt.toISOString(),
         });
 
-        // ── STEP 7: Return the result ────────────────────────────────────────────────
+        // ── STEP 7: Return the fresh regime ────────────────────────────────────────────
         return regime;
     }
 
     /**
  * Public read method: Retrieves the **lightweight** excursion regime for a given symbol.
  *
- * This is the **optimized, memory-efficient** version of the regime data — it contains:
- *   • All computed aggregates (MFE/MAE averages, ratio, win rate, reverse count...)
- *   • Outcome counts (tp/sl/timeout/partial_tp) — overall + directional
- *   • SL streak and timeout ratio
- *   • **NO** `historyJson` array (saves memory & allocation cost)
+ * Optimized version without `historyJson` array — contains:
+ *   - Combined overview (total samples, SL streak, timeout ratio)
+ *   - Directional aggregates (`buy` / `sell`) with MFE/MAE, ratio, durations, outcomes
  *
- * When to use this method (vs getRegime):
- *   - In performance-critical loops (strategy scoring, risk filters, alert generation)
- *   - When sending regime data over network / logging frequently
- *   - When you only need the summary numbers and not the raw simulation entries
+ * Use this method when:
+ *   - Performance matters (strategy loops, risk checks, alert decisions)
+ *   - You only need summary stats (no raw simulation history)
+ *   - Sending regime data over network or logging frequently
  *
- * Performance characteristics:
- *   - O(1) in the common case (aggregates already cached)
- *   - O(n) only on rare cache miss (n ≤ 5 → recompute is trivial)
- *   - Slightly faster & lower memory than getRegime because no array is copied/returned
- *   - Thread-safe for concurrent reads
+ * Performance:
+ *   - O(1) most of the time (cached aggregates)
+ *   - O(n) on rare cache miss (n ≤ maxClosedSims → fast)
  *
- * Behavior on edge cases:
- *   - No data → returns `null`
- *   - Cache miss but entries exist → computes fresh aggregates automatically
- *   - All entries pruned (too old) → returns `null` and cleans up
+ * Edge cases:
+ *   - No data → null
+ *   - Cache miss → auto-recompute
+ *   - All entries pruned → null + cleanup
  *
- * @param symbol - Trading pair (e.g. 'BTC/USDT') — case-insensitive, normalized internally
- * @returns Lightweight `ExcursionRegimeLite` object or `null` if no recent completed simulations exist
+ * @param symbol Trading pair (e.g. 'BTC/USDT') — normalized internally
+ * @returns ExcursionRegimeLite or null if no recent completed simulations
  */
     public getRegimeLite(symbol: string): ExcursionRegimeLite | null {
-        // ── STEP 1: Normalize symbol once (consistency with updateOrAdd & getRegime) ──
+        // ── STEP 1: Normalize symbol (consistent with other methods) ───────────────────
         const normalized = symbol.trim().toUpperCase();
+        if (!normalized) {
+            logger.warn('getRegimeLite called with invalid/empty symbol');
+            return null;
+        }
 
-        // ── STEP 2: Fast path — check for existing cached aggregates ─────────────────
-        // Because we eagerly recompute on every write/prune, this should be hit almost always
+        // ── STEP 2: Fast path — return cached lightweight regime ───────────────────────
         let regime = this.aggregates.get(normalized);
 
         if (regime) {
-            // Optional sanity check (should never fail in correct code)
-            if (regime.symbol !== normalized) {
-                logger.warn('Cached lite regime symbol mismatch — possible corruption', {
-                    requested: normalized,
-                    cached: regime.symbol,
-                });
-                // Proceed anyway — data is still usable
-            }
-
-            // Create lightweight version by destructuring out historyJson
-            // This avoids copying the array reference unnecessarily
+            // Destructure to exclude historyJson (lightweight by design)
             const { historyJson, ...liteRegime } = regime;
 
             logger.debug('Returning cached lightweight regime (fast path)', {
                 symbol: normalized,
-                sampleCount: liteRegime.recentSampleCount,
+                totalSamples: liteRegime.recentSampleCount,
+                buySamples: liteRegime.buy?.sampleCount ?? 0,
+                sellSamples: liteRegime.sell?.sampleCount ?? 0,
                 slStreak: liteRegime.slStreak,
-                ratio: liteRegime.recentExcursionRatio.toFixed(2),
-                timeoutRatio: liteRegime.timeoutRatio.toFixed(2),
+                timeoutRatio: liteRegime.timeoutRatio?.toFixed(3) ?? 'n/a',
                 cachedAt: liteRegime.updatedAt.toISOString(),
             });
 
             return liteRegime as ExcursionRegimeLite;
         }
 
-        // ── STEP 3: Cache miss — check if we have any raw data to compute from ───────
+        // ── STEP 3: No cache hit — check if raw entries exist ──────────────────────────
         const entries = this.cache.get(normalized);
 
         if (!entries || entries.length === 0) {
-            // No raw entries → no regime possible
-            // Clean up any stale aggregate reference (defensive)
+            // No data → clean up aggregate reference and return null
             this.aggregates.delete(normalized);
-
-            logger.debug('getRegimeLite returning null — no simulation data', {
+            logger.debug('getRegimeLite returning null – no simulation data', {
                 symbol: normalized,
             });
-
             return null;
         }
 
-        // ── STEP 4: Cache miss but entries exist → force recomputation ───────────────
-        // This is the only time we do real work — but max 5 entries → very cheap
-        logger.debug('Cache miss on lightweight regime — triggering recomputeAggregates', {
+        // ── STEP 4: Cache miss with entries → force recompute ──────────────────────────
+        logger.debug('Cache miss on lightweight regime – recomputing aggregates', {
             symbol: normalized,
             entryCount: entries.length,
             newest: entries[0]?.timestamp ? new Date(entries[0].timestamp).toISOString() : 'none',
         });
 
-        // Recompute will populate this.aggregates with fresh data
         this.recomputeAggregates(normalized);
 
-        // ── STEP 5: Retrieve the freshly computed regime ─────────────────────────────
+        // ── STEP 5: Retrieve fresh regime after recompute ──────────────────────────────
         regime = this.aggregates.get(normalized);
 
         if (!regime) {
-            // Should almost never happen — recomputeAggregates failed to store result
-            logger.error('recomputeAggregates ran but no regime stored — possible bug', {
+            // Rare failure — log but return null safely
+            logger.error('recomputeAggregates ran but no regime stored – possible bug', {
                 symbol: normalized,
                 entryCount: entries.length,
             });
             return null;
         }
 
-        // ── STEP 6: Strip historyJson to create lightweight version ──────────────────
+        // ── STEP 6: Create lightweight version (exclude historyJson) ───────────────────
         const { historyJson, ...liteRegime } = regime;
 
-        // ── STEP 7: Success logging (info level because cache miss is noteworthy) ────
+        // ── STEP 7: Log success on cache miss (info level) ─────────────────────────────
         logger.info('Lightweight regime computed on cache miss and returned', {
             symbol: normalized,
-            samples: liteRegime.recentSampleCount,
-            ratio: liteRegime.recentExcursionRatio.toFixed(2),
-            winRatePct: (liteRegime.recentWinRate * 100).toFixed(1) + '%',
+            totalSamples: liteRegime.recentSampleCount,
+            buySamples: liteRegime.buy?.sampleCount ?? 0,
+            sellSamples: liteRegime.sell?.sampleCount ?? 0,
+            buyMfeMae: liteRegime.buy ? `${liteRegime.buy.mfe.toFixed(3)} / ${liteRegime.buy.mae.toFixed(3)}` : 'n/a',
+            sellMfeMae: liteRegime.sell ? `${liteRegime.sell.mfe.toFixed(3)} / ${liteRegime.sell.mae.toFixed(3)}` : 'n/a',
             slStreak: liteRegime.slStreak,
-            timeoutRatio: liteRegime.timeoutRatio.toFixed(2),
-            outcomeSummary: `${liteRegime.outcomeCounts.tp} TP / ${liteRegime.outcomeCounts.sl} SL / ${liteRegime.outcomeCounts.timeout} TO`,
+            timeoutRatio: liteRegime.timeoutRatio?.toFixed(3) ?? 'n/a',
+            avgDurationSec: (liteRegime.buy?.avgDurationMs ?? 0) || (liteRegime.sell?.avgDurationMs ?? 0)
+                ? (((liteRegime.buy?.avgDurationMs ?? 0) + (liteRegime.sell?.avgDurationMs ?? 0)) /
+                    (liteRegime.recentSampleCount || 1) / 1000).toFixed(1)
+                : 'n/a',
             computedAt: liteRegime.updatedAt.toISOString(),
         });
 
-        // ── STEP 8: Return the stripped lightweight object ───────────────────────────
-        return liteRegime as ExcursionRegimeLite;
+        // ── STEP 8: Return lightweight regime ──────────────────────────────────────────
+        return liteRegime;
     }
 
     /**
- * Warms up the in-memory excursion cache from the database on startup.
- *
- * Purpose:
- *   - After bot restart, restore recent simulation history so regime advice,
- *     scoring, and ML features work immediately (no cold start)
- *   - Loads only **labeled + closed** simulations (ready for training)
- *   - Respects the same limits as normal operation (last N hours + max 10 per symbol)
- *   - Reuses `addCompletedSimulation()` so scoring, label mapping, pruning,
- *     and aggregate recomputation happen automatically
- *
- * When to call:
- *   - Once during application startup (after dbService.initialize())
- *   - Optionally on a schedule (e.g. every 30–60 minutes) for safety
- *
- * @param recencyHours - How far back to load (default = RECENT_WINDOW_HOURS_DEFAULT)
- */
+     * Warms up the in-memory excursion cache from the database on startup.
+     *
+     * Purpose:
+     *   - After bot restart, restore recent simulation history so regime advice,
+     *     scoring, and ML features work immediately (no cold start)
+     *   - Loads only **labeled + closed** simulations (ready for training)
+     *   - Respects the same limits as normal operation (last N hours + max 10 per symbol)
+     *   - Reuses `addCompletedSimulation()` so scoring, label mapping, pruning,
+     *     and aggregate recomputation happen automatically
+     *
+     * When to call:
+     *   - Once during application startup (after dbService.initialize())
+     *   - Optionally on a schedule (e.g. every 30–60 minutes) for safety
+     *
+     * @param recencyHours - How far back to load (default = RECENT_WINDOW_HOURS_DEFAULT)
+     */
     public async warmUpFromDb(recencyHours: number = RECENT_WINDOW_HOURS_DEFAULT): Promise<void> {
         const cutoffTime = Date.now() - recencyHours * 60 * 60 * 1000;
 
@@ -1062,8 +1006,8 @@ export class ExcursionHistoryCache {
                         outcome: sim.outcome! as SimulationOutcome,
                         rMultiple: (sim.rMultiple ?? 0) / 10000,   // unscale from DB
                         label: sim.label! as SignalLabel,
-                        mfe: (sim.maxFavorableExcursion ?? 0) / 10000,
-                        mae: (sim.maxAdverseExcursion ?? 0) / 10000,
+                        mfe: (sim.maxFavorableExcursion ?? 0) / 1e8,
+                        mae: (sim.maxAdverseExcursion ?? 0) / 1e8,
                         durationMs: sim.durationMs ?? 0,
                         timeToMFE_ms: sim.timeToMFEMs ?? 0,
                         timeToMAE_ms: sim.timeToMAEMs ?? 0,
@@ -1232,48 +1176,48 @@ export class ExcursionHistoryCache {
     }
 
     /**
- * Public method: Graceful shutdown and resource cleanup for the ExcursionHistoryCache.
- *
- * This method should be called exactly once during application shutdown — typically in:
- *   - Main process exit handler (process.on('SIGTERM'), 'SIGINT'))
- *   - Container stop hook (Docker/Kubernetes graceful termination)
- *   - Worker shutdown sequence (e.g. when stopping the MarketScanner or entire bot)
- *
- * Responsibilities in strict order:
- *   1. Prevent double-shutdown (idempotent — safe to call multiple times)
- *   2. Stop the periodic cleanup timer (prevents new background tasks after shutdown)
- *   3. Perform one final cleanup pass → ensures latest state is pruned & aggregates fresh
- *   4. Log shutdown status clearly (helps confirm clean exit in logs/monitoring)
- *   5. Do NOT clear the actual cache data by default — let Node.js GC handle memory
- *      (this keeps memory alive until process fully exits — usually desired)
- *
- * Important design principles:
- *   - **Idempotent**: Calling destroy() twice does nothing the second time
- *   - **Fail-safe**: Never throws — errors are logged but shutdown continues
- *   - **Observability**: Detailed logging at info/debug levels
- *   - **No persistence**: We don't flush to disk/DB (if needed, add later)
- *   - **Minimal work**: Fast execution — should not delay process exit
- *
- * When NOT to call this:
- *   - During normal operation (timer should keep running)
- *   - In tests (unless you want to simulate shutdown)
- *
- * Future optional extensions (commented out for now):
- *   - Final stats export / Prometheus push
- *   - Cache snapshot for warm restart
- *   - Event emission (if we add listeners later)
- *
- * Typical usage pattern in main app:
- *
- * ```ts
- * process.on('SIGTERM', () => {
- *   logger.info('SIGTERM received — initiating graceful shutdown...');
- *   excursionCache.destroy();
- *   // other shutdown steps...
- *   process.exit(0);
- * });
- * ```
- */
+     * Public method: Graceful shutdown and resource cleanup for the ExcursionHistoryCache.
+     *
+     * This method should be called exactly once during application shutdown — typically in:
+     *   - Main process exit handler (process.on('SIGTERM'), 'SIGINT'))
+     *   - Container stop hook (Docker/Kubernetes graceful termination)
+     *   - Worker shutdown sequence (e.g. when stopping the MarketScanner or entire bot)
+     *
+     * Responsibilities in strict order:
+     *   1. Prevent double-shutdown (idempotent — safe to call multiple times)
+     *   2. Stop the periodic cleanup timer (prevents new background tasks after shutdown)
+     *   3. Perform one final cleanup pass → ensures latest state is pruned & aggregates fresh
+     *   4. Log shutdown status clearly (helps confirm clean exit in logs/monitoring)
+     *   5. Do NOT clear the actual cache data by default — let Node.js GC handle memory
+     *      (this keeps memory alive until process fully exits — usually desired)
+     *
+     * Important design principles:
+     *   - **Idempotent**: Calling destroy() twice does nothing the second time
+     *   - **Fail-safe**: Never throws — errors are logged but shutdown continues
+     *   - **Observability**: Detailed logging at info/debug levels
+     *   - **No persistence**: We don't flush to disk/DB (if needed, add later)
+     *   - **Minimal work**: Fast execution — should not delay process exit
+     *
+     * When NOT to call this:
+     *   - During normal operation (timer should keep running)
+     *   - In tests (unless you want to simulate shutdown)
+     *
+     * Future optional extensions (commented out for now):
+     *   - Final stats export / Prometheus push
+     *   - Cache snapshot for warm restart
+     *   - Event emission (if we add listeners later)
+     *
+     * Typical usage pattern in main app:
+     *
+     * ```ts
+     * process.on('SIGTERM', () => {
+     *   logger.info('SIGTERM received — initiating graceful shutdown...');
+     *   excursionCache.destroy();
+     *   // other shutdown steps...
+     *   process.exit(0);
+     * });
+     * ```
+     */
     public destroy(): void {
         // ── STEP 1: Idempotency check — prevent double execution ─────────────────────
         // If timer is already null → we've already been called (or never started)
@@ -1359,108 +1303,85 @@ export class ExcursionHistoryCache {
     // Static utilities – unchanged for now (can be stubbed/refactored later)
     // ──────────────────────────────────────────────────────────────────────────────
     /**
-     * Static utility method: Computes the **excursion ratio** — a core risk/reward efficiency metric.
-     *
-     * Formula (conceptually):
-     *   excursionRatio = MFE / |MAE|
-     *
-     * This single number tells us, historically:
-     *   - How much favorable price movement (profit potential) we get
-     *     compared to the adverse movement (drawdown pain) we have to endure
-     *
-     * Interpretation guide:
-     *   > 2.0     → Excellent — strong reward relative to risk (favor this direction)
-     *   1.5–2.0   → Good — meaningful edge
-     *   ~1.0      → Balanced — reward roughly equals risk
-     *   0.5–1.0   → Poor — more pain than gain (caution / possible skip or reverse)
-     *   < 0.5     → Very dangerous — drawdowns dominate (strong reverse candidate)
-     *   0         → No meaningful data (MAE=0 or MFE=0)
-     *
-     * Safety & edge-case handling (critical for production stability):
-     *   - Never divide by zero → returns 0 when MAE is zero (conservative)
-     *   - Handles negative/zero MFE → returns 0 (no favorable movement = no ratio)
-     *   - Uses absolute value of MAE (since MAE is conventionally negative or zero)
-     *   - Caps extreme ratios to prevent numeric weirdness downstream (e.g. Infinity)
-     *   - No side effects, pure function — safe to call anywhere
-     *
-     * Why this method exists as static:
-     *   - Reusable in many places (strategy, alerts, ML features, excursionUtils)
-     *   - No dependency on instance state → can be called without cache object
-     *   - Central single source of truth for how ratio is calculated
-     *
-     * @param mfe - Maximum Favorable Excursion (positive or zero)
-     *              Best unrealized profit seen (% or points relative to entry)
-     * @param mae - Maximum Adverse Excursion (negative or zero)
-     *              Worst unrealized drawdown seen (% or points relative to entry)
-     * @returns The safe MFE / |MAE| ratio (≥ 0)
-     *          - 0 when no meaningful ratio can be computed
-     *          - Positive number indicating historical reward-to-risk efficiency
-     *
-     * @example
-     * computeExcursionRatio(3.2, -1.1)   // → ~2.91  (strong)
-     * computeExcursionRatio(0.8, -2.0)   // → 0.40   (poor)
-     * computeExcursionRatio(4.5, 0)      // → 0      (no drawdown → undefined)
-     * computeExcursionRatio(0, -1.5)     // → 0      (no favorable movement)
-     * computeExcursionRatio(-1, -2)      // → 0      (invalid negative MFE)
-     */
+  * Static utility method: Computes the **excursion ratio** — a core risk/reward efficiency metric.
+  *
+  * Formula:
+  *   excursionRatio = MFE / |MAE|
+  *
+  * Interpretation guide (for percentage-based excursions):
+  *   > 2.0     → Excellent regime — strong reward vs risk (favor this direction)
+  *   1.5–2.0   → Good — meaningful edge
+  *   1.0–1.5   → Balanced — reward roughly matches risk
+  *   0.5–1.0   → Weak — more pain than gain (caution / possible skip)
+  *   < 0.5     → Poor — drawdowns dominate (strong skip or reverse candidate)
+  *   0         → No meaningful ratio (insufficient data or zero MAE)
+  *
+  * Safety features:
+  *   - Returns 0 on invalid/meaningless inputs (zero/negative MFE, zero MAE)
+  *   - Protects against tiny MAE values causing huge ratios
+  *   - Caps extreme ratios to prevent downstream numeric issues
+  *   - Pure function — no side effects, safe to call anywhere
+  *
+  * @param mfe Maximum Favorable Excursion (should be ≥ 0)
+  * @param mae Maximum Adverse Excursion (should be ≤ 0)
+  * @returns Safe excursion ratio (≥ 0)
+  *          - 0 when ratio cannot be meaningfully computed
+  *          - Positive value indicating historical reward-to-risk efficiency
+  *
+  * @example
+  * computeExcursionRatio(2.8, -0.9)   // → ~3.11  (excellent)
+  * computeExcursionRatio(1.2, -2.5)   // → 0.48   (poor — caution)
+  * computeExcursionRatio(5.0, 0)      // → 0      (no drawdown = undefined)
+  * computeExcursionRatio(0, -1.0)     // → 0      (no favorable movement)
+  * computeExcursionRatio(-0.5, -1.0)  // → 0      (invalid negative MFE)
+  */
     public static computeExcursionRatio(mfe: number, mae: number): number {
-        // ── STEP 1: Early rejection of meaningless inputs ────────────────────────────
-        // If MFE is zero or negative → no favorable movement ever occurred
-        // Ratio is undefined → return conservative 0
+        // ── Configurable thresholds (can be moved to class constants later) ───────────
+        const MIN_MAE_THRESHOLD = 1e-6;       // Ignore tiny MAE values (noise protection)
+        const MAX_REASONABLE_RATIO = 50;      // Cap extreme ratios (e.g. 100× in pumps)
+
+        // ── STEP 1: Reject invalid / meaningless MFE ────────────────────────────────
         if (mfe <= 0) {
-            // Optional debug log when this happens frequently (helps detect data issues)
             if (logger.isDebugEnabled() && mfe < 0) {
-                logger.debug('computeExcursionRatio received negative MFE — treated as 0', {
-                    inputMfe: mfe,
-                    inputMae: mae,
-                    result: 0,
+                logger.debug('computeExcursionRatio: negative MFE treated as 0', {
+                    mfe,
+                    mae,
+                    result: 0
                 });
             }
             return 0;
         }
 
-        // ── STEP 2: Handle zero MAE case (no drawdown observed) ──────────────────────
-        // Mathematically undefined (division by zero)
-        // We choose conservative return value: 0
-        // Treating it as infinite reward would be dangerous (over-optimistic)
-        if (mae === 0) {
-            return 0;
-        }
-
-        // ── STEP 3: Core calculation ─────────────────────────────────────────────────
-        // MAE is negative by convention → take absolute value for magnitude
+        // ── STEP 2: Handle zero or near-zero MAE (no drawdown) ──────────────────────
         const absMae = Math.abs(mae);
 
-        // Very small MAE protection — floating-point noise can cause huge ratios
-        // Threshold is intentionally tiny (0.0001% is negligible in crypto)
-        if (absMae < 1e-6) {
-            logger.debug('computeExcursionRatio protected against tiny MAE', {
-                absMae,
-                mfe,
-                result: 0,
-            });
+        if (absMae === 0 || absMae < MIN_MAE_THRESHOLD) {
+            if (logger.isDebugEnabled()) {
+                logger.debug('computeExcursionRatio: insignificant MAE — returning 0', {
+                    mae,
+                    absMae,
+                    minThreshold: MIN_MAE_THRESHOLD,
+                    mfe
+                });
+            }
             return 0;
         }
 
-        // Actual ratio: how many times bigger is best profit vs worst loss
+        // ── STEP 3: Core calculation ────────────────────────────────────────────────
         let ratio = mfe / absMae;
 
-        // ── STEP 4: Final safety clamp (prevent numeric instability downstream) ──────
-        // While theoretically possible to have very high ratios (e.g. 100× in pumps),
-        // extreme values can cause issues in comparisons/multipliers/alert logic
-        // We cap at a reasonable but generous value (50× is already exceptional)
-        const MAX_REASONABLE_RATIO = 50;
+        // ── STEP 4: Safety cap for extreme values ───────────────────────────────────
         if (ratio > MAX_REASONABLE_RATIO) {
-            logger.debug('Excursion ratio capped for safety', {
+            logger.debug('Excursion ratio capped for numeric stability', {
                 rawRatio: ratio,
                 cappedTo: MAX_REASONABLE_RATIO,
                 mfe,
-                absMae,
+                absMae
             });
             ratio = MAX_REASONABLE_RATIO;
         }
 
-        // ── STEP 5: Return final safe value ──────────────────────────────────────────
+        // ── STEP 5: Return clean positive value ─────────────────────────────────────
         return ratio;
     }
 
@@ -1568,215 +1489,201 @@ export class ExcursionHistoryCache {
  * Static utility method: Determines whether the current regime shows **dangerously high drawdown risk**
  * in the requested trade direction (long or short).
  *
- * This is a critical **safety filter** used in:
- *   - Strategy.generateSignal() — to potentially skip or demote signals
- *   - getExcursionAdvice() — to influence action ('skip', tighten SL, etc.)
- *   - AutoTradeService — to block or reduce live position size
- *   - Alerts / UI — to show red flags / warnings
+ * Critical safety filter used in:
+ *   - Strategy.generateSignal() — to skip/demote signals
+ *   - getExcursionAdvice() — to force 'skip' or tighten levels
+ *   - AutoTradeService — to block/reduce live trades
+ *   - Alerts — to show red flags
  *
- * Main decision logic (priority order):
- *   1. Require minimum trusted samples (default 2 in 2025) — if too few → conservative false (not high risk yet)
- *   2. Prefer **directional MAE** if enough directional samples exist (most relevant)
- *   3. Fallback to **overall MAE** if directional data is insufficient
- *   4. Compare absolute MAE against configurable max threshold (default 3.0%)
- *   5. Optional future enhancement: factor in slStreak or outcomeCounts.sl for stronger signal
+ * 2026+ pure directional rules:
+ *   1. Require minimum trusted samples **strictly on the intended side** (default 3)
+ *   2. Use **only directional MAE** from buy or sell aggregates
+ *   3. No fallback to combined MAE — if side missing or insufficient samples → treat as safe
+ *   4. Compare |MAE| against configurable threshold (default 3.0%)
  *
  * Returns:
- *   true  → High drawdown risk detected → typically skip / reduce size / warn
- *   false → Acceptable risk (or insufficient data to judge) → can proceed with caution
+ *   true  → High drawdown risk on this side → skip / reduce size / warn
+ *   false → Acceptable risk, or insufficient side data to judge → proceed (or skip upstream)
  *
- * Safety principles:
- *   - Fail-open on missing/invalid data → returns false (better to allow cautious trading than block everything)
+ * Safety:
+ *   - Fail-open on missing/insufficient side data → false
  *   - Never throws — always returns boolean
- *   - Very defensive against undefined/missing regime fields
- *   - Logging only when actually risky (debug level) — keeps production clean
+ *   - Pure directional — no combined stats used for risk judgment
  *
- * Configurability:
+ * Config:
  *   - maxMaePct → config.strategy.maxMaePct (default 3.0)
- *   - minSamples → config.strategy.minExcursionSamples (default 2 in 2025)
+ *   - minSamples → config.strategy.minExcursionSamples (default 3)
  *
- * @param regime    - Full or lite ExcursionRegime object from cache
- * @param direction - Intended trade direction ('long' = buy, 'short' = sell)
- * @returns boolean — true if drawdown risk is considered dangerously high
- *
- * @example
- * isHighMaeRisk(regime, 'long')   // true if directional long MAE > -3.0% (with enough samples)
- * isHighMaeRisk(regime, 'short')  // false if no short data or MAE within limits
+ * @param regime Full or lite ExcursionRegime from cache
+ * @param direction 'long' (buy) or 'short' (sell)
+ * @returns boolean — true if drawdown risk is dangerously high **on this side**
  */
     public static isHighMaeRisk(
-        regime: ExcursionRegime | ExcursionRegimeLite,
-        direction: 'long' | 'short'
+        regime: ExcursionRegime | ExcursionRegimeLite | null | undefined,
+        direction: LongShort
     ): boolean {
-        // ── STEP 1: Configuration values (centralized, overridable) ──────────────────
-        // These should ideally live in config.strategy (already partially do)
-        const MAX_MAE_PCT_DEFAULT = 3.0;          // 3% average drawdown is our danger threshold
-        const MIN_SAMPLES_FOR_TRUST = 2; // lowered to 2 in 2025
+        // ── STEP 1: Early guard — invalid/missing regime → treat as safe ───────────────
+        if (!regime || typeof regime !== 'object') {
+            logger.debug('isHighMaeRisk: invalid/missing regime — treated as safe', {
+                regimeType: regime === null ? 'null' : typeof regime,
+                direction
+            });
+            return false;
+        }
+
+        // ── STEP 2: Configuration (centralized, overridable) ───────────────────────────
+        const MAX_MAE_PCT_DEFAULT = 3.0;          // 3% avg drawdown = danger zone
+        const MIN_SAMPLES_FOR_TRUST = 3;          // strict minimum for directional trust
 
         const maxMaePct = config.strategy?.maxMaePct ?? MAX_MAE_PCT_DEFAULT;
+        const minSamples = config.strategy?.minExcursionSamples ?? MIN_SAMPLES_FOR_TRUST;
 
-        // ── STEP 2: Early exit — not enough overall samples to trust any judgment ─────
-        // If we don't have enough completed simulations → conservative: NOT high risk yet
-        // (prevents blocking new symbols too aggressively while data accumulates)
-        if ((regime.recentSampleCount ?? 0) < MIN_SAMPLES_FOR_TRUST) {
-            // Optional debug log when borderline — helps tune min samples
-            if (logger.isDebugEnabled() && (regime.recentSampleCount ?? 0) > 0) {
-                logger.debug('isHighMaeRisk: insufficient overall samples — treated as safe', {
-                    symbol: regime.symbol,
-                    samples: regime.recentSampleCount,
-                    required: MIN_SAMPLES_FOR_TRUST,
-                    direction,
-                });
-            }
-            return false;
-        }
+        // ── STEP 3: Strict directional check — no combined fallback ─────────────────────
+        const isLong = direction === 'long';
+        const sideAgg = isLong ? regime.buy : regime.sell;
 
-        // ── STEP 3: Select the most relevant MAE value (priority order) ───────────────
-        let selectedMae: number | undefined;
+        // Use strict directional sample check (no combined fallback)
+        const hasEnoughSide = ExcursionHistoryCache.hasEnoughSamples(regime, minSamples, direction);
 
-        // Priority 1: Directional MAE — most specific and relevant
-        if (direction === 'long') {
-            selectedMae = regime.recentMaeLong;
-        } else if (direction === 'short') {
-            selectedMae = regime.recentMaeShort;
-        }
-
-        // Priority 2: Fallback to overall MAE if directional not available or insufficient
-        if (selectedMae === undefined) {
-            selectedMae = regime.recentMae;
-
-            // Log fallback (debug) — helps understand data coverage
-            if (logger.isDebugEnabled()) {
-                logger.debug('isHighMaeRisk: falling back to overall MAE (no directional data)', {
-                    symbol: regime.symbol,
-                    direction,
-                    overallMae: selectedMae?.toFixed(3),
-                    directionalMae: direction === 'long' ? regime.recentMaeLong : regime.recentMaeShort,
-                });
-            }
-        }
-
-        // ── STEP 4: Final safety check — no usable MAE value → treat as safe ──────────
-        // Could happen if:
-        //   - No data in that direction
-        //   - All MAE values are undefined/zero
-        if (selectedMae === undefined || selectedMae === 0) {
-            logger.debug('isHighMaeRisk: no meaningful MAE value — treated as safe', {
+        if (!hasEnoughSide) {
+            // Side missing or insufficient samples → cannot judge risk → treat as safe
+            logger.debug('isHighMaeRisk: insufficient directional samples — treated as safe', {
                 symbol: regime.symbol,
                 direction,
-                selectedMae,
+                sideSamples: sideAgg?.sampleCount ?? 0,
+                requiredMin: minSamples
             });
             return false;
         }
 
-        // ── STEP 5: Core risk decision — compare absolute drawdown to threshold ───────
-        const absMae = Math.abs(selectedMae);
+        // ── STEP 4: Use only directional MAE — no averaging or combined fallback ────────
+        const mae = sideAgg?.mae;
+
+        if (mae === undefined || mae === 0) {
+            logger.debug('isHighMaeRisk: no usable directional MAE — treated as safe', {
+                symbol: regime.symbol,
+                direction,
+                sideSamples: sideAgg?.sampleCount ?? 0
+            });
+            return false;
+        }
+
+        // ── STEP 5: Core risk decision — absolute drawdown vs threshold ─────────────────
+        const absMae = Math.abs(mae);
         const isHighRisk = absMae > maxMaePct;
 
-        // ── STEP 6: Detailed debug logging only when risk is actually high ───────────
-        // Helps diagnose why trades are being blocked/reduced
+        // ── STEP 6: Detailed debug log only when risk is actually high ──────────────────
         if (isHighRisk && logger.isDebugEnabled()) {
-            const source = selectedMae === regime.recentMae ? 'overall' : direction;
-
-            logger.debug('High MAE risk DETECTED', {
+            logger.debug('High MAE risk DETECTED (pure directional)', {
                 symbol: regime.symbol,
                 direction,
-                maeValue: selectedMae.toFixed(3),
+                maeValue: mae.toFixed(3),
                 absMae: absMae.toFixed(3),
                 threshold: maxMaePct,
-                source,
-                sampleCount: regime.recentSampleCount,
-                directionalSamples: direction === 'long'
-                    ? regime.recentSampleCountLong
-                    : regime.recentSampleCountShort,
-                slStreak: regime.slStreak,              // extra context
-                slCount: regime.outcomeCounts?.sl ?? 0, // extra context
+                sideSamples: sideAgg?.sampleCount,
+                slStreakSide: isLong ? regime.slStreakBuy : regime.slStreakSell,
+                outcomeSl: sideAgg?.outcomeCounts.sl
             });
         }
 
-        // ── STEP 7: Return final boolean decision ────────────────────────────────────
+        // ── STEP 7: Final result ────────────────────────────────────────────────────────
         return isHighRisk;
     }
 
     /**
- * Static utility method: Determines whether we have **enough completed simulation samples**
- * in the recent regime to reasonably trust the computed statistics (MFE/MAE averages,
- * win rate, excursion ratio, outcome counts, slStreak, etc.).
- *
- * This is a **critical confidence gate** used in many places:
- *   - getExcursionAdvice() — to decide whether to trust regime data or skip/reverse cautiously
- *   - Strategy.generateSignal() — to reduce confidence, skip, or add warnings when data is sparse
- *   - AutoTradeService — to block or heavily reduce size on low-sample symbols
- *   - Alerts / UI — to show "limited data" disclaimers
- *
- * Main rules (2025 version):
- *   - Uses `recentSampleCount` (completed simulations within time window) as primary metric
- *   - Default minimum raised/lowered to 2 per your request (configurable via config)
- *   - Very conservative by nature: better to say "not enough data" than trust noisy stats
- *   - Only counts **completed** simulations — live/in-progress don't count toward trust
- *   - Returns false on missing/invalid regime → fail-safe (treat as not trusted)
- *
- * Why completed-only?
- *   - Win rate, average R, reverse count, outcome counts, streaks — all require closed outcomes
- *   - Live simulations are useful for current MFE/MAE extremes, but unreliable for statistics
- *
- * Configurability:
- *   - minSamples default = config.strategy.minExcursionSamples ?? 2
- *   - Caller can override (e.g. stricter checks in risk filters)
- *
- * Returns:
- *   true  → Enough samples → trust aggregates / outcome stats / streaks
- *   false → Too few samples → be cautious (lower confidence, add warnings, skip, etc.)
- *
- * @param regime     - Full or lite ExcursionRegime object from cache
- * @param minSamples - Optional override for minimum trusted samples
- *                     Default pulled from config (2 in 2025)
- * @returns boolean — true if we have enough completed samples to trust regime statistics
- *
- * @example
- * hasEnoughSamples(regime)                  // true if recentSampleCount >= 2
- * hasEnoughSamples(regime, 5)               // stricter check — needs >=5
- * hasEnoughSamples({ recentSampleCount: 1 }) // false
- * hasEnoughSamples(undefined as any)        // false (defensive)
- */
+     * Static utility method: Determines whether we have **enough completed simulation samples**
+     * to reasonably trust the regime statistics (MFE/MAE, ratio, outcomes, durations, streaks...).
+     *
+     * Critical confidence gate used in:
+     *   - getExcursionAdvice() — to trust side-specific data or force 'skip'
+     *   - Strategy.generateSignal() — to reduce confidence / add warnings on sparse data
+     *   - AutoTradeService — to gate trades/alerts on low-sample symbols
+     *   - Alerts/UI — to show "limited data" disclaimers
+     *
+     * 2026+ pure directional rules:
+     *   - When direction is provided → **strictly** check side-specific sample count (buy/sell)
+     *     → No fallback to combined count allowed — if side is missing or insufficient → not trusted
+     *   - When no direction is provided → use combined recentSampleCount (only for alert gate)
+     *   - Conservative: better "not enough data" than trust noisy/sparse side stats
+     *   - Only completed simulations count (no live blending)
+     *
+     * Configurability:
+     *   - Default minSamples = config.strategy.minExcursionSamples ?? 3
+     *   - Caller can override (e.g. stricter for live trades)
+     *
+     * Returns:
+     *   true  → Enough trusted samples on the relevant side (or combined if no direction)
+     *   false → Too few → be cautious (skip, lower conf, warn, etc.)
+     *
+     * @param regime Full or lite ExcursionRegime from cache
+     * @param minSamples Optional override for minimum trusted samples (default from config)
+     * @param direction Optional: 'long' or 'short' — if provided, checks **side-specific** count only (no fallback)
+     * @returns boolean — true if we can trust the regime stats
+     *
+     * @example
+     * hasEnoughSamples(regime)                        // true if combined >= 3 (alert gate only)
+     * hasEnoughSamples(regime, 3, 'long')             // true only if regime.buy?.sampleCount >= 3
+     * hasEnoughSamples(regime, 3, 'short')            // true only if regime.sell?.sampleCount >= 3
+     * hasEnoughSamples(regime)                        // false if combined < 3
+     * hasEnoughSamples(undefined)                     // false (defensive)
+     */
     public static hasEnoughSamples(
         regime: ExcursionRegime | ExcursionRegimeLite | null | undefined,
-        minSamples: number = MIN_SAMPLES_FOR_TRUST_DEFAULT
+        minSamples: number = MIN_SAMPLES_FOR_TRUST_DEFAULT,
+        direction?: LongShort
     ): boolean {
-        // ── STEP 1: Input safety — handle null/undefined regime gracefully ───────────
-        // This method is called in many places — better to fail-safe than crash
+        // ── STEP 1: Input safety — fail-safe on invalid/missing regime ─────────────────────────
         if (!regime || typeof regime !== 'object') {
-            logger.debug('hasEnoughSamples called with invalid regime — treated as insufficient', {
+            logger.debug('hasEnoughSamples: invalid/missing regime — treated as insufficient', {
                 regimeType: regime === null ? 'null' : typeof regime,
                 minSamples,
+                direction: direction ?? 'none'
             });
             return false;
         }
 
-        // ── STEP 2: Normalize minSamples (protect against bad caller input) ──────────
-        // Make sure it's a reasonable positive integer
+        // ── STEP 2: Normalize minSamples (prevent bad caller input) ────────────────────
         const effectiveMin = Math.max(1, Math.floor(minSamples));
 
-        // ── STEP 3: Core decision — check completed sample count ─────────────────────
-        // recentSampleCount is the single source of truth (set in recomputeAggregates)
-        const completedCount = regime.recentSampleCount ?? 0;
+        // ── STEP 3: Handle no-direction case (reserved for alert gate only) ─────────────
+        if (!direction) {
+            const combinedCount = regime.recentSampleCount ?? 0;
+            const hasEnoughCombined = combinedCount >= effectiveMin;
 
-        const hasEnough = completedCount >= effectiveMin;
+            if (logger.isDebugEnabled() && combinedCount > 0 && combinedCount < effectiveMin + 4) {
+                logger.debug('Borderline combined sample count (alert gate)', {
+                    symbol: regime.symbol ?? 'unknown',
+                    combinedSamples: combinedCount,
+                    required: effectiveMin,
+                    decision: hasEnoughCombined ? 'trusted for alert' : 'not trusted'
+                });
+            }
 
-        // ── STEP 4: Borderline debug logging (helps tuning minSamples value) ─────────
-        // Only logs when close to threshold — avoids spam in production
-        if (logger.isDebugEnabled() && completedCount > 0 && completedCount < effectiveMin + 3) {
-            logger.debug('Borderline sample count for regime trust', {
+            return hasEnoughCombined;
+        }
+
+        // ── STEP 4: Pure directional check – NO combined fallback allowed ───────────────
+        const isLong = direction === 'long';
+        const sideAgg = isLong ? regime.buy : regime.sell;
+        const sideCount = sideAgg?.sampleCount ?? 0;
+
+        const hasEnough = sideCount >= effectiveMin;
+
+        // ── STEP 5: Borderline debug logging (helps tuning minSamples & side coverage) ──
+        if (logger.isDebugEnabled() && sideCount > 0 && sideCount < effectiveMin + 4) {
+            logger.debug('Borderline directional sample count', {
                 symbol: regime.symbol ?? 'unknown',
-                completedSamples: completedCount,
-                requiredMinimum: effectiveMin,
-                decision: hasEnough ? 'trusted' : 'not trusted',
-                directionContext: 'N/A (overall)', // could extend later for directional
-                timeoutRatio: regime.timeoutRatio?.toFixed(2) ?? 'n/a',
-                slStreak: regime.slStreak ?? 0,
+                direction,
+                sideSamples: sideCount,
+                required: effectiveMin,
+                decision: hasEnough ? 'trusted' : 'not trusted – skip required',
+                oppositeSideSamples: isLong
+                    ? regime.sell?.sampleCount ?? 0
+                    : regime.buy?.sampleCount ?? 0
             });
         }
 
-        // ── STEP 5: Return clean boolean result ──────────────────────────────────────
+        // ── STEP 6: Return clean boolean – strict side-only result ──────────────────────
         return hasEnough;
     }
 }

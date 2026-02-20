@@ -1737,12 +1737,20 @@ export class TelegramBotController {
     /**
   * Handles the /excursions [symbol] command.
   *
-  * Displays real-time excursion statistics for a symbol:
-  *   • Current regime (last ~3h closed + live active simulations)
-  *   • Samples, active sims, reversals
-  *   • MFE/MAE/Ratio with live updates
-  *   • Directional bias from recent closed data
-  *   • Risk assessment and visual indicators
+  * Displays real-time pure directional excursion statistics for a symbol:
+  *   • Total simulations (combined count for context only)
+  *   • Breakdown: how many buys vs sells
+  *   • Separate regime stats for Buy and Sell sides (no combined aggregates)
+  *   • Individual simulation details: time ago, outcome, duration, MFE/MAE, time-to-excursions
+  *
+  * Pure directional 2026+ rules:
+  *   - All stats (MFE/MAE/ratio/duration/outcomes) come exclusively from buy/sell aggregates
+  *   - No combined MFE/MAE/ratio/win rate used — only total sample count shown for context
+  *   - Shows both sides separately if they have data
+  *   - Lists up to 10 most recent individual sims with full details
+  *
+  * @param msg - Telegram message object
+  * @param match - RegExp match array (symbol from command)
   */
     private handleExcursions = async (msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> => {
         if (!this.isAuthorized(msg.chat.id)) return;
@@ -1753,72 +1761,123 @@ export class TelegramBotController {
         if (!symbolInput) {
             await this.bot.sendMessage(
                 chatId,
-                '*Usage:* `/excursions BTC/USDT`\n\nShows real\\-time excursion stats (including live simulations) for a symbol.',
+                '*Usage:* `/excursions BTC/USDT`\n\nShows pure directional excursion stats and individual simulation details for a symbol.',
                 { parse_mode: 'Markdown' }
             );
             return;
         }
 
         try {
-            // Get real-time regime: closed recent + all live active simulations
+            // Fetch current regime (cache with pure directional aggregates)
             const regime = excursionCache.getRegime(symbolInput);
 
-            if (regime == null || (regime?.recentSampleCount) === 0) {
+            if (!regime || regime.recentSampleCount === 0) {
                 await this.bot.sendMessage(
                     chatId,
-                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nWaiting for first simulation to complete or run.`,
+                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nWaiting for first simulation to complete.`,
                     { parse_mode: 'Markdown' }
                 );
                 return;
             }
 
-            const lines: string[] = [`**Live Excursion Analysis: ${symbolInput}** 📊`];
+            const lines: string[] = [`**Excursion Analysis: ${symbolInput}** 📊`];
 
-            const liveNote = regime.activeCount > 0 ? ` (${regime.activeCount} active sim${regime.activeCount > 1 ? 's' : ''})` : '';
-            const ratioColor = regime.recentExcursionRatio > 2.0 ? '🟢' : regime.recentExcursionRatio < 1.0 ? '🔴' : '🟡';
+            // ── Total count (only combined field shown – for context) ──────────────────────
+            const totalSims = regime.recentSampleCount;
+            const buySims = regime.buy?.sampleCount ?? 0;
+            const sellSims = regime.sell?.sampleCount ?? 0;
 
-            lines.push('');
-            lines.push(`*Current Regime (last ~3h + live)${liveNote}*`);
-            lines.push(`Samples: ${regime.recentSampleCount}`);
-            lines.push(`Reversals: ${regime.recentReverseCount} ${regime.recentReverseCount >= 3 ? '⚠️ High' : regime.recentReverseCount >= 2 ? '🟡 Moderate' : ''}`);
-            lines.push(`MFE: ${regime.recentMfe.toFixed(2)}%`);
-            lines.push(`MAE: ${regime.recentMae.toFixed(2)}%`);
-            lines.push(`Ratio: ${regime.recentExcursionRatio.toFixed(2)} ${ratioColor}`);
+            lines.push(`Total recent sims: **${totalSims}** (Buys: ${buySims}, Sells: ${sellSims})`);
 
-            if (regime.recentExcursionRatio < 1.0) {
-                lines.push('→ *Low reward phase* – consider fading or early exits');
-            } else if (regime.recentExcursionRatio > 2.0) {
-                lines.push('→ *Strong reward phase* – favorable excursions');
+            // ── BUY SIDE REGIME ─────────────────────────────────────────────────────────────
+            if (regime.buy && regime.buy.sampleCount > 0) {
+                const buy = regime.buy;
+                const durMin = (buy.avgDurationMs / 60000).toFixed(1);
+                const maeAbs = Math.abs(buy.mae);
+                const ratioColor = buy.excursionRatio > 2.0 ? '🟢' : buy.excursionRatio < 1.0 ? '🔴' : '🟡';
+
+                lines.push('');
+                lines.push(`**Buy / Long Regime** (${buy.sampleCount} sims)`);
+                lines.push(`MFE: **+${buy.mfe.toFixed(2)}%**`);
+                lines.push(`MAE: **-${maeAbs.toFixed(2)}%**`);
+                lines.push(`Ratio: **${buy.excursionRatio.toFixed(2)}** ${ratioColor}`);
+                lines.push(`Avg duration: **${durMin} min**`);
+
+                const oc = buy.outcomeCounts;
+                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (total > 0) {
+                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
+                    const slPct = (oc.sl / total * 100).toFixed(0);
+                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                }
+
+                if (maeAbs >= 2.5) {
+                    lines.push('⚠️ High drawdown risk on buy side');
+                }
             } else {
-                lines.push('→ *Balanced regime* – standard risk management');
+                lines.push('');
+                lines.push('**Buy / Long Regime:** No data yet');
             }
 
-            if (regime.recentReverseCount >= 3) {
-                lines.push('⚠️ *Mean-reversion likely* – high reversal activity detected');
+            // ── SELL SIDE REGIME ────────────────────────────────────────────────────────────
+            if (regime.sell && regime.sell.sampleCount > 0) {
+                const sell = regime.sell;
+                const durMin = (sell.avgDurationMs / 60000).toFixed(1);
+                const maeAbs = Math.abs(sell.mae);
+                const ratioColor = sell.excursionRatio > 2.0 ? '🟢' : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
+
+                lines.push('');
+                lines.push(`**Sell / Short Regime** (${sell.sampleCount} sims)`);
+                lines.push(`MFE: **+${sell.mfe.toFixed(2)}%**`);
+                lines.push(`MAE: **-${maeAbs.toFixed(2)}%**`);
+                lines.push(`Ratio: **${sell.excursionRatio.toFixed(2)}** ${ratioColor}`);
+                lines.push(`Avg duration: **${durMin} min**`);
+
+                const oc = sell.outcomeCounts;
+                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (total > 0) {
+                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
+                    const slPct = (oc.sl / total * 100).toFixed(0);
+                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                }
+
+                if (maeAbs >= 2.5) {
+                    lines.push('⚠️ High drawdown risk on sell side');
+                }
+            } else {
+                lines.push('');
+                lines.push('**Sell / Short Regime:** No data yet');
             }
 
-            // === Directional Bias (from recent closed simulations) ===
-            // if (closedHistory.recentSampleCountLong > 0 || closedHistory.recentSampleCountShort > 0) {
-            //     const longRatio = closedHistory.recentMfeLong / Math.max(Math.abs(closedHistory.recentMaeLong), 1e-6);
-            //     const shortRatio = closedHistory.recentMfeShort / Math.max(Math.abs(closedHistory.recentMaeShort), 1e-6);
+            // ── INDIVIDUAL SIMULATION DETAILS ──────────────────────────────────────────────
+            if (regime.historyJson && regime.historyJson.length > 0) {
+                lines.push('');
+                lines.push('**Recent Individual Simulations** (newest first)');
 
-            //     lines.push('');
-            //     lines.push('*Directional Bias (recent closed)*');
-            //     lines.push(`Long:  MFE ${closedHistory.recentMfeLong.toFixed(2)}% | MAE ${closedHistory.recentMaeLong.toFixed(2)}% → Ratio ${longRatio.toFixed(2)}`);
-            //     lines.push(`Short: MFE ${closedHistory.recentMfeShort.toFixed(2)}% | MAE ${closedHistory.recentMaeShort.toFixed(2)}% → Ratio ${shortRatio.toFixed(2)}`);
-            // }
+                const now = Date.now();
+                regime.historyJson.forEach((entry, index) => {
+                    const ageMs = now - entry.timestamp;
+                    const ageMin = Math.floor(ageMs / 60000);
+                    const ageStr = ageMin < 60 ? `${ageMin} min ago` : `${Math.floor(ageMin / 60)}h ${ageMin % 60} min ago`;
 
-            // === Final Risk Assessment ===
-            lines.push('');
-            const highMaeRisk = Math.abs(regime.recentMae) > (config.strategy.maxMaePct ?? 3.0);
-            const overallRisk = highMaeRisk
-                ? '🔴 High drawdown risk'
-                : regime.recentExcursionRatio > 2.0
-                    ? '🟢 Low risk – strong reward profile'
-                    : '🟡 Moderate risk';
+                    const durMin = (entry.durationMs / 60000).toFixed(1);
+                    const mfeStr = `+${entry.mfe.toFixed(2)}%`;
+                    const maeStr = `-${Math.abs(entry.mae).toFixed(2)}%`;
 
-            lines.push(`**Assessment:** ${overallRisk}`);
+                    const timeToMFE = entry.timeToMFE_ms > 0 ? `${(entry.timeToMFE_ms / 1000).toFixed(0)}s` : 'n/a';
+                    const timeToMAE = entry.timeToMAE_ms > 0 ? `${(entry.timeToMAE_ms / 1000).toFixed(0)}s` : 'n/a';
 
+                    lines.push(`**#${index + 1}** ${ageStr} • ${entry.direction.toUpperCase()} • ${entry.outcome.toUpperCase()}`);
+                    lines.push(`Duration: ${durMin} min • MFE: ${mfeStr} • MAE: ${maeStr}`);
+                    lines.push(`Time to MFE: ${timeToMFE} • Time to MAE: ${timeToMAE}`);
+                    lines.push('─');
+                });
+            } else {
+                lines.push('');
+                lines.push('No individual simulation details available yet.');
+            }
+
+            // ── FINAL MESSAGE ───────────────────────────────────────────────────────────────
             await this.bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
         } catch (error: any) {
             logger.error('Error in /excursions command', { symbol: symbolInput, error });
@@ -1849,27 +1908,24 @@ export class TelegramBotController {
             }
         }, 5 * 60 * 1000);
     }
-
     /**
-  * Sends a formatted Telegram alert for a generated signal.
-  *
-  * UPDATED DESIGN (2026+ centralized AutoTrade decisions):
-  *   • This method now receives the FINAL adjusted TradeSignal from AutoTradeService.
-  *   • The signal includes:
-  *       - Final direction (reversed if applicable)
-  *       - Adjusted SL/TP levels
-  *       - Extended reason array (technical reasons + excursion advice + adjustments + reversal note)
-  *   • Header reflects final direction + explicit "↔️ REVERSED" tag if reversal occurred.
-  *   • Excursion advice/adjustments are NO LONGER fetched fresh here – they are baked into the passed reason[].
-  *   • Regime summary & timing stats are still fetched fresh (always up-to-date view).
-  *   • Alert is sent regardless of whether a live trade was placed (simulation mode supported).
-  *   • All previous rich features preserved (confidence, ML, regime warnings, timing, reasons list).
-  *
-  * @param symbol Trading pair (e.g. 'BTC/USDT')
-  * @param signal FINAL adjusted TradeSignal (post-excursion: may be reversed/adjusted)
-  * @param price Current price at signal time
-  * @param tradeExecuted Optional flag indicating if a live order was actually placed (default: true)
-  */
+     * Sends a formatted Telegram alert for a generated signal.
+     *
+     * UPDATED DESIGN (2026+ pure directional):
+     *   • Receives FINAL adjusted TradeSignal from AutoTradeService (may be reversed)
+     *   • Direction, SL/TP, confidence, reason[] are final (post-excursion)
+     *   • Regime summary & individual sims are fetched fresh (always up-to-date)
+     *   • Pure directional: all stats (MFE/MAE/ratio/duration/outcomes) from buy/sell aggregates only
+     *   • No combined MFE/MAE/ratio/win rate — only total sample count for context
+     *   • Shows both sides separately (transparency)
+     *   • Lists all recent individual simulations (up to 10) with full details
+     *   • Alert sent even in simulation-only mode or on skip (with "Skipped" note)
+     *
+     * @param symbol Trading pair (e.g. 'BTC/USDT')
+     * @param signal FINAL adjusted TradeSignal (post-excursion)
+     * @param price Current price at signal time
+     * @param tradeExecuted Flag if a live order was placed (default: true)
+     */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
@@ -1885,12 +1941,12 @@ export class TelegramBotController {
 
         const lines: string[] = [];
 
-        // ── Optional top note if no live trade was placed ─────────────────────────────
+        // ── Top note if no live trade placed or skipped ────────────────────────────────
         if (!tradeExecuted) {
             lines.push('🔔 **SIGNAL ALERT ONLY** \\(auto\\-trade disabled or skipped\\)');
         }
 
-        // ── Header with direction + reversal tag ───────────────────────────────────
+        // ── Header with final direction + reversal tag ─────────────────────────────────
         const signalEmoji =
             signal.signal === 'buy' ? '🟢 LONG' :
                 signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
@@ -1900,7 +1956,7 @@ export class TelegramBotController {
         lines.push(`**${signalEmoji} SIGNAL** ${wasReversed ? '↔️ REVERSED ' : ''}${escape(symbol)}`);
         lines.push(`**Price:** $${escape(price.toFixed(6))}`);
 
-        // ── Confidence & key levels ──────────────────────────────────────────────
+        // ── Confidence & key levels ────────────────────────────────────────────────────
         if (signal.confidence > 0) {
             lines.push(`**Confidence:** ${escape(signal.confidence.toFixed(1))}%`);
         }
@@ -1916,7 +1972,7 @@ export class TelegramBotController {
         if (signal.takeProfit) {
             const rrApprox = signal.takeProfit && signal.stopLoss
                 ? Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
-                : config.strategy.riskRewardTarget?.toString() ?? 'N/A';
+                : 'N/A';
 
             lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${escape(rrApprox)}R\\)`);
         }
@@ -1925,94 +1981,121 @@ export class TelegramBotController {
             lines.push(`**Trailing:** ${escape(signal.trailingStopDistance.toFixed(6))}`);
         }
 
-        // ── Regime Summary (fresh fetch – always current) ────────────────────────
+        // ── FETCH FRESH REGIME ─────────────────────────────────────────────────────────
         const regime = excursionCache.getRegime(symbol);
 
-        if (regime && regime.recentSampleCount > 0) {
+        if (!regime || regime.recentSampleCount === 0) {
             lines.push('');
-            lines.push('**Regime Summary** 📊');
-
-            const liveNote = regime.activeCount > 0 ? escape(` (${regime.activeCount} live)`) : '';
-            lines.push(`Samples: **${escape(regime.recentSampleCount)}${escape(liveNote)}**`);
-
-            if (regime.recentReverseCount > 0) {
-                lines.push(`Reversals: **${escape(regime.recentReverseCount)}**`);
-            }
-
-            lines.push(`MFE: **${escape(regime.recentMfe.toFixed(2))}%** \\| MAE: **${escape(regime.recentMae.toFixed(2))}%**`);
-            lines.push(`Ratio: **${escape(regime.recentExcursionRatio.toFixed(2))}**`);
-
-            // Outcome warnings
-            const { tp = 0, partial_tp = 0, sl = 0, timeout = 0 } = regime.outcomeCounts ?? {};
-            const total = tp + partial_tp + sl + timeout;
-
-            if (total > 0) {
-                const slRatio = sl / total;
-                if (slRatio > 0.6 || sl >= 3) {
-                    lines.push(`⚠️ High SL rate \\(${escape(sl)}/${escape(total)}\\)`);
-                }
-                if (timeout / total > 0.5 || timeout >= 3) {
-                    lines.push(`⚠️ High timeouts \\(${escape(timeout)}\\)`);
-                }
-            }
-
-            if (regime.slStreak >= 2) {
-                lines.push(`⚠️ SL streak: **${escape(regime.slStreak)}**`);
-            }
+            lines.push('**No recent regime data** – limited history');
         } else {
+            // ── TOTAL SIMS CONTEXT (combined count only – no other combined stats) ──────
+            const totalSims = regime.recentSampleCount;
+            const buySims = regime.buy?.sampleCount ?? 0;
+            const sellSims = regime.sell?.sampleCount ?? 0;
+
             lines.push('');
-            lines.push('**No recent regime data** — limited history');
+            lines.push(`**Total recent sims:** ${totalSims} \\(Buys: ${buySims}, Sells: ${sellSims}\\)`);
+
+            // ── BUY / LONG SIDE ─────────────────────────────────────────────────────────
+            if (regime.buy && regime.buy.sampleCount > 0) {
+                const buy = regime.buy;
+                const durMin = (buy.avgDurationMs / 60000).toFixed(1);
+                const maeAbs = Math.abs(buy.mae);
+                const ratioColor = buy.excursionRatio > 2.0 ? '🟢' : buy.excursionRatio < 1.0 ? '🔴' : '🟡';
+
+                lines.push('');
+                lines.push(`**Buy / Long Regime** \\(${buy.sampleCount} sims\\)`);
+                lines.push(`MFE: **\\+${buy.mfe.toFixed(2)}%**`);
+                lines.push(`MAE: **\\-${maeAbs.toFixed(2)}%**`);
+                lines.push(`Ratio: **${buy.excursionRatio.toFixed(2)}** ${ratioColor}`);
+                lines.push(`Avg Duration: **${durMin} min**`);
+
+                const oc = buy.outcomeCounts;
+                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (total > 0) {
+                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
+                    const slPct = (oc.sl / total * 100).toFixed(0);
+                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                }
+
+                if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on buy side');
+            } else {
+                lines.push('');
+                lines.push('**Buy / Long Regime:** No data yet');
+            }
+
+            // ── SELL / SHORT SIDE ───────────────────────────────────────────────────────
+            if (regime.sell && regime.sell.sampleCount > 0) {
+                const sell = regime.sell;
+                const durMin = (sell.avgDurationMs / 60000).toFixed(1);
+                const maeAbs = Math.abs(sell.mae);
+                const ratioColor = sell.excursionRatio > 2.0 ? '🟢' : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
+
+                lines.push('');
+                lines.push(`**Sell / Short Regime** \\(${sell.sampleCount} sims\\)`);
+                lines.push(`MFE: **\\+${sell.mfe.toFixed(2)}%**`);
+                lines.push(`MAE: **\\-${maeAbs.toFixed(2)}%**`);
+                lines.push(`Ratio: **${sell.excursionRatio.toFixed(2)}** ${ratioColor}`);
+                lines.push(`Avg Duration: **${durMin} min**`);
+
+                const oc = sell.outcomeCounts;
+                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (total > 0) {
+                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
+                    const slPct = (oc.sl / total * 100).toFixed(0);
+                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                }
+
+                if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on sell side');
+            } else {
+                lines.push('');
+                lines.push('**Sell / Short Regime:** No data yet');
+            }
+
+            // ── INDIVIDUAL SIMULATION DETAILS ────────────────────────────────────────────
+            if (regime.historyJson && regime.historyJson.length > 0) {
+                lines.push('');
+                lines.push('**Recent Individual Simulations** (newest first)');
+
+                const now = Date.now();
+                regime.historyJson.forEach((entry, index) => {
+                    const ageMs = now - entry.timestamp;
+                    const ageMin = Math.floor(ageMs / 60000);
+                    const ageStr = ageMin < 60
+                        ? `${ageMin} min ago`
+                        : `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago`;
+
+                    const durMin = (entry.durationMs / 60000).toFixed(1);
+                    const mfeStr = `+${entry.mfe.toFixed(2)}%`;
+                    const maeStr = `-${Math.abs(entry.mae).toFixed(2)}%`;
+
+                    const timeToMFE = entry.timeToMFE_ms > 0 ? `${(entry.timeToMFE_ms / 1000).toFixed(0)}s` : 'n/a';
+                    const timeToMAE = entry.timeToMAE_ms > 0 ? `${(entry.timeToMAE_ms / 1000).toFixed(0)}s` : 'n/a';
+
+                    lines.push(`**\\#${index + 1}** ${ageStr} • ${entry.direction.toUpperCase()} • ${entry.outcome.toUpperCase()}`);
+                    lines.push(`Duration: ${durMin} min • MFE: ${mfeStr} • MAE: ${maeStr}`);
+                    lines.push(`Time to MFE: ${timeToMFE} • Time to MAE: ${timeToMAE}`);
+                    lines.push('─');
+                });
+            } else {
+                lines.push('');
+                lines.push('No individual simulation details available.');
+            }
         }
 
-        // ── Regime Timing Stats (fresh) ───────────────────────────────────────────
-        if (regime && regime.avgDurationMs > 0) {
-            lines.push('');
-            lines.push('**Regime Timing Stats** ⏱️');
-
-            const avgMin = (regime.avgDurationMs / 60000).toFixed(1);
-            lines.push(`Avg Duration: **${escape(avgMin)} min**`);
-
-            if (regime.avgDurationLong && regime.recentSampleCountLong && regime.recentSampleCountLong >= 2) {
-                const longMin = (regime.avgDurationLong / 60000).toFixed(1);
-                lines.push(`Longs Avg: **${escape(longMin)} min**`);
-            }
-
-            if (regime.avgDurationShort && regime.recentSampleCountShort && regime.recentSampleCountShort >= 2) {
-                const shortMin = (regime.avgDurationShort / 60000).toFixed(1);
-                lines.push(`Shorts Avg: **${escape(shortMin)} min**`);
-            }
-
-            if (regime.avgDurationLong && regime.avgDurationShort) {
-                const diff = Math.abs(regime.avgDurationLong - regime.avgDurationShort) / 60000;
-                if (diff > 3) {
-                    lines.push(`→ Notable difference between long/short durations`);
-                }
-            }
-
-            if ('historyJson' in regime && regime.historyJson && regime.historyJson.length > 0) {
-                const recent = regime.historyJson[0];
-                if (recent.timeToMFE_ms > 0) {
-                    lines.push(`Recent Time\\-to\\-MFE: **${(recent.timeToMFE_ms / 1000).toFixed(0)} sec**`);
-                }
-                if (recent.timeToMAE_ms > 0) {
-                    lines.push(`Recent Time\\-to\\-MAE: **${(recent.timeToMAE_ms / 1000).toFixed(0)} sec**`);
-                }
-            }
-        }
-
-        // ── Strategy + Excursion Reasons (uses passed extended array) ─────────────
+        // ── Strategy + Excursion Reasons (from passed extended array) ──────────────────
         if (signal.reason?.length > 0) {
             lines.push('');
             lines.push('**Signal Reasons & Excursion Notes:**');
             signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
         }
 
-        // ── Timestamp ────────────────────────────────────────────────────────────
+        // ── Timestamp ────────────────────────────────────────────────────────────────
         const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
         lines.push('');
         lines.push(`🕒 ${escape(timestamp)}`);
 
-        // ── Send ─────────────────────────────────────────────────────────────────
+        // ── SEND MESSAGE ──────────────────────────────────────────────────────────────
         const message = lines.join('\n');
 
         try {

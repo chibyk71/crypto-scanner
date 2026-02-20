@@ -20,6 +20,7 @@ import type { TradeSignal } from '../../types';
 import { getExcursionAdvice } from '../utils/excursionUtils';
 import type { TelegramBotController } from './telegramBotController';
 import { excursionCache } from './excursionHistoryCache';
+import { simulateTrade } from './simulateTrade';
 // import { simulateTrade } from './simulateTrade';
 
 const logger = createLogger('AutoTradeService');
@@ -54,19 +55,21 @@ export class AutoTradeService {
      * Main entry point: Execute a live trade as fast as possible (if enabled)
      * while serving as the FINAL GATEKEEPER for all regime-based decisions.
      *
-     * 2026+ DESIGN PHILOSOPHY:
+     * 2026+ DESIGN PHILOSOPHY (pure directional):
      *   - AutoTradeService is the single decision point for:
-     *       • Excursion regime analysis (skip, reverse, adjust confidence)
-     *       • Final SL/TP levels (with fixed leverage-aware rules)
+     *       • Excursion regime analysis (skip, reverse, adjust confidence) — pure side-specific
+     *       • Final SL/TP levels (fixed leverage-aware rules, no combined fallback)
      *       • Post-adjustment validation (valid risk/reward, safe exits)
-     *       • Rich Telegram alerting (ALWAYS sent if signal passes validation)
+     *       • Rich Telegram alerting (ALWAYS sent if passes combined gate and not 'skip')
      *       • Optional live order placement (only if config.autoTrade.enabled)
      *   - Receives RAW technical signal from scanner (base/unadjusted SL/TP)
      *   - Benefits:
-     *       - No duplicated regime logic
-     *       - Alerts reflect final decision (reversals, fixed levels)
+     *       - No duplicated regime logic — all directional
+     *       - Alerts reflect final decision (reversals, fixed levels) — shows both sides
      *       - Alerts sent even in simulation-only mode
      *       - Reversed trades get extra simulation for regime data
+     *   - No combined aggregates used for decisions — only intended side
+     *   - Combined recentSampleCount ONLY for alert gate (total ≥3 → send alert)
      *
      * LEVERAGE & RISK RULES (fixed for this version):
      *   - Leverage: 25×
@@ -75,7 +78,7 @@ export class AutoTradeService {
      *   - TP: always set to 0.4% move from current price (ignores tpMultiplier)
      *   - SL: uses original signal SL distance, but capped at 0.04% adverse move
      *   - Multipliers (slMultiplier/tpMultiplier): IGNORED
-     *   - Reversal: still applied if advice.action === 'reverse'
+     *   - Reversal: applied only if advice.action === 'reverse' (advice ensures intended side has ≥3 samples)
      *
      * @param signal Raw technical TradeSignal from Strategy (base SL/TP, no regime adjustments)
      */
@@ -119,29 +122,36 @@ export class AutoTradeService {
         try {
             // ────────────────────────────────────────────────────────────────
             // 4. FETCH REGIME + ADVICE: Core decision point (skip/reverse)
+            //    - Pure directional: advice based ONLY on intended side
             // ────────────────────────────────────────────────────────────────
             const regime = excursionCache.getRegime(symbol);
-            if (!regime || regime.recentSampleCount === 0) {
-                logger.info(`No regime data available yet – skipping alert/trade`, { symbol });
+            if (!regime || regime.recentSampleCount < 3) {
+                logger.info(`Insufficient total data (${regime?.recentSampleCount ?? 0}/3) – skipping alert/trade`, { symbol });
                 return;
             }
 
             const intendedDirection = signal.signal === 'buy' ? 'long' : 'short';
             const advice = getExcursionAdvice(regime, intendedDirection);
 
-            logger.error(`Excursion advice for ${symbol}: ${advice.action.toUpperCase()}`, { symbol, adviceSummary: advice.advice });
-
-
-            // Skip if regime says no-go
+            // Skip if regime says no-go (pure directional decision)
             if (advice.action === 'skip') {
-                logger.info(`Excursion advice: SKIP – no alert or trade sent`, {
+                logger.info(`Excursion advice: SKIP – no trade, but alert sent`, {
                     symbol,
                     adviceSummary: advice.advice
                 });
+                // Still send alert if combined >=3 (your rule)
+                if (this.telegramService) {
+                    await this.telegramService.sendSignalAlert(
+                        symbol,
+                        signal,  // use original signal for skip alert
+                        currentPrice,
+                        false    // no order placed
+                    );
+                }
                 return;
             }
 
-            // Extract adjustments (we'll ignore SL/TP multipliers, but keep confidence boost)
+            // Extract adjustments (ignore SL/TP multipliers, keep confidence boost)
             const { confidenceBoost = 0 } = advice.adjustments ?? {};
 
             // ────────────────────────────────────────────────────────────────
@@ -161,7 +171,7 @@ export class AutoTradeService {
             //    Ignores tpMultiplier completely
             // ────────────────────────────────────────────────────────────────
             const TARGET_ACCOUNT_GAIN = 0.10;  // 10% account target
-            const LEVERAGE = 50;
+            const LEVERAGE = 25;
             const TP_PRICE_MOVE = TARGET_ACCOUNT_GAIN / LEVERAGE; // 0.004 = 0.4%
 
             const finalTakeProfit = finalSide === 'buy'
@@ -250,7 +260,7 @@ export class AutoTradeService {
                     finalSide,
                     currentPrice: currentPrice.toFixed(8)
                 });
-                // void simulateTrade(this.exchangeService, symbol, adjustedSignal, currentPrice, adjustedSignal.features);
+                void simulateTrade(this.exchange, symbol, adjustedSignal, currentPrice, adjustedSignal.features);
                 // Note: feeds cache only — no ML feature extraction needed here
             }
 
