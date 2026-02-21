@@ -224,17 +224,21 @@ export class MLService {
  *   • Strategy.generateSignal() – for every potential signal (live prediction)
  *   • simulateTrade() – to store features with simulation outcome (training data)
  *
- * Design principles:
- *   - Fixed length: always returns the same number of features (currently ~19)
- *   - Normalized values: most features scaled to [0,1] or small range for better convergence
- *   - Consistent: uses same computeIndicators() as training → no train/test mismatch
- *   - Async: fetches live excursion regime from DB/cache
+ * 2026+ pure directional design:
+ *   - Technical indicators (RSI, EMA, MACD, etc.) remain unchanged
+ *   - Excursion regime features now come **exclusively from the intended side** (buy/sell)
+ *     - No combined MFE/MAE/ratio used — pure side isolation
+ *     - If intended side missing or has 0 samples → neutral values (0/0.2)
+ *   - Fixed length: always returns the same number of features (currently 22)
+ *   - Normalized values: most features scaled to [0,1] or small range
+ *   - Consistent: uses same computeIndicators() as training
+ *   - Async: fetches live excursion regime from cache
  *   - Defensive: no NaN/Infinity, safe fallbacks for missing data
  *
- * Feature groups (order matters — do not reorder without updating model):
- *   1. Technical indicators (normalized latest values from primary + HTF)
- *   2. Real-time excursion regime (MFE/MAE/ratio from recent simulations)
- *   3. Market context (volume, price scaling)
+ * Feature groups (order matters – do not reorder without updating model):
+ *   1. Technical indicators (normalized latest values from primary + HTF) – 15 features
+ *   2. Real-time excursion regime (MFE/MAE/ratio from **intended side only**) – 3 features
+ *   3. Market context (volume, price scaling) – 4 features
  *
  * @param input Full market context at signal time
  * @returns Fixed-length number[] ready for classifier.predict()
@@ -245,17 +249,16 @@ export class MLService {
 
         // Safety: prevent division by zero or invalid price
         if (price <= 0) {
-            logger.warn('Invalid price in extractFeatures – using fallback', { symbol, price });
-            return new Array(19).fill(0); // fallback neutral vector
+            logger.warn('Invalid price in extractFeatures – using fallback neutral vector', { symbol, price });
+            return new Array(25).fill(0);
         }
 
         const f: number[] = [];
 
-        // ── 1. Technical indicators (primary + HTF) ─────────────────────────────
+        // ── 1. Technical indicators (primary + HTF) – unchanged ─────────────────────────
         const indicators = computeIndicators(primaryData, htfData);
         const last = indicators.last;
 
-        // Normalize to avoid large value ranges
         f.push(
             last.rsi ? last.rsi / 100 : 0.5,                        // 0–1
             last.emaShort ? (price - last.emaShort) / price : 0,    // relative deviation
@@ -274,42 +277,43 @@ export class MLService {
             last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // categorical
         );
 
-        // ── 2. Real-time excursion regime features (live + recent closed) ───────
+        // ── 2. Pure directional excursion regime features (both sides) ──────────────────
         let regime;
         try {
-            regime = await excursionCache.getRegimeLite(symbol);
+            regime = excursionCache.getRegimeLite(symbol);
         } catch (err) {
-            logger.warn('Failed to fetch regime in extractFeatures – using neutral', { symbol, err });
+            logger.warn('Failed to fetch regime in extractFeatures – using neutral excursion features', { symbol, err });
         }
 
-        if (regime && regime.recentSampleCount > 0) {
-            const mfePct = regime.recentMfe ?? 0;
-            const maePct = regime.recentMae ?? 0; // negative
-            const ratio = regime.recentExcursionRatio ?? 1;
+        let buyMfe = 0, buyMae = 0, buyRatio = 0.2;
+        let sellMfe = 0, sellMae = 0, sellRatio = 0.2;
 
-            // Normalize to reasonable ranges (avoid extreme values breaking model)
-            f.push(
-                Math.min(10, Math.max(0, mfePct)) / 10,          // 0–1 (cap at 10%)
-                Math.min(10, Math.abs(maePct)) / 10,             // MAE magnitude 0–1
-                Math.min(10, ratio) / 5                          // ratio usually 0–5 → 0–1
-            );
-
-            if (logger.isDebugEnabled()) {
-                logger.debug('Added excursion regime features', {
-                    symbol,
-                    liveMfe: mfePct.toFixed(2),
-                    liveMae: maePct.toFixed(2),
-                    liveRatio: ratio.toFixed(2),
-                    activeSims: regime.activeCount,
-                    sampleCount: regime.recentSampleCount,
-                });
-            }
-        } else {
-            // No regime data yet → neutral values
-            f.push(0, 0, 0.2); // slight bias toward balanced ratio
+        if (regime?.buy && regime.buy.sampleCount > 0) {
+            buyMfe = Math.min(10, Math.max(0, regime.buy.mfe ?? 0)) / 10;
+            buyMae = Math.min(10, Math.abs(regime.buy.mae ?? 0)) / 10;
+            buyRatio = Math.min(10, regime.buy.excursionRatio ?? 1) / 5;
         }
 
-        // ── 3. Market context features (volume, scaling) ────────────────────────
+        if (regime?.sell && regime.sell.sampleCount > 0) {
+            sellMfe = Math.min(10, Math.max(0, regime.sell.mfe ?? 0)) / 10;
+            sellMae = Math.min(10, Math.abs(regime.sell.mae ?? 0)) / 10;
+            sellRatio = Math.min(10, regime.sell.excursionRatio ?? 1) / 5;
+        }
+
+        // Push both sides (6 features)
+        f.push(buyMfe, buyMae, buyRatio);
+        f.push(sellMfe, sellMae, sellRatio);
+
+        // Debug log (optional)
+        if (logger.isDebugEnabled()) {
+            logger.debug('Added both-side excursion features', {
+                symbol,
+                buy: { mfe: buyMfe.toFixed(3), mae: buyMae.toFixed(3), ratio: buyRatio.toFixed(3), samples: regime?.buy?.sampleCount ?? 0 },
+                sell: { mfe: sellMfe.toFixed(3), mae: sellMae.toFixed(3), ratio: sellRatio.toFixed(3), samples: regime?.sell?.sampleCount ?? 0 }
+            });
+        }
+
+        // ── 3. Market context features (volume, scaling) – unchanged ─────────────────────
         f.push(
             last.obv ? last.obv / 1e9 : 0,           // OBV scaled down
             last.vwap ? last.vwap / 1e6 : 0,         // VWAP scaled
@@ -317,20 +321,20 @@ export class MLService {
             price / 1e5                              // price scaled (e.g. BTC ~60k → 0.6)
         );
 
-        // ── Final validation: fixed length check (critical for model) ───────────
-        const expectedLength = 22; // Update this number if you add/remove features!
+        // ── Final validation: fixed length check (critical for model) ────────────────────
+        const expectedLength = 25; // 15 technical + 6 excursion + 4 context
         if (f.length !== expectedLength) {
             logger.error('Feature length mismatch in extractFeatures', {
                 expected: expectedLength,
                 actual: f.length,
-                symbol,
+                symbol
             });
             throw new Error(`Feature vector length error: expected ${expectedLength}, got ${f.length}`);
         }
 
-        // Optional: final NaN/Infinity guard (should never happen after above)
+        // Final NaN/Infinity guard (should never happen)
         if (f.some(v => isNaN(v) || !isFinite(v))) {
-            logger.error('NaN or Infinity detected in final features', { symbol });
+            logger.error('NaN or Infinity detected in final features – returning neutral vector', { symbol });
             return new Array(expectedLength).fill(0);
         }
 

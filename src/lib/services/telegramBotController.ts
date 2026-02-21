@@ -1758,10 +1758,18 @@ export class TelegramBotController {
         const chatId = msg.chat.id;
         const symbolInput = match?.[1]?.trim().toUpperCase();
 
+        // Robust MarkdownV2 escape
+        const escape = (value: string | number | undefined): string => {
+            if (value === undefined || value === null) return '';
+            const str = String(value);
+            return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+        };
+
+
         if (!symbolInput) {
             await this.bot.sendMessage(
                 chatId,
-                '*Usage:* `/excursions BTC/USDT`\n\nShows pure directional excursion stats and individual simulation details for a symbol.',
+                `*Usage:* \`/excursions BTC/USDT\`\n\nShows pure directional excursion stats and individual simulation details for a symbol\\.`,
                 { parse_mode: 'Markdown' }
             );
             return;
@@ -1774,11 +1782,11 @@ export class TelegramBotController {
             if (!regime || regime.recentSampleCount === 0) {
                 await this.bot.sendMessage(
                     chatId,
-                    `ℹ️ *No excursion data yet for ${symbolInput}*\n\nWaiting for first simulation to complete.`,
+                    `ℹ️ *No excursion data yet for ${escape(symbolInput)}*\n\nWaiting for first simulation to complete\\.`,
                     { parse_mode: 'Markdown' }
                 );
                 return;
-            }
+            } ``
 
             const lines: string[] = [`**Excursion Analysis: ${symbolInput}** 📊`];
 
@@ -1787,7 +1795,7 @@ export class TelegramBotController {
             const buySims = regime.buy?.sampleCount ?? 0;
             const sellSims = regime.sell?.sampleCount ?? 0;
 
-            lines.push(`Total recent sims: **${totalSims}** (Buys: ${buySims}, Sells: ${sellSims})`);
+            lines.push(`Total recent sims: **${escape(totalSims)}** (Buys: ${escape(buySims)}, Sells: ${escape(sellSims)})`);
 
             // ── BUY SIDE REGIME ─────────────────────────────────────────────────────────────
             if (regime.buy && regime.buy.sampleCount > 0) {
@@ -1797,18 +1805,18 @@ export class TelegramBotController {
                 const ratioColor = buy.excursionRatio > 2.0 ? '🟢' : buy.excursionRatio < 1.0 ? '🔴' : '🟡';
 
                 lines.push('');
-                lines.push(`**Buy / Long Regime** (${buy.sampleCount} sims)`);
-                lines.push(`MFE: **+${buy.mfe.toFixed(2)}%**`);
-                lines.push(`MAE: **-${maeAbs.toFixed(2)}%**`);
-                lines.push(`Ratio: **${buy.excursionRatio.toFixed(2)}** ${ratioColor}`);
-                lines.push(`Avg duration: **${durMin} min**`);
+                lines.push(`**Buy / Long Regime** \\(${escape(buy.sampleCount)} sims\\)`);
+                lines.push(`MFE: **\\+${escape(buy.mfe.toFixed(2))}%**`);
+                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
+                lines.push(`Ratio: **${escape(buy.excursionRatio.toFixed(2))}** ${ratioColor}`);
+                lines.push(`Avg duration: **${escape(durMin)} min**`);
 
                 const oc = buy.outcomeCounts;
                 const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
                 if (total > 0) {
                     const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
                     const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
                 }
 
                 if (maeAbs >= 2.5) {
@@ -1827,18 +1835,17 @@ export class TelegramBotController {
                 const ratioColor = sell.excursionRatio > 2.0 ? '🟢' : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
 
                 lines.push('');
-                lines.push(`**Sell / Short Regime** (${sell.sampleCount} sims)`);
-                lines.push(`MFE: **+${sell.mfe.toFixed(2)}%**`);
-                lines.push(`MAE: **-${maeAbs.toFixed(2)}%**`);
-                lines.push(`Ratio: **${sell.excursionRatio.toFixed(2)}** ${ratioColor}`);
-                lines.push(`Avg duration: **${durMin} min**`);
-
+                lines.push(`**Sell / Short Regime** \\(${escape(sell.sampleCount)} sims\\)`);
+                lines.push(`MFE: **\\+${sell.mfe.toFixed(2)}%**`);
+                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
+                lines.push(`Ratio: **${escape(sell.excursionRatio.toFixed(2))}** ${ratioColor}`);
+                lines.push(`Avg duration: **${escape(durMin)} min**`);
                 const oc = sell.outcomeCounts;
                 const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
                 if (total > 0) {
                     const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
                     const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
                 }
 
                 if (maeAbs >= 2.5) {
@@ -1852,7 +1859,7 @@ export class TelegramBotController {
             // ── INDIVIDUAL SIMULATION DETAILS ──────────────────────────────────────────────
             if (regime.historyJson && regime.historyJson.length > 0) {
                 lines.push('');
-                lines.push('**Recent Individual Simulations** (newest first)');
+                lines.push('**Recent Individual Simulations** \\(newest first\\)');
 
                 const now = Date.now();
                 regime.historyJson.forEach((entry, index) => {
@@ -1867,14 +1874,14 @@ export class TelegramBotController {
                     const timeToMFE = entry.timeToMFE_ms > 0 ? `${(entry.timeToMFE_ms / 1000).toFixed(0)}s` : 'n/a';
                     const timeToMAE = entry.timeToMAE_ms > 0 ? `${(entry.timeToMAE_ms / 1000).toFixed(0)}s` : 'n/a';
 
-                    lines.push(`**#${index + 1}** ${ageStr} • ${entry.direction.toUpperCase()} • ${entry.outcome.toUpperCase()}`);
-                    lines.push(`Duration: ${durMin} min • MFE: ${mfeStr} • MAE: ${maeStr}`);
-                    lines.push(`Time to MFE: ${timeToMFE} • Time to MAE: ${timeToMAE}`);
+                    lines.push(`**\\#${index + 1}** ${escape(ageStr)} • ${escape(entry.direction.toUpperCase())} • ${escape(entry.outcome.toUpperCase())}`);
+                    lines.push(`Duration: ${escape(durMin)} min • MFE: ${escape(mfeStr)} • MAE: ${escape(maeStr)}`);
+                    lines.push(`Time to MFE: ${escape(timeToMFE)} • Time to MAE: ${escape(timeToMAE)}`);
                     lines.push('─');
                 });
             } else {
                 lines.push('');
-                lines.push('No individual simulation details available yet.');
+                lines.push('No individual simulation details available yet\\.');
             }
 
             // ── FINAL MESSAGE ───────────────────────────────────────────────────────────────
@@ -2005,17 +2012,17 @@ export class TelegramBotController {
 
                 lines.push('');
                 lines.push(`**Buy / Long Regime** \\(${buy.sampleCount} sims\\)`);
-                lines.push(`MFE: **\\+${buy.mfe.toFixed(2)}%**`);
-                lines.push(`MAE: **\\-${maeAbs.toFixed(2)}%**`);
-                lines.push(`Ratio: **${buy.excursionRatio.toFixed(2)}** ${ratioColor}`);
-                lines.push(`Avg Duration: **${durMin} min**`);
+                lines.push(`MFE: **\\+${escape(buy.mfe.toFixed(2))}%**`);
+                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
+                lines.push(`Ratio: **${escape(buy.excursionRatio.toFixed(2))}** ${ratioColor}`);
+                lines.push(`Avg Duration: **${escape(durMin)} min**`);
 
                 const oc = buy.outcomeCounts;
                 const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
                 if (total > 0) {
                     const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
                     const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
                 }
 
                 if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on buy side');
@@ -2032,54 +2039,23 @@ export class TelegramBotController {
                 const ratioColor = sell.excursionRatio > 2.0 ? '🟢' : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
 
                 lines.push('');
-                lines.push(`**Sell / Short Regime** \\(${sell.sampleCount} sims\\)`);
-                lines.push(`MFE: **\\+${sell.mfe.toFixed(2)}%**`);
-                lines.push(`MAE: **\\-${maeAbs.toFixed(2)}%**`);
-                lines.push(`Ratio: **${sell.excursionRatio.toFixed(2)}** ${ratioColor}`);
-                lines.push(`Avg Duration: **${durMin} min**`);
-
+                lines.push(`**Sell / Short Regime** \\(${escape(sell.sampleCount)} sims\\)`);
+                lines.push(`MFE: **\\+${escape(sell.mfe.toFixed(2))}%**`);
+                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
+                lines.push(`Ratio: **${escape(sell.excursionRatio.toFixed(2))}** ${ratioColor}`);
+                lines.push(`Avg Duration: **${escape(durMin)} min**`);
                 const oc = sell.outcomeCounts;
                 const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
                 if (total > 0) {
                     const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
                     const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${tpPct}% wins** / **${slPct}% SL** / ${oc.timeout} timeouts`);
+                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
                 }
 
                 if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on sell side');
             } else {
                 lines.push('');
                 lines.push('**Sell / Short Regime:** No data yet');
-            }
-
-            // ── INDIVIDUAL SIMULATION DETAILS ────────────────────────────────────────────
-            if (regime.historyJson && regime.historyJson.length > 0) {
-                lines.push('');
-                lines.push('**Recent Individual Simulations** (newest first)');
-
-                const now = Date.now();
-                regime.historyJson.forEach((entry, index) => {
-                    const ageMs = now - entry.timestamp;
-                    const ageMin = Math.floor(ageMs / 60000);
-                    const ageStr = ageMin < 60
-                        ? `${ageMin} min ago`
-                        : `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago`;
-
-                    const durMin = (entry.durationMs / 60000).toFixed(1);
-                    const mfeStr = `+${entry.mfe.toFixed(2)}%`;
-                    const maeStr = `-${Math.abs(entry.mae).toFixed(2)}%`;
-
-                    const timeToMFE = entry.timeToMFE_ms > 0 ? `${(entry.timeToMFE_ms / 1000).toFixed(0)}s` : 'n/a';
-                    const timeToMAE = entry.timeToMAE_ms > 0 ? `${(entry.timeToMAE_ms / 1000).toFixed(0)}s` : 'n/a';
-
-                    lines.push(`**\\#${index + 1}** ${ageStr} • ${entry.direction.toUpperCase()} • ${entry.outcome.toUpperCase()}`);
-                    lines.push(`Duration: ${durMin} min • MFE: ${mfeStr} • MAE: ${maeStr}`);
-                    lines.push(`Time to MFE: ${timeToMFE} • Time to MAE: ${timeToMAE}`);
-                    lines.push('─');
-                });
-            } else {
-                lines.push('');
-                lines.push('No individual simulation details available.');
             }
         }
 
