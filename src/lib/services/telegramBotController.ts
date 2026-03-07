@@ -1795,7 +1795,7 @@ export class TelegramBotController {
             const buySims = regime.buy?.sampleCount ?? 0;
             const sellSims = regime.sell?.sampleCount ?? 0;
 
-            lines.push(`Total recent sims: **${escape(totalSims)}** (Buys: ${escape(buySims)}, Sells: ${escape(sellSims)})`);
+            lines.push(`Total recent sims: **${escape(totalSims)}** \\(Buys: ${escape(buySims)}, Sells: ${escape(sellSims)}\\)`);
 
             // ── BUY SIDE REGIME ─────────────────────────────────────────────────────────────
             if (regime.buy && regime.buy.sampleCount > 0) {
@@ -1885,10 +1885,10 @@ export class TelegramBotController {
             }
 
             // ── FINAL MESSAGE ───────────────────────────────────────────────────────────────
-            await this.bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
+            await this.bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'MarkdownV2' });
         } catch (error: any) {
             logger.error('Error in /excursions command', { symbol: symbolInput, error });
-            await this.bot.sendMessage(chatId, '❌ Failed to retrieve excursion statistics. Please try again later.');
+            await this.sendMessage('❌ Failed to retrieve excursion statistics. Please try again later.');
         }
     };
 
@@ -1915,6 +1915,7 @@ export class TelegramBotController {
             }
         }, 5 * 60 * 1000);
     }
+
     /**
      * Sends a formatted Telegram alert for a generated signal.
      *
@@ -2026,6 +2027,12 @@ export class TelegramBotController {
                 }
 
                 if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on buy side');
+
+                // ← SL Streak warning
+                if (regime.slStreakBuy && regime.slStreakBuy >= 2) {
+                    const icon = regime.slStreakBuy >= 3 ? '🔥' : '⚠️';
+                    lines.push(`${icon} **${regime.slStreakBuy} consecutive SL** on buy side`);
+                }
             } else {
                 lines.push('');
                 lines.push('**Buy / Long Regime:** No data yet');
@@ -2053,6 +2060,12 @@ export class TelegramBotController {
                 }
 
                 if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on sell side');
+
+                // ← SL Streak warning
+                if (regime.slStreakSell && regime.slStreakSell >= 2) {
+                    const icon = regime.slStreakSell >= 3 ? '🔥' : '⚠️';
+                    lines.push(`${icon} **${regime.slStreakSell} consecutive SL** on sell side`);
+                }
             } else {
                 lines.push('');
                 lines.push('**Sell / Short Regime:** No data yet');

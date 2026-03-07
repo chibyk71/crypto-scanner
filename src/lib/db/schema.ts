@@ -294,6 +294,8 @@ export const simulatedTrades = mysqlTable(
          * Only populated for rows where label IS NOT NULL
          */
         features: json('features').$type<number[] | null>(),
+
+        wasTaken: boolean('was_taken').$default(() => false)
     },
     (table) => ({
         /** Fast lookup by signal UUID */

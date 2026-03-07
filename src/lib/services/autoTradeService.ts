@@ -242,10 +242,10 @@ export class AutoTradeService {
                 stopLoss: Number(finalStopLoss.toFixed(8)),
                 takeProfit: Number(finalTakeProfit.toFixed(8)),
                 reason: [
+                    wasReversed ? '↔️ DIRECTION REVERSED' : '',
                     ...signal.reason, // original technical reasons
                     advice.advice,
                     `Fixed 1:10 account R:R (25× leverage) – TP 0.4% move, SL capped at 0.04%`,
-                    wasReversed ? '↔️ DIRECTION REVERSED' : '',
                     confidenceBoost !== 0 ? `Confidence boost: ${confidenceBoost > 0 ? '+' : ''}${confidenceBoost.toFixed(2)}` : ''
                 ].filter(Boolean)
             };

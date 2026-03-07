@@ -348,80 +348,95 @@ export class ExchangeService {
 
 
     /**
-     * Places a market order with optional stop-loss and take-profit.
-     * - Supports Bybit’s native trailing stop if available; otherwise, simulates it.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @param side - Order side ('buy' or 'sell').
-     * @param amount - Order quantity (adjusted for leverage).
-     * @param stopLoss - Optional stop-loss price.
-     * @param takeProfit - Optional take-profit price.
-     * @param trailingStopDistance - Optional trailing stop distance (in price units).
-     * @returns {Promise<Order>} The placed order object.
-     * @throws {Error} If order placement fails.
-     */
-    public async placeOrder(symbol: string, side: 'buy' | 'sell', amount: number, stopLoss?: number, takeProfit?: number, trailingStopDistance?: number): Promise<Order> {
+ * Places a market order with optional stop-loss, take-profit, and trailing stop.
+ * - Validates and aligns quantity based on exchange limits (min qty, step size, min cost).
+ * - Uses fixed USD amount from config for position sizing.
+ * - Handles testnet/live mode via config.
+ * @param symbol - Trading symbol (e.g., 'BTC/USDT').
+ * @param side - Order side ('buy' or 'sell').
+ * @param amount - Order quantity (will be adjusted for precision and limits).
+ * @param stopLoss - Optional stop-loss price.
+ * @param takeProfit - Optional take-profit price.
+ * @param trailingStopDistance - Optional trailing stop distance.
+ * @returns {Promise<Order>} Placed order details.
+ * @throws {Error} If order placement fails or quantity is invalid.
+ */
+    public async placeOrder(
+        symbol: string,
+        side: 'buy' | 'sell',
+        amount: number,
+        stopLoss?: number,
+        takeProfit?: number,
+        trailingStopDistance?: number
+    ): Promise<Order> {
         if (!this.isAutoTradeEnvSet()) {
-            return Promise.reject(new Error('Auto-trade environment is not set. Cannot place orders.'));
+            return Promise.reject(new Error('Auto-trade environment is not set. Cannot place order.'));
         }
 
         try {
-            // Load markets if not already loaded (ccxt caches internally)
-            const markets = await this.exchange.loadMarkets();
-            const market = markets[symbol];
-            if (!market || !await this.validateSymbol(symbol)) {
-                logger.error(`Invalid symbol for order: ${symbol}`);
-                throw new Error(`Symbol ${symbol} is not supported`);
+            const market = this.exchange.market(symbol);
+
+            // 1. Get current price for min cost calculation
+            const currentPrice = this.getLatestPrice(symbol);
+            if (!currentPrice) {
+                throw new Error(`Cannot get current price for ${symbol}`);
             }
 
-            // Fetch current ticker for price-based validations (e.g., min notional)
-            const ticker = await this.exchange.fetchTicker(symbol);
-            const price = ticker.last || ticker.ask || ticker.bid; // Fallback to ask/bid if last unavailable
-            if (!price) {
-                throw new Error(`Unable to fetch price for ${symbol}`);
-            }
-
-            // 1. Calculate Min Quantity more safely
+            // 2. Align minQty with minCost if applicable
             let minQty = market.limits.amount?.min ?? 0;
-            const minCost = market.limits.cost?.min || 5;
-
-            if (minCost > 0 && price > 0) {
-                // Instead of Math.ceil, get the raw min, then format it to valid precision
-                const rawMinFromCost = minCost / price;
-                const formattedMin = this.exchange.amountToPrecision(symbol, rawMinFromCost);
-                minQty = Math.max(minQty, parseFloat(formattedMin));
+            const minCost = market.limits.cost?.min ?? 0;
+            if (minCost > 0 && currentPrice > 0) {
+                const minQtyFromCost = minCost / currentPrice;
+                minQty = Math.max(minQty, minQtyFromCost);
             }
 
-            // 2. Validate
+            // Log market limits for debugging
+            logger.debug(`Market limits for ${symbol}: minQty=${minQty}, minCost=${minCost}, step=${(market.limits.amount as any)?.step ?? 'N/A'}, precision.amount=${market.precision.amount ?? 'N/A'}`);
+
+            // 3. Check raw amount against minQty
             if (amount < minQty) {
                 throw new Error(`Amount ${amount} too small; minimum is ${minQty} (based on ${minCost} USDT min cost)`);
             }
 
-            // 3. Calculate Determine step size safely
-            const precision = market.precision.amount ?? 0;
-            const stepSize = Math.pow(10, -precision);
-
-            // Align to step size (CRITICAL FIX)
-            const steppedAmount = Math.floor(amount / stepSize) * stepSize;
-
-            if (steppedAmount < minQty || steppedAmount <= 0) {
-                throw new Error(
-                    `Invalid quantity. Adjusted amount ${steppedAmount} < minQty ${minQty}`
-                );
+            // 4. Determine step size (prioritize limits.step, fallback to precision-based)
+            let stepSize = (market.limits.amount as any)?.step ?? null;  // Use exchange-provided step if available (e.g., 10 for SUIUSDT)
+            if (!stepSize) {
+                const precision = market.precision.amount ?? 0;
+                stepSize = Math.pow(10, -precision);  // Fallback for decimal-based steps
             }
 
-            // Final precision-safe formatting
+            // 5. Align to step size (floor to nearest valid multiple)
+            const steppedAmount = Math.floor(amount / stepSize) * stepSize;
+
+            // 6. Final check after stepping
+            if (steppedAmount < minQty || steppedAmount <= 0) {
+                // Optional: Round up to next multiple if close (uncomment if desired)
+                // const roundedUp = Math.ceil(amount / stepSize) * stepSize;
+                // if (roundedUp >= minQty) {
+                //     logger.debug(`Rounded up amount from ${steppedAmount} to ${roundedUp} for ${symbol}`);
+                //     steppedAmount = roundedUp;
+                // } else {
+                throw new Error(`Invalid quantity after stepping: ${steppedAmount} < minQty ${minQty} (original amount: ${amount})`);
+                // }
+            }
+
+            // 7. Apply CCXT precision formatting
             const finalAmount = parseFloat(
                 this.exchange.amountToPrecision(symbol, steppedAmount)
             );
 
+            // Log final amount for debugging
+            logger.debug(`Final aligned amount for ${symbol}: ${finalAmount} (original: ${amount})`);
 
-            // Prepare unified params (ccxt handles mapping to Bybit-specific keys)
+            // Prepare params
             const params: { [key: string]: any } = {
                 category: 'linear', // Required for Bybit v5 unified API
             };
             if (stopLoss) params.stopLossPrice = stopLoss;
             if (takeProfit) params.takeProfitPrice = takeProfit;
             // if (trailingStopDistance) params.trailingAmount = trailingStopDistance;
+
+            logger.debug(`Placing ${side} order for ${finalAmount} ${symbol} with params`, { stopLoss, takeProfit, trailingStopDistance, params });
 
             // Place the order with retries
             const order = await this.withRetries(

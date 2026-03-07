@@ -23,7 +23,7 @@ const logger = createLogger('ExcursionCache');
 // Configuration constants (overridable via config)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const RECENT_WINDOW_HOURS_DEFAULT = 3; // 3 hours default recency window for simulations included in regime (tune as needed)
+const RECENT_WINDOW_HOURS_DEFAULT = 1.5; // 1.5 hours default recency window for simulations included in regime (tune as needed)
 const MAX_CLOSED_SIMS_PER_SYMBOL = 10;
 const MIN_SAMPLES_FOR_TRUST_DEFAULT = 3;
 
@@ -153,14 +153,14 @@ export interface ExcursionRegimeLite
 */
 const SCORE_THRESHOLDS = {
     mfeGood: 0.5,               // % — meaningful favorable excursion
-    mfeDecent: 0.25,
+    mfeDecent: 0.3,
     maeMaxGood: 1.0,            // % — acceptable adverse
     ratioReverse: 0.6,          // MAE > MFE / 0.6 → MAE dominates
     earlyTimeMs: 5 * 60 * 1000,  // 5 minutes
     fastCloseMs: 5 * 60 * 1000,  // Fast overall close bonus
     slowCloseMs: 8 * 60 * 1000,  // Slow close penalty
     earlyMfeBonusMs: 3 * 60 * 1000,
-    rapidMaePenaltyMs: 2 * 60 * 1000,
+    rapidMaePenaltyMs: 3 * 60 * 1000,
     lateMfePenaltyRatio: 0.7,   // >70% of duration = late peak
 };
 
@@ -202,7 +202,7 @@ export class ExcursionHistoryCache {
 
         // Max simulations kept per symbol (total, not per side yet)
         // In future we might split to max per direction
-        this.maxClosedSims = Math.max(5, MAX_CLOSED_SIMS_PER_SYMBOL ?? 10);
+        this.maxClosedSims = Math.max(10, MAX_CLOSED_SIMS_PER_SYMBOL);
 
         // Cleanup runs every 30 minutes by default
         // Can be made configurable later if needed
@@ -524,12 +524,12 @@ export class ExcursionHistoryCache {
             if (dirEntries.length === 0) return undefined;
 
             const mfeValues = dirEntries.map(e => e.mfe ?? 0);
-            const maeValues = dirEntries.map(e => Math.abs(e.mae ?? 0)); // absolute for averaging
+            const maeValues = dirEntries.map(e => Math.abs(e.mae ?? 0));
             const durationMs = dirEntries.map(e => e.durationMs ?? 0);
 
             const mfe = this.safeAvg(mfeValues);
-            const mae = -this.safeAvg(maeValues); // back to negative
-            const ratio = mfe / (Math.abs(mae) || 1); // avoid div/0
+            const mae = -this.safeAvg(maeValues);
+            const ratio = mfe / (Math.abs(mae) || 1);
 
             const outcomeCounts = { tp: 0, partial_tp: 0, sl: 0, timeout: 0 };
             dirEntries.forEach(e => {
@@ -550,33 +550,53 @@ export class ExcursionHistoryCache {
         const buyAgg = computeDirectional(buyEntries);
         const sellAgg = computeDirectional(sellEntries);
 
-        // ── STEP 4: Combined stats (for alert gate & overview) ──────────────────────
-        let slStreak = 0;
-        for (const e of entries) { // newest first
-            if (e.outcome === 'sl') slStreak++;
+        // ── STEP 4: Compute ALL streak variants ─────────────────────────────────────
+        // A. Combined streak (old behavior – newest first across both sides)
+        let slStreakCombined = 0;
+        for (const e of entries) {           // already sorted newest → oldest
+            if (e.outcome === 'sl') slStreakCombined++;
             else break;
         }
 
+        // B. Buy-side streak (only looking at buy entries, newest first)
+        let slStreakBuy = 0;
+        for (const e of buyEntries) {        // already filtered & in newest-first order
+            if (e.outcome === 'sl') slStreakBuy++;
+            else break;
+        }
+
+        // C. Sell-side streak
+        let slStreakSell = 0;
+        for (const e of sellEntries) {
+            if (e.outcome === 'sl') slStreakSell++;
+            else break;
+        }
+
+        // ── STEP 5: Combined timeout ratio (unchanged) ──────────────────────────────
         const totalTimeouts = (buyAgg?.outcomeCounts.timeout ?? 0) + (sellAgg?.outcomeCounts.timeout ?? 0);
         const timeoutRatio = combinedCount > 0 ? totalTimeouts / combinedCount : 0;
 
-        // ── STEP 5: Build fresh regime object ───────────────────────────────────────
+        // ── STEP 6: Build fresh regime object ───────────────────────────────────────
         const freshRegime: ExcursionRegime = {
             symbol,
-            historyJson: entries.map(e => ({ ...e }) as SimulationHistoryEntry).slice(0, 5), // cap for alerts
+            historyJson: entries.map(e => ({ ...e }) as SimulationHistoryEntry).slice(0, 5),
 
             recentSampleCount: combinedCount,
-            slStreak,
+            slStreak: slStreakCombined,     // kept for overview / legacy
             timeoutRatio,
 
             buy: buyAgg,
             sell: sellAgg,
 
+            // Now populated!
+            slStreakBuy,
+            slStreakSell,
+
             activeCount: 0,
             updatedAt: new Date(),
         };
 
-        // ── STEP 6: Store & log ─────────────────────────────────────────────────────
+        // ── STEP 7: Store & enhanced logging ────────────────────────────────────────
         this.aggregates.set(symbol, freshRegime);
 
         logger.debug('Directional aggregates recomputed', {
@@ -586,10 +606,13 @@ export class ExcursionHistoryCache {
             sellSamples: sellAgg?.sampleCount ?? 0,
             buyMfeMae: buyAgg ? `${buyAgg.mfe.toFixed(3)} / ${buyAgg.mae.toFixed(3)}` : 'n/a',
             sellMfeMae: sellAgg ? `${sellAgg.mfe.toFixed(3)} / ${sellAgg.mae.toFixed(3)}` : 'n/a',
-            slStreak,
+            slStreakCombined,
+            slStreakBuy,
+            slStreakSell,
             timeoutRatio: timeoutRatio.toFixed(3),
-            avgDurationSec: buyAgg || sellAgg ?
-                ((buyAgg?.avgDurationMs ?? 0) + (sellAgg?.avgDurationMs ?? 0)) / (combinedCount || 1) / 1000 : 'n/a',
+            avgDurationSec: (buyAgg || sellAgg)
+                ? ((buyAgg?.avgDurationMs ?? 0) + (sellAgg?.avgDurationMs ?? 0)) / (combinedCount || 1) / 1000
+                : 'n/a',
         });
     }
 
