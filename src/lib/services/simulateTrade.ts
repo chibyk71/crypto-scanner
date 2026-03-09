@@ -143,7 +143,8 @@ export async function simulateTrade(
     symbol: string,
     signal: TradeSignal,
     entryPrice: number,
-    features: number[]
+    features: number[],
+    correlationId?: string,
 ): Promise<SimulationResult> {
     // ────────────────────────────────────────────────────────────────
     // 0. EARLY VALIDATION – prevent invalid simulations early
@@ -174,12 +175,15 @@ export async function simulateTrade(
     //    Single source of truth for the entire simulation loop
     // ────────────────────────────────────────────────────────────────
     const startTime = Date.now();
+    const signalId = correlationId ?? crypto.randomUUID(); // generated here – caller doesn't need to know
 
     const tracking = initializeTrackingVariables(
         signal,
         entryPrice,
         startTime
     );
+
+    dbService.createNewSimulation(signalId, signal.symbol, signal.signal as 'buy' | 'sell', entryPrice, startTime, features);
 
     // ────────────────────────────────────────────────────────────────
     // 3. MAIN SIMULATION LOOP – runs until exit or 10 candles reached
@@ -240,6 +244,7 @@ export async function simulateTrade(
             if (tracking.remainingPosition <= 0.01) {
                 return await storeAndFinalizeSimulation({
                     outcome: 'partial_tp',
+                    signalId,
                     startTime,
                     totalPnL: tracking.totalPnL,
                     entryPrice,
@@ -262,6 +267,7 @@ export async function simulateTrade(
 
             return await storeAndFinalizeSimulation({
                 outcome: 'tp',
+                signalId,
                 startTime,
                 totalPnL: fullTpPnL,
                 entryPrice,
@@ -283,6 +289,7 @@ export async function simulateTrade(
 
             return await storeAndFinalizeSimulation({
                 outcome: 'sl',
+                signalId,
                 startTime,
                 totalPnL: slPnL,
                 entryPrice,
@@ -319,6 +326,7 @@ export async function simulateTrade(
 
     return await storeAndFinalizeSimulation({
         outcome: 'timeout',
+        signalId,
         startTime,
         totalPnL: timeoutPnL,
         entryPrice,
@@ -1119,6 +1127,7 @@ function checkStopLoss(
  */
 async function storeAndFinalizeSimulation(
     params: {
+        signalId: string;                     // optional – generated if not provided
         symbol: string;
         signal: TradeSignal;                    // original signal for context
         entryPrice: number;                     // raw float
@@ -1134,6 +1143,7 @@ async function storeAndFinalizeSimulation(
 ): Promise<SimulationResult> {
     const {
         symbol,
+        signalId,
         signal,
         entryPrice,
         startTime,
@@ -1148,7 +1158,6 @@ async function storeAndFinalizeSimulation(
 
     const endTime = Date.now();
     const durationMs = endTime - startTime;
-    const signalId = crypto.randomUUID(); // generated here – caller doesn't need to know
 
     // ── 1. Compute excursions as percentages ────────────────────────────────
     const isLong = signal.signal === 'buy';
@@ -1194,27 +1203,24 @@ async function storeAndFinalizeSimulation(
 
     // ── 5. Atomic DB insert – everything in one row ─────────────────────────
     try {
-        dbService.storeCompletedSimulation({
+        dbService.updateCompletedSimulation(
             signalId,
-            symbol: symbol.trim().toUpperCase(),
-            side: isLong ? 'buy' : 'sell',
-            entryPrice,
-            stopLoss: signal.stopLoss,
-            trailingDist: signal.trailingStopDistance,
-            tpLevels: signal.takeProfitLevels ?? undefined,
-            openedAt: startTime,
-            closedAt: endTime,
-            outcome,
-            pnl: Math.round(totalPnL * 1e8),
-            rMultiple: Math.round(rMultiple * 1e4),
-            label,
-            maxFavorableExcursion: Math.round(boundedMfe * 1e4),
-            maxAdverseExcursion: Math.round(boundedMae * 1e4),
-            durationMs,
-            timeToMFEMs: timeToMfeMs,
-            timeToMAEMs: timeToMaeMs,
-            features: features ?? [],
-        })
+            {
+                tpLevels: signal.takeProfitLevels ?? undefined,
+                stoploss: signal.stopLoss,
+                trailingDist: signal.trailingStopDistance,
+                closedAt: endTime,
+                outcome,
+                pnl: Math.round(totalPnL * 1e8),
+                rMultiple: Math.round(rMultiple * 1e4),
+                label,
+                maxFavorableExcursion: Math.round(boundedMfe * 1e4),
+                maxAdverseExcursion: Math.round(boundedMae * 1e4),
+                durationMs,
+                timeToMFEMs: timeToMfeMs,
+                timeToMAEMs: timeToMaeMs,
+                features: features ?? [],
+            })
     } catch (err) {
         logger.error('Failed to store completed simulation in DB', {
             symbol,

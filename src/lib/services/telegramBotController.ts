@@ -183,6 +183,9 @@ export class TelegramBotController {
         // =================================================================
         this.bot.onText(/\/positions/, this.handlePositions.bind(this));
         this.bot.onText(/\/trades/, this.handleTrades.bind(this));
+        this.bot.onText(/\/takenstats(?:\s+(.+))?/, this.handleTakenStats.bind(this));
+        this.bot.onText(/\/takensymbols(?:\s+(\d+))?/, this.handleTakenSymbols.bind(this));
+        this.bot.onText(/\/takenvsall/, this.handleTakenVsAll.bind(this));
 
         // =================================================================
         // 6. Analytics & Diagnostics
@@ -1525,6 +1528,275 @@ export class TelegramBotController {
     };
 
     /**
+     * Handles the /takenstats command.
+     * Displays statistics for simulations marked as `was_taken = true`.
+     *
+     * Usage:
+     *   /takenstats                → overall stats across all symbols
+     *   /takenstats BTC/USDT       → stats filtered to a specific symbol
+     */
+    private handleTakenStats = async (msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> => {
+        // Early authorization check
+        if (msg.chat.id.toString() !== this.authorizedChatId) {
+            return;
+        }
+
+        // Extract optional symbol filter from command argument
+        const symbolFilter = match?.[1]?.trim();
+
+        try {
+            // Fetch stats (with optional symbol filter)
+            const stats = await dbService.getTakenSimulationStats({
+                symbol: symbolFilter || undefined,
+            });
+
+            // Build message content
+            const lines: string[] = [];
+
+            // Header
+            if (symbolFilter) {
+                lines.push(`**Taken Trade Stats for ${escape(symbolFilter)}**`);
+            } else {
+                lines.push('**Taken Trade Statistics (All Symbols)**');
+            }
+
+            lines.push(`Total taken trades: **${stats.totalTaken}**`);
+
+            if (stats.totalTaken === 0) {
+                lines.push('');
+                lines.push('No taken trades have been recorded yet.');
+            } else {
+                // Performance summary
+                lines.push(`Wins: **${stats.wins}** (${this.formatPercent(stats.winRate, 1)})`);
+                lines.push(`Win rate: **${this.formatPercent(stats.winRate, 1)}**`);
+                lines.push(`Average R-multiple: **${this.formatR(stats.avgRMultiple)}**`);
+                lines.push(`Average PnL: **${stats.avgPnL.toFixed(4)}**`);
+                lines.push(`Total realized PnL: **${stats.totalPnL.toFixed(4)}**`);
+
+                // Outcome distribution
+                lines.push('');
+                lines.push('**Outcome Breakdown**');
+                lines.push(`• Take Profit: ${stats.outcomes.tp}`);
+                lines.push(`• Partial TP:   ${stats.outcomes.partial_tp}`);
+                lines.push(`• Stop Loss:    ${stats.outcomes.sl}`);
+                lines.push(`• Timeout:      ${stats.outcomes.timeout}`);
+            }
+
+            // Timestamp / freshness note
+            lines.push('');
+            lines.push(`🕒 Updated: ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
+
+            // Send formatted message
+            await this.sendMessage(lines.join('\n'), {
+                parse_mode: 'MarkdownV2',
+            });
+
+            logger.info('Sent taken stats response', {
+                chatId: msg.chat.id,
+                symbol: symbolFilter || 'all',
+                totalTaken: stats.totalTaken,
+            });
+        } catch (error) {
+            // Log detailed error for debugging
+            logger.error('Failed to handle /takenstats command', {
+                chatId: msg.chat.id,
+                symbolFilter,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+            });
+
+            // User-friendly error message
+            await this.sendMessage(
+                'Sorry, there was an error fetching the taken trade statistics.\n' +
+                'Please check the logs or try again later.',
+                { parse_mode: 'Markdown' }
+            );
+        }
+    };
+
+    /**
+     * Handles the /takensymbols command.
+     * Displays the top symbols ranked by number of taken (filtered/executed) simulations.
+     *
+     * Usage examples:
+     *   /takensymbols          → shows top 10 symbols
+     *   /takensymbols 5        → shows top 5 symbols
+     *   /takensymbols 20       → shows top 20 symbols (clamped between 3–30)
+     */
+    private handleTakenSymbols = async (
+        msg: TelegramBot.Message,
+        match: RegExpExecArray | null
+    ): Promise<void> => {
+        // Security: only respond to authorized user
+        if (msg.chat.id.toString() !== this.authorizedChatId) {
+            return;
+        }
+
+        // Parse and clamp the optional limit argument (3–30, default 10)
+        let limit = 10;
+        if (match?.[1]) {
+            const parsed = parseInt(match[1], 10);
+            if (!isNaN(parsed)) {
+                limit = Math.min(Math.max(3, parsed), 30);
+            }
+        }
+
+        try {
+            // Fetch top symbols from database
+            const topSymbols = await dbService.getTakenStatsBySymbol(limit);
+
+            // Prepare message content
+            const lines: string[] = [
+                `**Top ${limit} Symbols by Taken Trades**`,
+                '',
+            ];
+
+            if (topSymbols.length === 0) {
+                lines.push('No taken trades have been recorded yet.');
+                lines.push('Once some filtered trades occur, top performers will appear here.');
+            } else {
+                // Build ranked list
+                topSymbols.forEach((s, index) => {
+                    const rank = index + 1;
+                    const winRateStr = this.formatPercent(s.winRate, 1);
+                    const avgRStr = this.formatR(s.avgR);
+
+                    lines.push(
+                        `${rank}. **${escape(s.symbol)}**` +
+                        ` — ${s.totalTaken} trades` +
+                        ` — Win rate: **${winRateStr}**` +
+                        ` — Avg R: **${avgRStr}**`
+                    );
+                });
+
+                // Optional footer note
+                lines.push('');
+                lines.push('Sorted by number of taken trades (descending).');
+            }
+
+            // Add data freshness indicator
+            lines.push('');
+            lines.push(
+                `🕒 Updated: ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`
+            );
+
+            // Send formatted response
+            await this.sendMessage(lines.join('\n'), {
+                parse_mode: 'MarkdownV2',
+            });
+
+            // Log success for usage tracking / debugging
+            logger.info('Sent top taken symbols response', {
+                chatId: msg.chat.id,
+                requestedLimit: limit,
+                returnedCount: topSymbols.length,
+            });
+        } catch (error) {
+            // Detailed error logging
+            logger.error('Failed to handle /takensymbols command', {
+                chatId: msg.chat.id,
+                requestedLimit: limit,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack?.slice(0, 300) : undefined,
+            });
+
+            // User-friendly error message
+            await this.sendMessage(
+                'Sorry, could not fetch the top symbols statistics right now.\n' +
+                'Please check the logs or try again later.',
+                { parse_mode: 'Markdown' }
+            );
+        }
+    };
+
+    /**
+ * Handles the /takenvsall command.
+ * Shows a quick comparison between:
+ *   - Total number of closed simulations
+ *   - Number of simulations marked as taken (filtered/executed)
+ *   - Percentage of simulations that passed the excursion/regime filter
+ *
+ * Purpose: Helps evaluate how selective the filtering logic is.
+ */
+    private handleTakenVsAll = async (msg: TelegramBot.Message): Promise<void> => {
+        // Early exit if not authorized user
+        if (msg.chat.id.toString() !== this.authorizedChatId) {
+            return;
+        }
+
+        try {
+            // Fetch comparison counts from DB
+            const counts = await dbService.getTakenVsTotalCount();
+
+            // Build message content
+            const lines: string[] = [
+                '**Taken vs All Simulations**',
+                '',
+                `Total closed simulations: **${counts.totalSims.toLocaleString()}**`,
+                `Taken (filtered/executed): **${counts.takenSims.toLocaleString()}**`,
+            ];
+
+            // Only show percentage if we have valid data
+            if (counts.totalSims > 0) {
+                lines.push(
+                    `Percentage taken: **${this.formatPercent(counts.takenPercentage, 1)}**`
+                );
+            } else {
+                lines.push('Percentage taken: **N/A** (no simulations yet)');
+            }
+
+            lines.push('');
+
+            // Interpretation / context
+            if (counts.takenSims === 0) {
+                lines.push('⚠️ No trades have passed the excursion filter yet.');
+                lines.push('This could mean: limited data, strict regime rules, or no strong signals.');
+            } else if (counts.takenPercentage < 20) {
+                lines.push('The filter is currently **very selective** (<20%).');
+                lines.push('This is good for quality — but may limit trade frequency.');
+            } else if (counts.takenPercentage > 60) {
+                lines.push('The filter is **quite permissive** (>60%).');
+                lines.push('Consider tightening regime rules if too many weak trades are passing.');
+            } else {
+                lines.push('The filter is moderately selective — balanced approach.');
+            }
+
+            // Add freshness timestamp (helps user know data is current)
+            lines.push('');
+            lines.push(
+                `🕒 Stats as of ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`
+            );
+
+            // Send the formatted message
+            await this.sendMessage(lines.join('\n'), {
+                parse_mode: 'MarkdownV2',
+            });
+
+            // Log successful response (useful for monitoring usage)
+            logger.info('Sent taken vs all stats response', {
+                chatId: msg.chat.id,
+                totalSims: counts.totalSims,
+                takenSims: counts.takenSims,
+                takenPct: counts.takenPercentage.toFixed(1),
+            });
+        } catch (error) {
+            // Detailed logging for debugging
+            logger.error('Failed to handle /takenvsall command', {
+                chatId: msg.chat.id,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack?.slice(0, 300) : undefined,
+            });
+
+            // User-friendly fallback message
+            await this.sendMessage(
+                'Sorry, could not fetch the taken vs all comparison right now.\n' +
+                'Please check the logs or try again later.',
+                { parse_mode: 'Markdown' }
+            );
+        }
+    };
+
+    /**
      * Handles the /ml_pause command.
      *
      * Pauses ongoing ML model training.
@@ -2159,5 +2431,13 @@ export class TelegramBotController {
             // Re-throw to allow callers to handle gracefully (e.g., retry or fallback)
             throw error;
         }
+    }
+
+    private formatPercent(value: number, decimals = 1): string {
+        return value.toFixed(decimals) + '%';
+    }
+
+    private formatR(value: number): string {
+        return value.toFixed(2) + 'R';
     }
 }

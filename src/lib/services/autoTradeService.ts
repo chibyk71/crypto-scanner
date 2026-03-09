@@ -21,7 +21,7 @@ import { getExcursionAdvice } from '../utils/excursionUtils';
 import type { TelegramBotController } from './telegramBotController';
 import { excursionCache } from './excursionHistoryCache';
 import { simulateTrade } from './simulateTrade';
-// import { simulateTrade } from './simulateTrade';
+import { dbService } from '../db';
 
 const logger = createLogger('AutoTradeService');
 
@@ -81,8 +81,9 @@ export class AutoTradeService {
      *   - Reversal: applied only if advice.action === 'reverse' (advice ensures intended side has ≥3 samples)
      *
      * @param signal Raw technical TradeSignal from Strategy (base SL/TP, no regime adjustments)
+     * @param correlationId Unique identifier for correlating trade execution with its original signal and simulation (optional, for logging/tracing)
      */
-    public async execute(signal: TradeSignal): Promise<void> {
+    public async execute(signal: TradeSignal, correlationId: string): Promise<void> {
         const symbol = signal.symbol;
 
         // ────────────────────────────────────────────────────────────────
@@ -139,17 +140,10 @@ export class AutoTradeService {
                     symbol,
                     adviceSummary: advice.advice
                 });
-                // Still send alert if combined >=3 (your rule)
-                if (this.telegramService) {
-                    await this.telegramService.sendSignalAlert(
-                        symbol,
-                        signal,  // use original signal for skip alert
-                        currentPrice,
-                        false    // no order placed
-                    );
-                }
                 return;
             }
+
+            dbService.setSimulationTaken(correlationId); // Mark original sim as taken (for tracking)
 
             // Extract adjustments (ignore SL/TP multipliers, keep confidence boost)
             const { confidenceBoost = 0 } = advice.adjustments ?? {};
@@ -260,7 +254,8 @@ export class AutoTradeService {
                     finalSide,
                     currentPrice: currentPrice.toFixed(8)
                 });
-                void simulateTrade(this.exchange, symbol, adjustedSignal, currentPrice, adjustedSignal.features);
+                let signalId = crypto.randomUUID(); // Generate unique ID for this simulation (for tracking)
+                void simulateTrade(this.exchange, symbol, adjustedSignal, currentPrice, adjustedSignal.features, signalId);
                 // Note: feeds cache only — no ML feature extraction needed here
             }
 

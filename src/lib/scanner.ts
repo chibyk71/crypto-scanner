@@ -318,7 +318,7 @@ export class MarketScanner {
  *   6. Graceful per-symbol error handling
  */
     private async processSymbol(symbol: string): Promise<void> {
-        const correlationId = crypto.randomUUID().slice(0, 8); // short traceable ID
+        const correlationId = crypto.randomUUID(); // short traceable ID
         const startMs = Date.now();
 
         try {
@@ -378,7 +378,8 @@ export class MarketScanner {
                         symbol,
                         signal,
                         currentPrice,
-                        signal.features
+                        signal.features,
+                        correlationId
                     ).catch(err => {
                         logger.error(`[${correlationId}] Background simulation failed`, {
                             symbol,
@@ -404,7 +405,7 @@ export class MarketScanner {
             // 6. ALWAYS forward raw signal to AutoTradeService
             //    → AutoTradeService decides filtering, alerting, execution
             logger.debug(`[${correlationId}] Forwarding raw signal to AutoTradeService: ${symbol} → ${signal.signal.toUpperCase()}`);
-            void this.autoTradeService.execute(signal);
+            void this.autoTradeService.execute(signal, correlationId);
 
         } catch (err) {
             const durationSec = ((Date.now() - startMs) / 1000).toFixed(1);

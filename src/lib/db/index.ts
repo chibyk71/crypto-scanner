@@ -42,6 +42,7 @@ import {
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
+import type { PartialTPLevel } from '../../types';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -834,34 +835,102 @@ class DatabaseService {
         }));
     }
 
+    /**
+     * Creates a new empty simulation row with the provided signalId.
+     * Seeds default/starting values for a fresh simulation.
+     * Used to reserve a row early (e.g. before async polling begins),
+     * so we can reference it immediately via signalId.
+     *
+     * @param signalId Unique UUID of the signal (must be pre-generated)
+     * @param symbol Trading pair (e.g. 'BTC/USDT')
+     * @param side 'buy' or 'sell'
+     * @param entryPrice Entry price (raw number, will be stored as-is)
+     * @param openedAt Unix ms timestamp when simulation was started (defaults to now)
+     * @param features Optional initial feature vector
+     * @returns The created row (with defaults applied)
+     */
+    public async createNewSimulation(
+        signalId: string,
+        symbol: string,
+        side: 'buy' | 'sell',
+        entryPrice: number,
+        openedAt: number = Date.now(),
+        features?: number[]
+    ): Promise<string> {
+        try {
+            const [inserted] = await this.db
+                .insert(simulatedTrades)
+                .values({
+                    signalId,
+                    symbol,
+                    side,
+                    entryPrice,               // stored as raw float
+                    openedAt,
+                    wasTaken: false,
+                    // Default/starting values
+                    pnl: 0,
+                    rMultiple: 0,
+                    maxFavorableExcursion: 0,
+                    maxAdverseExcursion: 0,
+                    durationMs: 0,
+                    timeToMFEMs: 0,
+                    timeToMAEMs: 0,
+                    // Nullable fields left undefined/null
+                    stopLoss: null,
+                    trailingDist: null,
+                    tpLevels: null,
+                    closedAt: null,
+                    outcome: null,
+                    label: null,
+                    // Optional features
+                    features: features && features.length > 0 ? features : null,
+                })
+                .$returningId()
+
+            logger.debug('Created new empty simulation row', {
+                signalId,
+                symbol,
+                side,
+                entryPrice,
+                openedAt: new Date(openedAt).toISOString(),
+            });
+
+            return String(inserted.id); // Return the generated signalId for reference (not DB ID)
+        } catch (error) {
+            logger.error('Failed to create new simulation row', {
+                signalId,
+                symbol,
+                side,
+                entryPrice,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
+    }
+
     // =========================================================================
     // SIMULATED TRADES: Store a completed simulation (single atomic insert)
     // =========================================================================
     /**
-     * Stores a fully completed simulated trade in the database in one operation.
+     * Updates an existing simulation row with the final outcome and metrics.
      *
-     * Replaces the old startSimulatedTrade + closeSimulatedTrade pattern.
-     * Called once at the end of simulation when all outcome metrics are known.
+     * This method is called at the end of a simulation (after polling/timeout)
+     * to fill in the results into a row that was pre-created with signalId.
      *
-     * Benefits of single-call design:
-     *   - Atomic: either full row or nothing (no partial/incomplete records)
-     *   - One DB write instead of two
-     *   - No need to track signalId across calls
-     *   - Simpler caller code (simulateTrade just computes → calls this)
+     * It performs a targeted UPDATE instead of INSERT, ensuring we don't duplicate rows.
+     * Only updates fields that are now known (outcome, pnl, excursions, etc.).
+     * Leaves early fields (symbol, side, entryPrice, openedAt, wasTaken, etc.) unchanged.
      *
-     * @param data All required simulation data (entry + outcome + metrics)
-     * @returns The generated signalId (for logging / correlation)
+     * @param signalId The unique UUID of the simulation to update
+     * @param data The final simulation results to apply
+     * @returns true if the row was updated (affected rows > 0), false if no matching row found
      */
-    public async storeCompletedSimulation(
+    public async updateCompletedSimulation(
+        signalId: string,
         data: {
-            signalId?: string;                   // optional – if not provided, a new UUID will be generated
-            symbol: string;
-            side: 'buy' | 'sell';
-            entryPrice: number;                 // raw float
-            stopLoss?: number;
+            stoploss?: number;
             trailingDist?: number;
-            tpLevels?: { price: number; weight: number }[];
-            openedAt: number;                   // Unix ms
+            tpLevels?: PartialTPLevel[];
             closedAt: number;                   // Unix ms
             outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout';
             pnl: number;                        // decimal (e.g. 0.023 = +2.3%)
@@ -872,50 +941,42 @@ class DatabaseService {
             durationMs: number;
             timeToMFEMs: number;
             timeToMAEMs: number;
-            features?: number[];                // optional – if you want to store
+            features?: number[];                // optional – can overwrite if needed
         }
-    ): Promise<string> {
-        const signalId = data.signalId ?? crypto.randomUUID();
-        // const now = Date.now();
-
-        // Defensive guard: ensure openedAt ≤ closedAt
-        if (data.openedAt > data.closedAt) {
-            logger.warn('Invalid timestamps in simulation – adjusting openedAt', {
-                symbol: data.symbol,
-                signalId,
-                openedAt: new Date(data.openedAt).toISOString(),
-                closedAt: new Date(data.closedAt).toISOString(),
-            });
-            data.openedAt = data.closedAt;
-        }
-
+    ): Promise<boolean> {
         try {
-            await this.db.insert(simulatedTrades).values({
-                signalId,
-                symbol: data.symbol.trim().toUpperCase(),
-                side: data.side,
-                entryPrice: data.entryPrice,
-                stopLoss: data.stopLoss,
-                trailingDist: data.trailingDist,
-                tpLevels: data.tpLevels,
-                openedAt: data.openedAt,
-                closedAt: data.closedAt,
-                outcome: data.outcome,
-                pnl: Math.round(data.pnl * 1e8),                           // ×1e8
-                rMultiple: Math.round(data.rMultiple * 1e4),               // ×1e4
-                label: data.label,
-                maxFavorableExcursion: Math.round(data.maxFavorableExcursion * 1e4), // ×1e4
-                maxAdverseExcursion: Math.round(data.maxAdverseExcursion * 1e4),     // ×1e4
-                durationMs: data.durationMs,
-                timeToMFEMs: data.timeToMFEMs,
-                timeToMAEMs: data.timeToMAEMs,
-                features: data.features ?? null,                           // optional
-            }).execute();
+            // Defensive guard: ensure openedAt ≤ closedAt (though openedAt is already set)
+            if (data.closedAt <= 0) {
+                throw new Error('Invalid closedAt timestamp');
+            }
 
-            logger.info('Stored completed simulated trade', {
+            const result = await this.db
+                .update(simulatedTrades)
+                .set({
+                    closedAt: data.closedAt,
+                    outcome: data.outcome,
+                    pnl: Math.round(data.pnl * 1e8),                              // ×1e8
+                    rMultiple: Math.round(data.rMultiple * 1e4),                  // ×1e4
+                    label: data.label,
+                    maxFavorableExcursion: Math.round(data.maxFavorableExcursion * 1e4), // ×1e4
+                    maxAdverseExcursion: Math.round(data.maxAdverseExcursion * 1e4),     // ×1e4
+                    durationMs: data.durationMs,
+                    timeToMFEMs: data.timeToMFEMs,
+                    timeToMAEMs: data.timeToMAEMs,
+                    features: data.features !== undefined ? data.features : null, // overwrite only if provided
+                })
+                .where(eq(simulatedTrades.signalId, signalId))
+                .execute();
+
+            const affectedRows = result[0].affectedRows ?? 0;
+
+            if (affectedRows === 0) {
+                logger.warn('No simulation row found to update', { signalId });
+                return false;
+            }
+
+            logger.info('Updated completed simulation', {
                 signalId,
-                symbol: data.symbol,
-                side: data.side,
                 outcome: data.outcome,
                 label: data.label,
                 rMultiple: data.rMultiple.toFixed(3),
@@ -923,19 +984,17 @@ class DatabaseService {
                 durationMin: (data.durationMs / 60000).toFixed(1),
                 mfe: data.maxFavorableExcursion.toFixed(4) + '%',
                 mae: data.maxAdverseExcursion.toFixed(4) + '%',
+                affectedRows,
             });
 
-            return signalId;
-        } catch (err) {
-            logger.error('Failed to store completed simulated trade', {
-                symbol: data.symbol,
+            return true;
+        } catch (error) {
+            logger.error('Failed to update completed simulation', {
                 signalId,
                 outcome: data.outcome,
-                error: err instanceof Error ? err.message : String(err),
-                stack: err instanceof Error ? err.stack : undefined,
+                error: error instanceof Error ? error.message : String(error),
             });
-
-            throw err; // Let caller decide whether to retry or skip
+            throw error; // Let caller handle retry or fallback
         }
     }
 
@@ -961,6 +1020,293 @@ class DatabaseService {
             .orderBy(desc(simulatedTrades.closedAt))         // Most recent first
             .limit(limit)
             .execute();
+    }
+
+    /**
+ * Marks a specific simulation as "taken" (i.e., the trade was approved by excursion logic
+ * and either executed live or would have been executed if auto-trade was enabled).
+ *
+ * This allows accurate performance tracking of only the filtered/traded signals,
+ * separate from all raw simulations used for regime building and ML training.
+ *
+ * @param signalId - The unique UUID of the simulation row
+ * @param taken - Whether to mark as taken (true) or untaken (false). Defaults to true.
+ * @returns Promise<void> - Resolves when update is complete
+ * @throws Error if update fails (logged internally)
+ */
+    public async setSimulationTaken(
+        signalId: string,
+        taken: boolean = true
+    ): Promise<void> {
+        try {
+            const result = await this.db
+                .update(simulatedTrades)
+                .set({
+                    wasTaken: taken,
+                })
+                .where(eq(simulatedTrades.signalId, signalId))
+                .execute();
+
+            // Check if any row was actually affected (defensive)
+            if (result[0].affectedRows === 0) {
+                logger.warn(`No simulation found to update was_taken`, { signalId, taken });
+                return;
+            }
+
+            logger.debug(`Updated simulation was_taken status`, {
+                signalId,
+                wasTaken: taken,
+            });
+        } catch (error) {
+            logger.error(`Failed to update was_taken for simulation`, {
+                signalId,
+                taken,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            // Re-throw if you want callers to handle failure, or swallow if non-critical
+            throw error;
+        }
+    }
+
+    /**
+     * Fetches performance statistics only for simulations marked as taken.
+     * Useful for evaluating how well the excursion filtering / regime logic performs
+     * on trades that were actually approved.
+     *
+     * @param options Optional filters
+     * @returns Object with key metrics
+     */
+    public async getTakenSimulationStats(options: {
+        symbol?: string;
+        since?: number;           // Unix ms cutoff
+        minRMultiple?: number;    // optional filter
+    } = {}): Promise<{
+        totalTaken: number;
+        wins: number;
+        winRate: number;          // percentage
+        avgPnL: number;
+        avgRMultiple: number;
+        totalPnL: number;
+        outcomes: {
+            tp: number;
+            partial_tp: number;
+            sl: number;
+            timeout: number;
+        };
+    }> {
+        try {
+            const conditions = [
+                eq(simulatedTrades.wasTaken, true),
+                isNotNull(simulatedTrades.closedAt),
+                isNotNull(simulatedTrades.label),
+            ];
+
+            if (options.symbol) {
+                conditions.push(eq(simulatedTrades.symbol, options.symbol));
+            }
+            if (options.since) {
+                conditions.push(gte(simulatedTrades.closedAt, options.since));
+            }
+
+            const whereClause = and(...conditions);
+
+            // Aggregate query
+            const [stats] = await this.db
+                .select({
+                    totalTaken: count().as('totalTaken'),
+                    wins: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} IN ('tp', 'partial_tp') THEN 1 ELSE 0 END)`.mapWith(Number),
+                    totalPnL: sql<number>`SUM(${simulatedTrades.pnl} / 1e8)`.mapWith(Number),
+                    avgPnL: sql<number>`AVG(${simulatedTrades.pnl} / 1e8)`.mapWith(Number),
+                    avgRMultiple: sql<number>`AVG(${simulatedTrades.rMultiple} / 1e4)`.mapWith(Number),
+                    tp: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'tp' THEN 1 ELSE 0 END)`.mapWith(Number),
+                    partial_tp: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'partial_tp' THEN 1 ELSE 0 END)`.mapWith(Number),
+                    sl: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'sl' THEN 1 ELSE 0 END)`.mapWith(Number),
+                    timeout: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'timeout' THEN 1 ELSE 0 END)`.mapWith(Number),
+                })
+                .from(simulatedTrades)
+                .where(whereClause)
+                .execute();
+
+            const total = stats.totalTaken || 0;
+            const wins = stats.wins || 0;
+            const winRate = total > 0 ? (wins / total) * 100 : 0;
+
+            return {
+                totalTaken: total,
+                wins,
+                winRate,
+                avgPnL: stats.avgPnL || 0,
+                avgRMultiple: stats.avgRMultiple || 0,
+                totalPnL: stats.totalPnL || 0,
+                outcomes: {
+                    tp: stats.tp || 0,
+                    partial_tp: stats.partial_tp || 0,
+                    sl: stats.sl || 0,
+                    timeout: stats.timeout || 0,
+                },
+            };
+        } catch (err) {
+            logger.error('Failed to fetch taken simulation stats', { error: err });
+            return {
+                totalTaken: 0,
+                wins: 0,
+                winRate: 0,
+                avgPnL: 0,
+                avgRMultiple: 0,
+                totalPnL: 0,
+                outcomes: { tp: 0, partial_tp: 0, sl: 0, timeout: 0 },
+            };
+        }
+    }
+
+    /**
+ * Retrieves a quick comparison between:
+ * - Total number of closed (completed) simulations
+ * - Number of simulations marked as taken (was_taken = true)
+ * - The percentage of simulations that passed the excursion/regime filter
+ *
+ * Used primarily by the Telegram bot command /takenvsall to show
+ * how selective the current filtering logic is.
+ *
+ * @returns Promise with counts and calculated percentage
+ */
+    public async getTakenVsTotalCount(): Promise<{
+        totalSims: number;
+        takenSims: number;
+        takenPercentage: number;
+    }> {
+        try {
+            // ── 1. Count all closed simulations ─────────────────────────────────────
+            const [totalResult] = await this.db
+                .select({
+                    count: count().as('total'),
+                })
+                .from(simulatedTrades)
+                .where(and(
+                    isNotNull(simulatedTrades.closedAt),
+                    // Optional: only count simulations that have an outcome/label
+                    // (remove if you want to include pending/incomplete ones)
+                    isNotNull(simulatedTrades.outcome)
+                ))
+                .execute();
+
+            const totalSims = Number(totalResult?.count ?? 0);
+
+            // ── 2. Count only taken (filtered/executed) simulations ─────────────────
+            const [takenResult] = await this.db
+                .select({
+                    count: count(),
+                })
+                .from(simulatedTrades)
+                .where(and(
+                    eq(simulatedTrades.wasTaken, true),
+                    isNotNull(simulatedTrades.closedAt),
+                    isNotNull(simulatedTrades.outcome)
+                ))
+                .execute();
+
+            const takenSims = Number(takenResult?.count ?? 0);
+
+            // ── 3. Calculate percentage (safe handling for division by zero) ────────
+            const takenPercentage = totalSims > 0
+                ? (takenSims / totalSims) * 100
+                : 0;
+
+            return {
+                totalSims,
+                takenSims,
+                takenPercentage,
+            };
+        } catch (error) {
+            logger.error('Failed to compute taken vs total simulation counts', {
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+            });
+
+            // Graceful fallback — better to return zeros than crash the command
+            return {
+                totalSims: 0,
+                takenSims: 0,
+                takenPercentage: 0,
+            };
+        }
+    }
+
+    /**
+ * Retrieves performance statistics for taken simulations, grouped by symbol.
+ * Only includes completed simulations where `was_taken = true`.
+ *
+ * Results are sorted by total taken trades (descending) and limited to the requested count.
+ *
+ * @param limit Maximum number of symbols to return (default: 20)
+ * @param since Optional Unix timestamp (ms) — only include simulations closed after this time
+ * @returns Array of symbol stats, sorted by totalTaken descending
+ */
+    public async getTakenStatsBySymbol(
+        limit: number = 20,
+        since?: number
+    ): Promise<Array<{
+        symbol: string;
+        totalTaken: number;
+        winRate: number;     // percentage (0–100)
+        avgR: number;        // average R-multiple
+        totalPnL: number;    // cumulative realized PnL
+    }>> {
+        // Enforce reasonable limit range to prevent abuse or performance issues
+        const safeLimit = Math.max(1, Math.min(50, limit));
+
+        try {
+            const conditions = [
+                eq(simulatedTrades.wasTaken, true),
+                isNotNull(simulatedTrades.closedAt),
+                // Only count simulations with a meaningful outcome
+                isNotNull(simulatedTrades.outcome),
+            ];
+
+            if (since !== undefined) {
+                conditions.push(gte(simulatedTrades.closedAt, since));
+            }
+
+            const whereClause = and(...conditions);
+
+            const rows = await this.db
+                .select({
+                    symbol: simulatedTrades.symbol,
+                    totalTaken: count().as('totalTaken'),
+                    wins: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} IN ('tp', 'partial_tp') THEN 1 ELSE 0 END)`.mapWith(Number),
+                    totalPnL: sql<number>`COALESCE(SUM(${simulatedTrades.pnl} / 1e8), 0)`.mapWith(Number),
+                    avgR: sql<number>`COALESCE(AVG(${simulatedTrades.rMultiple} / 1e4), 0)`.mapWith(Number),
+                })
+                .from(simulatedTrades)
+                .where(whereClause)
+                .groupBy(simulatedTrades.symbol)
+                .orderBy(desc(sql`totalTaken`))
+                .limit(safeLimit)
+                .execute();
+
+            // Transform raw DB rows into clean result objects
+            return rows.map(row => {
+                const total = Number(row.totalTaken) || 0;
+                const wins = Number(row.wins) || 0;
+
+                return {
+                    symbol: row.symbol,
+                    totalTaken: total,
+                    winRate: total > 0 ? (wins / total) * 100 : 0,
+                    avgR: Number(row.avgR) || 0,
+                    totalPnL: Number(row.totalPnL) || 0,
+                };
+            });
+        } catch (error) {
+            logger.error('Failed to fetch taken stats by symbol', {
+                limit: safeLimit,
+                since: since ? new Date(since).toISOString() : undefined,
+                error: error instanceof Error ? error.message : String(error),
+            });
+
+            // Return empty array on failure — safe fallback for UI/Telegram
+            return [];
+        }
     }
 
     /**
