@@ -144,7 +144,7 @@ export async function simulateTrade(
     signal: TradeSignal,
     entryPrice: number,
     features: number[],
-    correlationId?: string,
+    correlationId: string,
 ): Promise<SimulationResult> {
     // ────────────────────────────────────────────────────────────────
     // 0. EARLY VALIDATION – prevent invalid simulations early
@@ -175,7 +175,7 @@ export async function simulateTrade(
     //    Single source of truth for the entire simulation loop
     // ────────────────────────────────────────────────────────────────
     const startTime = Date.now();
-    const signalId = correlationId ?? crypto.randomUUID(); // generated here – caller doesn't need to know
+    const signalId = correlationId; // generated here – caller doesn't need to know
 
     const tracking = initializeTrackingVariables(
         signal,
@@ -183,7 +183,7 @@ export async function simulateTrade(
         startTime
     );
 
-    dbService.createNewSimulation(signalId, signal.symbol, signal.signal as 'buy' | 'sell', entryPrice, startTime, features);
+    await dbService.createNewSimulation(signalId, signal.symbol, signal.signal as 'buy' | 'sell', entryPrice, startTime, features);
 
     // ────────────────────────────────────────────────────────────────
     // 3. MAIN SIMULATION LOOP – runs until exit or 10 candles reached

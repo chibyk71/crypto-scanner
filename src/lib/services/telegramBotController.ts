@@ -150,27 +150,23 @@ export class TelegramBotController {
      */
     private registerListeners(): void {
         // =================================================================
-        // 1. Basic & Help Commands
+        // TELEGRAM COMMAND REGISTRATION – Centralized & Grouped
         // =================================================================
+
+        // 1. Basic & Help Commands
         this.bot.onText(/\/start|\/help/, this.handleHelp.bind(this));
 
-        // =================================================================
         // 2. System Status & Control
-        // =================================================================
         this.bot.onText(/\/status/, this.handleStatus.bind(this));
         this.bot.onText(/\/stopbot/, this.handleStopBot.bind(this));
 
-        // =================================================================
         // 3. Custom Alert Management
-        // =================================================================
         this.bot.onText(/\/alerts/, this.handleAlerts.bind(this));
         this.bot.onText(/\/create_alert/, this.handleCreateAlertStart.bind(this));
         this.bot.onText(/\/edit_alert/, this.handleEditAlertStart.bind(this));
         this.bot.onText(/\/delete_alert/, this.handleDeleteAlertStart.bind(this));
 
-        // =================================================================
         // 4. ML Model Control & Monitoring
-        // =================================================================
         this.bot.onText(/\/ml_status/, this.handleMLStatus.bind(this));
         this.bot.onText(/\/ml_pause/, this.handleMLPause.bind(this));
         this.bot.onText(/\/ml_resume/, this.handleMLResume.bind(this));
@@ -178,22 +174,20 @@ export class TelegramBotController {
         this.bot.onText(/\/ml_samples/, this.handleMLSamples.bind(this));
         this.bot.onText(/\/ml_performance/, this.handleMLPerformance.bind(this));
 
-        // =================================================================
-        // 5. Live Trading Monitoring
-        // =================================================================
+        // 5. Live Trading & Position Monitoring
         this.bot.onText(/\/positions/, this.handlePositions.bind(this));
         this.bot.onText(/\/trades/, this.handleTrades.bind(this));
+
+        // 6. Taken Trade Analytics (new performance stats for filtered trades)
         this.bot.onText(/\/takenstats(?:\s+(.+))?/, this.handleTakenStats.bind(this));
         this.bot.onText(/\/takensymbols(?:\s+(\d+))?/, this.handleTakenSymbols.bind(this));
         this.bot.onText(/\/takenvsall/, this.handleTakenVsAll.bind(this));
 
-        // =================================================================
-        // 6. Analytics & Diagnostics
-        // =================================================================
+        // 7. Excursion & Regime Diagnostics
         this.bot.onText(/\/excursions(?:\s+(.+))?/, this.handleExcursions.bind(this));
 
         // =================================================================
-        // 7. Global Event Listeners (non-command input)
+        // 8. Global Event Listeners (non-command input)
         // =================================================================
         // Handles free-text input during multi-step workflows (e.g., entering period/target)
         this.bot.on('message', this.handleMessage.bind(this));
@@ -1555,36 +1549,36 @@ export class TelegramBotController {
 
             // Header
             if (symbolFilter) {
-                lines.push(`**Taken Trade Stats for ${escape(symbolFilter)}**`);
+                lines.push(`**Taken Trade Stats for ${this.escape(symbolFilter)}**`);
             } else {
-                lines.push('**Taken Trade Statistics (All Symbols)**');
+                lines.push('**Taken Trade Statistics \\(All Symbols\\)**');
             }
 
-            lines.push(`Total taken trades: **${stats.totalTaken}**`);
+            lines.push(`Total taken trades: **${this.escape(stats.totalTaken)}**`);
 
             if (stats.totalTaken === 0) {
                 lines.push('');
-                lines.push('No taken trades have been recorded yet.');
+                lines.push(this.escape('No taken trades have been recorded yet.'));
             } else {
                 // Performance summary
-                lines.push(`Wins: **${stats.wins}** (${this.formatPercent(stats.winRate, 1)})`);
+                lines.push(`Wins: **${stats.wins}** \\(${this.formatPercent(stats.winRate, 1)}\\)`);
                 lines.push(`Win rate: **${this.formatPercent(stats.winRate, 1)}**`);
-                lines.push(`Average R-multiple: **${this.formatR(stats.avgRMultiple)}**`);
-                lines.push(`Average PnL: **${stats.avgPnL.toFixed(4)}**`);
-                lines.push(`Total realized PnL: **${stats.totalPnL.toFixed(4)}**`);
+                lines.push(`Average R\\-multiple: **${this.formatR(stats.avgRMultiple)}**`);
+                lines.push(`Average PnL: **${this.escape((stats.avgPnL.toFixed(4)))}**`);
+                lines.push(`Total realized PnL: **${this.escape(stats.totalPnL.toFixed(4))}**`);
 
                 // Outcome distribution
                 lines.push('');
                 lines.push('**Outcome Breakdown**');
-                lines.push(`• Take Profit: ${stats.outcomes.tp}`);
-                lines.push(`• Partial TP:   ${stats.outcomes.partial_tp}`);
-                lines.push(`• Stop Loss:    ${stats.outcomes.sl}`);
-                lines.push(`• Timeout:      ${stats.outcomes.timeout}`);
+                lines.push(`• Take Profit: ${this.escape(stats.outcomes.tp)}`);
+                lines.push(`• Partial TP:   ${this.escape(stats.outcomes.partial_tp)}`);
+                lines.push(`• Stop Loss:    ${this.escape(stats.outcomes.sl)}`);
+                lines.push(`• Timeout:      ${this.escape(stats.outcomes.timeout)}`);
             }
 
             // Timestamp / freshness note
             lines.push('');
-            lines.push(`🕒 Updated: ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
+            lines.push(`🕒 Updated: ${this.escape(new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' }))} WAT`);
 
             // Send formatted message
             await this.sendMessage(lines.join('\n'), {
@@ -1652,8 +1646,8 @@ export class TelegramBotController {
             ];
 
             if (topSymbols.length === 0) {
-                lines.push('No taken trades have been recorded yet.');
-                lines.push('Once some filtered trades occur, top performers will appear here.');
+                lines.push('No taken trades have been recorded yet\\.');
+                lines.push(this.escape('Once some filtered trades occur, top performers will appear here.'));
             } else {
                 // Build ranked list
                 topSymbols.forEach((s, index) => {
@@ -1662,8 +1656,8 @@ export class TelegramBotController {
                     const avgRStr = this.formatR(s.avgR);
 
                     lines.push(
-                        `${rank}. **${escape(s.symbol)}**` +
-                        ` — ${s.totalTaken} trades` +
+                        `${rank}\\. **${this.escape(s.symbol)}**` +
+                        ` — ${this.escape(s.totalTaken)} trades` +
                         ` — Win rate: **${winRateStr}**` +
                         ` — Avg R: **${avgRStr}**`
                     );
@@ -1671,13 +1665,13 @@ export class TelegramBotController {
 
                 // Optional footer note
                 lines.push('');
-                lines.push('Sorted by number of taken trades (descending).');
+                lines.push('Sorted by number of taken trades \\(descending\\)\\.');
             }
 
             // Add data freshness indicator
             lines.push('');
             lines.push(
-                `🕒 Updated: ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`
+                `🕒 Updated: ${this.escape(new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' }))} WAT`
             );
 
             // Send formatted response
@@ -1732,8 +1726,8 @@ export class TelegramBotController {
             const lines: string[] = [
                 '**Taken vs All Simulations**',
                 '',
-                `Total closed simulations: **${counts.totalSims.toLocaleString()}**`,
-                `Taken (filtered/executed): **${counts.takenSims.toLocaleString()}**`,
+                `Total closed simulations: **${this.escape((counts.totalSims.toLocaleString()))}**`,
+                `Taken \\(filtered/executed\\): **${this.escape(counts.takenSims.toLocaleString())}**`,
             ];
 
             // Only show percentage if we have valid data
@@ -1742,29 +1736,29 @@ export class TelegramBotController {
                     `Percentage taken: **${this.formatPercent(counts.takenPercentage, 1)}**`
                 );
             } else {
-                lines.push('Percentage taken: **N/A** (no simulations yet)');
+                lines.push('Percentage taken: **N/A** \\(no simulations yet\\)');
             }
 
             lines.push('');
 
             // Interpretation / context
             if (counts.takenSims === 0) {
-                lines.push('⚠️ No trades have passed the excursion filter yet.');
-                lines.push('This could mean: limited data, strict regime rules, or no strong signals.');
+                lines.push('⚠️ No trades have passed the excursion filter yet\\.');
+                lines.push('This could mean: limited data, strict regime rules, or no strong signals\\.');
             } else if (counts.takenPercentage < 20) {
-                lines.push('The filter is currently **very selective** (<20%).');
-                lines.push('This is good for quality — but may limit trade frequency.');
+                lines.push(this.escape('The filter is currently **very selective** (<20%).'));
+                lines.push('This is good for quality — but may limit trade frequency\\.');
             } else if (counts.takenPercentage > 60) {
-                lines.push('The filter is **quite permissive** (>60%).');
-                lines.push('Consider tightening regime rules if too many weak trades are passing.');
+                lines.push(this.escape('The filter is **quite permissive** (>60%).'));
+                lines.push('Consider tightening regime rules if too many weak trades are passing\\.');
             } else {
-                lines.push('The filter is moderately selective — balanced approach.');
+                lines.push('The filter is moderately selective — balanced approach\\.');
             }
 
             // Add freshness timestamp (helps user know data is current)
             lines.push('');
             lines.push(
-                `🕒 Stats as of ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`
+                `🕒 Stats as of ${this.escape(new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' }))} WAT`
             );
 
             // Send the formatted message
@@ -2434,10 +2428,16 @@ export class TelegramBotController {
     }
 
     private formatPercent(value: number, decimals = 1): string {
-        return value.toFixed(decimals) + '%';
+        return this.escape(value.toFixed(decimals) + '%');
     }
 
     private formatR(value: number): string {
-        return value.toFixed(2) + 'R';
+        return this.escape(value.toFixed(2) + 'R');
     }
+
+    private escape = (value: string | number | undefined): string => {
+        if (value === undefined || value === null) return '';
+        const str = String(value);
+        return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+    };
 }

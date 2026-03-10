@@ -143,7 +143,7 @@ export class AutoTradeService {
                 return;
             }
 
-            dbService.setSimulationTaken(correlationId); // Mark original sim as taken (for tracking)
+            void dbService.setSimulationTaken(correlationId); // Mark original sim as taken (for tracking)
 
             // Extract adjustments (ignore SL/TP multipliers, keep confidence boost)
             const { confidenceBoost = 0 } = advice.adjustments ?? {};

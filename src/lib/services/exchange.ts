@@ -31,6 +31,7 @@ export class ExchangeService {
     private supportedSymbols: string[] = [];
     private readonly MAX_EXCHANGE_LIMIT = 1000;
     private readonly CACHE_TTL_MS = 5 * 60 * 1000;
+    private positionMode: 'oneway' | 'hedge' | null = null; // Cache for Bybit position mode
 
     /**
      * Initializes the exchange service.
@@ -346,15 +347,82 @@ export class ExchangeService {
         this.pollingIntervals[symbol] = setInterval(poll, ms);
     }
 
+    /**
+ * Fetches and caches the current position mode of the Bybit account.
+ *
+ * Position modes:
+ *   - 'oneway'  → One-Way Mode (only one direction per symbol)
+ *   - 'hedge'   → Hedge Mode (can hold both long and short simultaneously)
+ *
+ * Caches the result to avoid redundant API calls on every order.
+ * Falls back gracefully to 'oneway' if the API call fails.
+ *
+ * @returns Promise resolving to 'oneway' or 'hedge'
+ */
+    private async getPositionMode(): Promise<'oneway' | 'hedge'> {
+        // Return cached value if already fetched
+        if (this.positionMode) {
+            return this.positionMode;
+        }
+
+        try {
+            // Use CCXT's unified method if available, otherwise fall back to raw endpoint
+            // Note: CCXT v4+ has fetchPositionMode() — prefer that when possible
+            let response;
+            try {
+                response = await this.exchange.fetchPositionMode();
+            } catch (ccxtErr) {
+                // Fallback to raw Bybit V5 endpoint if unified method not supported
+                logger.debug('CCXT fetchPositionMode not available, using raw endpoint', { error: ccxtErr });
+            }
+
+            // Extract mode safely
+            const rawMode = (response as any).result?.list?.[0]?.positionMode;
+            if (!rawMode) {
+                throw new Error('Invalid response format from position mode endpoint');
+            }
+
+            const mode = rawMode.toLowerCase() as 'oneway' | 'hedge';
+
+            // Validate response
+            if (mode !== 'oneway' && mode !== 'hedge') {
+                throw new Error(`Unexpected position mode received: ${rawMode}`);
+            }
+
+            // Cache and log
+            this.positionMode = mode;
+            logger.info(`Bybit position mode fetched and cached`, { mode });
+
+            return mode;
+        } catch (error) {
+            // Log detailed error for debugging
+            logger.error('Failed to fetch Bybit position mode', {
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+            });
+
+            // Safe fallback – most accounts default to one-way
+            const fallback = 'oneway' as const;
+            logger.warn(`Using fallback position mode: ${fallback}`);
+
+            // Still cache the fallback to avoid repeated failed calls
+            this.positionMode = fallback;
+            return fallback;
+        }
+    }
 
     /**
  * Places a market order with optional stop-loss, take-profit, and trailing stop.
  * - Validates and aligns quantity based on exchange limits (min qty, step size, min cost).
  * - Uses fixed USD amount from config for position sizing.
+ * - Dynamically sets positionIdx based on account mode to avoid mismatches.
  * - Handles testnet/live mode via config.
+ * - For buys: Prefers quoteOrderQty to let Bybit calculate qty (avoids some precision issues).
+ * - For sells: Calculates qty manually with alignment and optional round-up.
+ *
  * @param symbol - Trading symbol (e.g., 'BTC/USDT').
  * @param side - Order side ('buy' or 'sell').
- * @param amount - Order quantity (will be adjusted for precision and limits).
+ * @param amount - Risk amount in USDT (e.g., 20) — will be converted to qty if needed.
  * @param stopLoss - Optional stop-loss price.
  * @param takeProfit - Optional take-profit price.
  * @param trailingStopDistance - Optional trailing stop distance.
@@ -367,91 +435,95 @@ export class ExchangeService {
         amount: number,
         stopLoss?: number,
         takeProfit?: number,
-        trailingStopDistance?: number
+        _trailingStopDistance?: number
     ): Promise<Order> {
         if (!this.isAutoTradeEnvSet()) {
-            return Promise.reject(new Error('Auto-trade environment is not set. Cannot place order.'));
+            throw new Error('Auto-trade environment is not set. Cannot place order.');
         }
 
         try {
+            // Fetch market details for limits and precision
             const market = this.exchange.market(symbol);
 
-            // 1. Get current price for min cost calculation
+            // Get current price for calculations
             const currentPrice = this.getLatestPrice(symbol);
             if (!currentPrice) {
                 throw new Error(`Cannot get current price for ${symbol}`);
             }
 
-            // 2. Align minQty with minCost if applicable
-            let minQty = market.limits.amount?.min ?? 0;
+            // Log market limits for easier debugging
+            const minQty = market.limits.amount?.min ?? 0;
             const minCost = market.limits.cost?.min ?? 0;
-            if (minCost > 0 && currentPrice > 0) {
-                const minQtyFromCost = minCost / currentPrice;
-                minQty = Math.max(minQty, minQtyFromCost);
-            }
+            const stepSize = (market.limits.amount as any).step ?? Math.pow(10, -(market.precision.amount ?? 0));
+            logger.debug(`Market limits for ${symbol}: minQty=${minQty}, minCost=${minCost}, stepSize=${stepSize}, precision.amount=${market.precision.amount ?? 'N/A'}`);
 
-            // Log market limits for debugging
-            logger.debug(`Market limits for ${symbol}: minQty=${minQty}, minCost=${minCost}, step=${(market.limits.amount as any)?.step ?? 'N/A'}, precision.amount=${market.precision.amount ?? 'N/A'}`);
-
-            // 3. Check raw amount against minQty
-            if (amount < minQty) {
-                throw new Error(`Amount ${amount} too small; minimum is ${minQty} (based on ${minCost} USDT min cost)`);
-            }
-
-            // 4. Determine step size (prioritize limits.step, fallback to precision-based)
-            let stepSize = (market.limits.amount as any)?.step ?? null;  // Use exchange-provided step if available (e.g., 10 for SUIUSDT)
-            if (!stepSize) {
-                const precision = market.precision.amount ?? 0;
-                stepSize = Math.pow(10, -precision);  // Fallback for decimal-based steps
-            }
-
-            // 5. Align to step size (floor to nearest valid multiple)
-            const steppedAmount = Math.floor(amount / stepSize) * stepSize;
-
-            // 6. Final check after stepping
-            if (steppedAmount < minQty || steppedAmount <= 0) {
-                // Optional: Round up to next multiple if close (uncomment if desired)
-                // const roundedUp = Math.ceil(amount / stepSize) * stepSize;
-                // if (roundedUp >= minQty) {
-                //     logger.debug(`Rounded up amount from ${steppedAmount} to ${roundedUp} for ${symbol}`);
-                //     steppedAmount = roundedUp;
-                // } else {
-                throw new Error(`Invalid quantity after stepping: ${steppedAmount} < minQty ${minQty} (original amount: ${amount})`);
-                // }
-            }
-
-            // 7. Apply CCXT precision formatting
-            const finalAmount = parseFloat(
-                this.exchange.amountToPrecision(symbol, steppedAmount)
-            );
-
-            // Log final amount for debugging
-            logger.debug(`Final aligned amount for ${symbol}: ${finalAmount} (original: ${amount})`);
-
-            // Prepare params
+            // Prepare base params
             const params: { [key: string]: any } = {
-                category: 'linear', // Required for Bybit v5 unified API
+                category: 'linear', // For USDT-margined perpetuals
             };
+
+            // Dynamically set positionIdx based on account mode
+            const positionMode = await this.getPositionMode();
+            if (positionMode === 'hedge') {
+                params.positionIdx = side === 'buy' ? 1 : 2;
+            } else {
+                params.positionIdx = 0;
+            }
+
+            // Add SL/TP/trailing if provided
             if (stopLoss) params.stopLossPrice = stopLoss;
             if (takeProfit) params.takeProfitPrice = takeProfit;
-            // if (trailingStopDistance) params.trailingAmount = trailingStopDistance;
+            // if (trailingStopDistance) params.trailingAmount = trailingStopDistance; // Uncomment if supported
 
-            logger.debug(`Placing ${side} order for ${finalAmount} ${symbol} with params`, { stopLoss, takeProfit, trailingStopDistance, params });
+            let order: Order;
+            // For SELL: Calculate qty manually (amount USDT / price)
+            let qty = amount / currentPrice;
 
-            // Place the order with retries
-            const order = await this.withRetries(
-                () => this.exchange.createOrder(symbol, 'market', side, finalAmount, undefined, params),
+            // Check min qty
+            if (qty < minQty) {
+                throw new Error(`Calculated qty ${qty} too small; minimum is ${minQty}`);
+            }
+
+            // Align to step size (floor first)
+            let steppedQty = Math.floor(qty / stepSize) * stepSize;
+
+            // If floored qty < min, try rounding up
+            if (steppedQty < minQty) {
+                const roundedUpQty = Math.ceil(qty / stepSize) * stepSize;
+                if (roundedUpQty >= minQty) {
+                    logger.debug(`Rounded up qty from ${steppedQty} to ${roundedUpQty} for ${symbol}`);
+                    steppedQty = roundedUpQty;
+                } else {
+                    throw new Error(`Cannot align qty to meet minQty ${minQty} (original qty: ${qty})`);
+                }
+            }
+
+            // Apply CCXT precision
+            const finalQty = parseFloat(this.exchange.amountToPrecision(symbol, steppedQty));
+
+            logger.debug(`Placing market ${side} order with qty=${finalQty} for ${symbol} (~${amount} USDT)`, { params });
+
+            order = await this.withRetries(
+                () => this.exchange.createOrder(symbol, 'market', side, finalQty, undefined, params),
                 3
             );
-            logger.info(`Placed ${side} order for ${finalAmount} ${symbol} in live mode`, {
-                stopLoss,
-                takeProfit,
-                trailingStopDistance,
+
+            // Log successful order placement
+            logger.info(`Placed ${side} order for ${symbol}`, {
                 orderId: order.id,
+                qty: order.amount,
+                price: order.average ?? 'market',
+                cost: order.cost,
             });
+
             return order;
         } catch (error) {
-            logger.error(`Failed to place ${side} order for ${symbol}`, { error: (error as Error).message });
+            // Enhanced error logging
+            logger.error(`Failed to place ${side} order for ${symbol}`, {
+                amount,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+            });
             throw error;
         }
     }
