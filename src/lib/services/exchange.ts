@@ -25,12 +25,11 @@ interface CacheEntry {
  */
 export class ExchangeService {
     private exchange: Exchange;
-    private primaryOhlcvData: { [symbol: string]: OHLCV[] } = {};
+    // private primaryOhlcvData: { [symbol: string]: OHLCV[] } = {};
     private ohlcvCache: { [symbol: string]: { [timeframe: string]: CacheEntry } } = {};
     private pollingIntervals: { [symbol: string]: NodeJS.Timeout } = {};
     private supportedSymbols: string[] = [];
     private readonly MAX_EXCHANGE_LIMIT = 1000;
-    private readonly CACHE_TTL_MS = 5 * 60 * 1000;
     private positionMode: 'oneway' | 'hedge' | null = null; // Cache for Bybit position mode
 
     /**
@@ -108,33 +107,127 @@ export class ExchangeService {
     }
 
     /**
-     * Starts polling OHLCV data for a specific symbol.
-     * - Fetches data at the configured primary timeframe and updates `primaryOhlcvData`.
-     * - Implements retry logic for transient errors and stops polling on max retries.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @private
-     */
+ * Starts polling OHLCV data for all configured symbols on the required timeframes.
+ *
+ * Actively polled timeframes:
+ *   - primaryTimeframe (e.g. '5m')   → live signal generation
+ *   - '1m'                           → simulation, excursion calc, precise backtesting
+ *
+ * Behavior:
+ *   - One repeating timer per (symbol + timeframe) combination
+ *   - Idempotent: safe to call multiple times (won't create duplicate timers)
+ *   - Initial fetch happens immediately
+ *   - Data is stored in this.primaryOhlcvData[`${symbol}:${tf}`]
+ */
     private startPolling(): void {
         const symbols = config.symbols;
-        const timeframe = config.scanner.primaryTimeframe;
+
+        // Which timeframes to poll continuously
+        const timeframesToPoll = [
+            config.scanner.primaryTimeframe,   // e.g. '5m' or '3m'
+            config.scanner.simulationTimeframe,                              // high-res for simulation / MAE/MFE
+        ];
+
+        let timersStarted = 0;
 
         symbols.forEach(symbol => {
-            logger.info(`Started polling for ${symbol} on ${timeframe}`);
-            this.pollSymbol(symbol, timeframe);
+            timeframesToPoll.forEach(tf => {
+                const key = `${symbol}:${tf}`;
+
+                // Prevent duplicate timers
+                if (this.pollingIntervals[key]) {
+                    logger.debug(`Polling already running for ${key} — skipping`);
+                    return;
+                }
+
+                // How often to fetch (in ms)
+                const intervalMs = ExchangeService.toTimeframeMs(tf);
+
+                // The actual polling function
+                const poll = async () => {
+                    try {
+                        const candles = await this.withRetries(
+                            () => this.exchange.fetchOHLCV(
+                                symbol,
+                                tf,
+                                undefined,
+                                config.historyLength + 20   // small buffer
+                            ),
+                            3
+                        );
+
+                        if (candles.length === 0) {
+                            logger.warn(`No candles returned for ${key}`);
+                            return;
+                        }
+
+                        // Keep only recent history (saves memory)
+                        const trimmed = candles.slice(-config.historyLength);
+
+                        // Store under composite key
+                        if (!this.ohlcvCache[symbol]) {
+                            this.ohlcvCache[symbol] = {};
+                        }
+                        this.ohlcvCache[symbol][tf] = {
+                            data: trimmed,
+                            timestamp: Date.now(),
+                        };
+
+                        logger.debug(`Polled ${trimmed.length} ${tf} candles for ${symbol}`);
+
+                    } catch (err) {
+                        logger.error(`Polling failed ${key}`, {
+                            error: err instanceof Error ? err.message : String(err)
+                        });
+                    }
+                };
+
+                // Run once immediately
+                poll().catch(err =>
+                    logger.error(`Initial poll failed ${key}`, { error: err })
+                );
+
+                // Then schedule repeating
+                this.pollingIntervals[key] = setInterval(poll, intervalMs);
+
+                timersStarted++;
+            });
         });
+
+        if (timersStarted > 0) {
+            logger.info(
+                `Started ${timersStarted} polling timer(s) ` +
+                `for ${symbols.length} symbol(s) × ${timeframesToPoll.length} timeframe(s)`
+            );
+        } else {
+            logger.warn("No polling timers started — check symbols / timeframes config");
+        }
     }
 
     /**
-     * Stops polling OHLCV data for a specific symbol.
-     * - Clears the polling interval and removes it from `pollingIntervals`.
-     * @param symbol - Trading symbol (e.g., 'BTC/USDT').
-     * @private
-     */
+ * Stops all OHLCV polling for a specific symbol across all timeframes.
+ * Clears all related interval timers and removes them from pollingIntervals.
+ *
+ * @param symbol - Trading symbol (e.g., 'BTC/USDT')
+ */
     private stopPolling(symbol: string): void {
-        if (this.pollingIntervals[symbol]) {
-            clearInterval(this.pollingIntervals[symbol]);
-            delete this.pollingIntervals[symbol];
-            logger.info(`[${symbol}] Polling stopped`);
+        const stopped: string[] = [];
+
+        // Find and clear all intervals that belong to this symbol
+        Object.keys(this.pollingIntervals).forEach(key => {
+            if (key.startsWith(`${symbol}:`)) {
+                clearInterval(this.pollingIntervals[key]);
+                delete this.pollingIntervals[key];
+                stopped.push(key);
+            }
+        });
+
+        if (stopped.length > 0) {
+            logger.info(`Stopped polling for ${symbol} (${stopped.length} timeframes)`, {
+                timeframes: stopped.map(k => k.split(':')[1])
+            });
+        } else {
+            logger.debug(`No active polling found for ${symbol}`);
         }
     }
 
@@ -166,16 +259,16 @@ export class ExchangeService {
     }
 
     /**
- * Fetches OHLCV (Open-High-Low-Close-Volume) data for a given symbol and timeframe.
- * Prioritizes live polling data, then cache, and falls back to a fresh exchange fetch.
+ * Fetches OHLCV data for a symbol and timeframe.
  *
- * @param symbol The trading pair (e.g., 'BTC/USDT').
- * @param timeframe The candlestick interval (e.g., '1h', '1d').
- * @param since Optional: Fetch candles from this Unix timestamp (ms). Disables simple caching.
- * @param until Optional: Fetch candles up to this Unix timestamp (ms). Disables simple caching.
- * @param forceRefresh Optional: If true, bypasses cache and live data checks.
- * @returns A Promise that resolves to the processed OhlcvData object.
- * @throws An error if the symbol is invalid, the data fetch fails, or data integrity checks fail.
+ * Data priority (after validation):
+ *  1. Recently cached data (with different freshness rules for polled vs on-demand timeframes)
+ *  2. Fresh fetch from exchange
+ *
+ * @remarks
+ * - Polled timeframes (1m + primary) should have short effective TTL because polling writes frequently
+ * - Higher timeframes (1h, 4h, etc.) get special staleness check based on last candle timestamp
+ * - Historical queries (since/until) always bypass cache
  */
     public async getOHLCV(
         symbol: string,
@@ -185,10 +278,10 @@ export class ExchangeService {
         forceRefresh = false
     ): Promise<OhlcvData> {
         const cacheKey = `${symbol}:${timeframe}`;
-        const isHistoricalQuery = since || until; // Flag for queries that look for a specific range
+        const isHistoricalQuery = !!(since || until);
 
         try {
-            // --- 1. Validate Symbol ---
+            // 1. Symbol validation
             if (!(await this.validateSymbol(symbol))) {
                 logger.error(`Invalid symbol: ${symbol}`);
                 throw new Error(`Symbol ${symbol} is not supported`);
@@ -196,96 +289,114 @@ export class ExchangeService {
 
             const now = Date.now();
 
-            // --- 2. Live Data Check (Only for non-historical, non-forced-refresh queries) ---
-            if (!forceRefresh && !isHistoricalQuery && this.primaryOhlcvData[symbol]) {
-                const liveData = this.primaryOhlcvData[symbol];
-                // Check if the live-polled data meets the minimum history length
-                if (liveData.length >= config.historyLength) {
-                    logger.debug(`Using live polling data for ${cacheKey}`);
-                    return this.toOhlcvData(liveData, symbol);
+            // ────────────────────────────────────────────────────────────────
+            //  Try to serve from cache (unless historical / force refresh)
+            // ────────────────────────────────────────────────────────────────
+            if (!forceRefresh && !isHistoricalQuery) {
+                const entry = this.ohlcvCache[symbol]?.[timeframe];
+
+                if (entry) {
+                    const cacheAgeMs = now - entry.timestamp;
+
+                    let isAcceptable = false;
+
+                    // 1h timeframe → check actual candle age (more important than cache write time)
+                    if (timeframe === '1h') {
+                        const lastCandleTime = entry.data.at(-1)?.[0];
+                        if (typeof lastCandleTime === 'number') {
+                            const candleAgeMs = now - lastCandleTime;
+                            isAcceptable = candleAgeMs <= 35 * 60_000; // ~35 min — slightly over 1 candle
+                        }
+                    }
+                    // Other timeframes — normal TTL check based on cache write time
+                    else {
+                        isAcceptable = cacheAgeMs < ExchangeService.toTimeframeMs(timeframe) + 30_000;
+                    }
+
+                    if (isAcceptable) {
+                        logger.debug(`Cache hit (acceptable freshness) → ${cacheKey}`);
+                        return this.toOhlcvData(entry.data, symbol);
+                    }
                 }
             }
 
-            // --- 3. Cache Check (Only for non-historical, non-forced-refresh queries) ---
-            const cache = this.ohlcvCache[symbol]?.[timeframe];
-            const isCacheValid = cache && now - cache.timestamp < this.CACHE_TTL_MS;
-
-            if (!forceRefresh && !isHistoricalQuery && isCacheValid) {
-                logger.debug(`Returning valid cached OHLCV for ${cacheKey}`);
-                return this.toOhlcvData(cache.data, symbol);
+            // ────────────────────────────────────────────────────────────────
+            //  Clear cache if forceRefresh requested
+            // ────────────────────────────────────────────────────────────────
+            if (forceRefresh && this.ohlcvCache[symbol]?.[timeframe]) {
+                logger.debug(`Force refresh → clearing cache ${cacheKey}`);
+                delete this.ohlcvCache[symbol]![timeframe];
             }
 
-            // --- 4. Force Refresh: Clear Cache if requested ---
-            if (forceRefresh && cache) {
-                logger.debug(`Force refreshing and clearing OHLCV cache for ${cacheKey}`);
-                delete this.ohlcvCache[symbol][timeframe];
-            }
-
-            // --- 5. Fetch Data from Exchange ---
+            // ────────────────────────────────────────────────────────────────
+            //  Fetch from exchange
+            // ────────────────────────────────────────────────────────────────
             const fetchLimit = this.MAX_EXCHANGE_LIMIT;
-            // The 'until' parameter is non-standard but supported by some CCXT-like exchanges;
-            // we pass it in 'params' if it exists.
-            const params = until ? { until } : {};
+            const params: any = until ? { until } : {};
 
-            // Use withRetries wrapper for robustness against temporary network/exchange issues
             const rawCandles = await this.withRetries(
-                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, { ...params }),
-                3 // Retry up to 3 times
+                () => this.exchange.fetchOHLCV(symbol, timeframe, since, fetchLimit, params),
+                3
             );
 
-            // --- 6. Handle Empty Result ---
             if (rawCandles.length === 0) {
-                logger.warn(`No candles returned for ${cacheKey} (since: ${since}, until: ${until})`);
+                logger.warn(`No candles returned for ${cacheKey} (since: ${since ?? 'unset'}, until: ${until ?? 'unset'})`);
                 return this.toOhlcvData([]);
             }
 
-            // Ensure data is sorted by timestamp (ascending) as required for processing
+            // Sort just in case (some exchanges occasionally return out-of-order)
             rawCandles.sort((a, b) => (a[0] as number) - (b[0] as number));
 
-            logger.info(`Fetched ${rawCandles.length} candles for ${cacheKey}. ` +
-                `Range: ${new Date(rawCandles[0][0] as number).toISOString()} to ${new Date(rawCandles.at(-1)![0] as number).toISOString()}`);
+            logger.info(`Fetched ${rawCandles.length} candles → ${cacheKey} ` +
+                `range: ${new Date(rawCandles[0][0] as number).toISOString()} → ${new Date(rawCandles.at(-1)![0] as number).toISOString()}`);
 
             const result = this.toOhlcvData(rawCandles, symbol);
 
-            // --- 7. Data Integrity Validation ---
-            // Check for NaN, non-positive High/Low/Close, or negative Volume
-            const isDataInvalid =
+            // ────────────────────────────────────────────────────────────────
+            //  Integrity validation (unchanged)
+            // ────────────────────────────────────────────────────────────────
+            const isInvalid =
                 result.timestamps.some(t => isNaN(t)) ||
                 result.highs.some(h => isNaN(h) || h <= 0) ||
                 result.lows.some(l => isNaN(l) || l <= 0) ||
                 result.closes.some(c => isNaN(c) || c <= 0) ||
                 result.volumes.some(v => isNaN(v) || v < 0);
 
-            if (isDataInvalid) {
-                logger.error(`Invalid OhlcvData for ${cacheKey}: Contains NaN, non-positive prices, or negative volume`);
-                throw new Error('Invalid OhlcvData: Contains NaN or problematic values');
+            if (isInvalid) {
+                logger.error(`Invalid OHLCV data for ${cacheKey}: NaN / non-positive values`);
+                throw new Error('Invalid OHLCV data: contains NaN or problematic values');
             }
 
-            // Check for strictly ascending timestamp order
             for (let i = 1; i < result.timestamps.length; i++) {
                 if (result.timestamps[i]! <= result.timestamps[i - 1]!) {
-                    logger.error(`Timestamp order validation failed for ${cacheKey}: Detected non-ascending timestamp at index ${i}`);
+                    logger.error(`Non-ascending timestamps in ${cacheKey} at index ${i}`);
                     throw new Error('Timestamps not in strictly ascending order');
                 }
             }
 
-            // --- 8. Update Cache (Only for default, non-historical, non-forced-refresh queries) ---
+            // ────────────────────────────────────────────────────────────────
+            //  Cache the result (only for "current" queries)
+            // ────────────────────────────────────────────────────────────────
             if (!isHistoricalQuery && !forceRefresh) {
                 if (!this.ohlcvCache[symbol]) this.ohlcvCache[symbol] = {};
                 this.ohlcvCache[symbol][timeframe] = {
                     data: rawCandles,
-                    timestamp: now
+                    timestamp: now,
                 };
-                logger.debug(`Cached new OHLCV data for ${cacheKey}`);
+                logger.debug(`Cached fresh data → ${cacheKey}`);
             }
 
             return result;
 
-        } catch (error: any) {
-            // --- 9. Error Handling ---
-            logger.error(`Error fetching OHLCV for ${cacheKey}`, { error: error.message, stack: error.stack });
-            // Re-throw the error to be handled by the caller
-            throw error;
+        } catch (err: any) {
+            logger.error(`getOHLCV failed → ${cacheKey}`, {
+                error: err.message,
+                stack: err.stack ?? undefined,
+                since,
+                until,
+                forceRefresh,
+            });
+            throw err;
         }
     }
 
@@ -302,49 +413,13 @@ export class ExchangeService {
         }
     }
 
-    public getPrimaryOhlcvData(symbol: string): OHLCV[] | undefined {
-        return this.primaryOhlcvData[symbol];
-    }
-
     /**
- * Polls OHLCV data for a single symbol at regular intervals.
- * - Updates live in-memory primary data for strategy/scanner use.
- * - Persists to database: full history on first poll, only new candles on subsequent polls.
- * - Uses per-symbol tracking of last persisted timestamp to avoid duplicates and overload.
- * @param symbol Trading symbol
- * @param timeframe Candlestick timeframe
- * @private
+ * Fast path: returns raw OHLCV array from cache for primary timeframe if available
+ * Returns undefined if missing, empty or not present.
  */
-    private async pollSymbol(symbol: string, timeframe: string): Promise<void> {
-        const ms = ExchangeService.toTimeframeMs(timeframe);
-        const historyLength = config.historyLength;
-
-        // Per-symbol tracker: last timestamp successfully persisted to DB
-        // let lastPersistedTimestamp = 0;
-
-        const poll = async () => {
-            try {
-                // Fetch latest candles from exchange
-                const candles = await this.exchange.fetchOHLCV(symbol, timeframe, undefined, historyLength);
-
-                if (candles.length === 0) {
-                    logger.warn(`No candles received during poll for ${symbol}`);
-                    return;
-                }
-
-                // Update live in-memory data (used by strategy, scanner, alerts)
-                this.primaryOhlcvData[symbol] = candles;
-
-            } catch (error) {
-                logger.error(`Polling failed for ${symbol} ${timeframe}`, { error });
-            }
-        };
-
-        // Initial poll: bootstraps full history if DB is empty
-        await poll();
-
-        // Schedule recurring polls
-        this.pollingIntervals[symbol] = setInterval(poll, ms);
+    public getPrimaryOhlcvData(symbol: string): OHLCV[] | undefined {
+        const tf = config.scanner.primaryTimeframe;
+        return this.ohlcvCache[symbol]?.[tf]?.data ?? undefined;
     }
 
     /**
@@ -371,13 +446,14 @@ export class ExchangeService {
             let response;
             try {
                 response = await this.exchange.fetchPositionMode();
+                logger.error('Fetched position mode using CCXT unified method', { response });
             } catch (ccxtErr) {
                 // Fallback to raw Bybit V5 endpoint if unified method not supported
                 logger.debug('CCXT fetchPositionMode not available, using raw endpoint', { error: ccxtErr });
             }
 
             // Extract mode safely
-            const rawMode = (response as any).result?.list?.[0]?.positionMode;
+            const rawMode = (response as any)?.result?.data?.mode || (response as any)?.mode; // Try both possible paths
             if (!rawMode) {
                 throw new Error('Invalid response format from position mode endpoint');
             }
@@ -673,41 +749,6 @@ export class ExchangeService {
     }
 
     /**
-     * NEW: Persists fetched OHLCV data to the database for historical backtesting.
-     * - Assumes a table `ohlcv_history` exists in the schema (e.g., with columns: symbol, timeframe, timestamp, open, high, low, close, volume).
-     * - Uses batch insert or upsert to avoid duplicates (based on symbol + timeframe + timestamp unique key).
-     * - Fire-and-forget: Non-blocking, logs errors but doesn't throw to avoid disrupting fetching.
-     * @param symbol - Trading symbol.
-     * @param timeframe - Timeframe string.
-     * @param candles - Array of OHLCV data to store.
-     * @private
-     */
-    // private async persistOhlcvToDb(symbol: string, timeframe: string, candles: OHLCV[]): Promise<void> {
-    //     try {
-    //         // Prepare batch data for insertion (convert to DB-friendly format)
-    //         const records = candles.map(candle => ({
-    //             symbol,
-    //             timeframe,
-    //             timestamp: Number(candle[0]),  // Unix ms
-    //             open: Number(candle[1]),
-    //             high: Number(candle[2]),
-    //             low: Number(candle[3]),
-    //             close: Number(candle[4]),
-    //             volume: Number(candle[5]),
-    //         }));
-
-    //         // Use dbService to batch insert/upsert (assuming a method like batchInsertOhlcv exists in dbService)
-    //         // If not, implement it in db/index.ts with Drizzle's batch insert on duplicate key update.
-    //         await dbService.batchInsertOhlcv(records);
-
-    //         logger.debug(`Persisted ${records.length} OHLCV candles for ${symbol} on ${timeframe} to DB`);
-    //     } catch (error) {
-    //         logger.error(`Failed to persist OHLCV for ${symbol} on ${timeframe} to DB`, { error });
-    //         // Non-fatal: Continue without throwing
-    //     }
-    // }
-
-    /**
      * Executes a function with retry logic for transient errors.
      * - Uses exponential back-off for retries.
      * @param fn - The async function to execute.
@@ -768,7 +809,7 @@ export class ExchangeService {
      * @returns {number | null} Latest closing price or null if unavailable.
      */
     public getLatestPrice(symbol: string): number | null {
-        const candles = this.primaryOhlcvData[symbol];
+        const candles = this.getPrimaryOhlcvData(symbol);
         if (candles && candles.length > 0) {
             const close = candles[candles.length - 1][4];
             logger.debug(`Latest price for ${symbol}: ${close}`);
@@ -792,7 +833,7 @@ export class ExchangeService {
      * @returns {boolean} True if initialized (has OHLCV data), false otherwise.
      */
     public isInitialized(): boolean {
-        const initialized = Object.keys(this.primaryOhlcvData).length > 0;
+        const initialized = Object.keys(this.ohlcvCache).length > 0;
         logger.debug(`ExchangeService initialized: ${initialized}`);
         return initialized;
     }

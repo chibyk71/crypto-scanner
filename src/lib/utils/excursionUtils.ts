@@ -69,6 +69,8 @@ export interface ExcursionAdvice {
      * - 'skip'    → no trade/alert (insufficient side samples or poor regime)
      */
     action: ExcursionAction;
+
+    score: number; // Added score to the interface for better integration with AutoTradeService
 }
 
 /**
@@ -165,7 +167,8 @@ export function getExcursionAdvice(
                 tpMultiplier: 1.0,
                 confidenceBoost: -0.30
             },
-            action: 'skip'
+            action: 'skip',
+            score: 0 // Added score for consistency, even in skip cases
         };
     }
 
@@ -183,7 +186,8 @@ export function getExcursionAdvice(
                 tpMultiplier: 1.0,
                 confidenceBoost: -0.40
             },
-            action: 'skip'
+            action: 'skip',
+            score: 0
         };
     }
 
@@ -214,7 +218,8 @@ export function getExcursionAdvice(
                 tpMultiplier: 1.0,
                 confidenceBoost: -0.35 // stronger penalty than combined-only
             },
-            action: 'skip'
+            action: 'skip',
+            score: 0
         };
     }
 
@@ -236,7 +241,8 @@ export function getExcursionAdvice(
                 tpMultiplier: 1.0,
                 confidenceBoost: -0.30
             },
-            action: 'skip'
+            action: 'skip',
+            score: 0
         };
     }
 
@@ -272,7 +278,8 @@ export function getExcursionAdvice(
     return {
         advice: finalAdvice,
         adjustments: adviceResult.adjustments,
-        action: adviceResult.action
+        action: adviceResult.action,
+        score: scoreResult.totalScore // Pass the computed score for better integration with AutoTradeService
     };
 }
 
@@ -524,7 +531,8 @@ function mapScoreToAdvice(
                 tpMultiplier: 1.0,
                 confidenceBoost: -0.30,
             },
-            action: 'skip'
+            action: 'skip',
+            score: 0
         };
     }
 
@@ -613,7 +621,8 @@ function mapScoreToAdvice(
             tpMultiplier: tpMult,
             confidenceBoost: confBoost,
         },
-        action
+        action,
+        score: finalScore
     };
 }
 

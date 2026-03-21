@@ -2182,187 +2182,384 @@ export class TelegramBotController {
         }, 5 * 60 * 1000);
     }
 
+
     /**
      * Sends a formatted Telegram alert for a generated signal.
      *
-     * UPDATED DESIGN (2026+ pure directional):
-     *   • Receives FINAL adjusted TradeSignal from AutoTradeService (may be reversed)
-     *   • Direction, SL/TP, confidence, reason[] are final (post-excursion)
-     *   • Regime summary & individual sims are fetched fresh (always up-to-date)
-     *   • Pure directional: all stats (MFE/MAE/ratio/duration/outcomes) from buy/sell aggregates only
-     *   • No combined MFE/MAE/ratio/win rate — only total sample count for context
-     *   • Shows both sides separately (transparency)
-     *   • Lists all recent individual simulations (up to 10) with full details
-     *   • Alert sent even in simulation-only mode or on skip (with "Skipped" note)
+     * REDESIGNED (2026+ pure directional):
+     *   • Compact single-line header (direction · symbol · price)
+     *   • Last 2 same-direction sims with outcome + MFE/MAE (SL streak context)
+     *   • Regime score number surfaced alongside buy/sell header
+     *   • MFE/MAE thresholds lowered to scalping scale (≥0.15% not ≥0.5%)
+     *   • "MFE arrives first %" shown per side
+     *   • Thin-data warning when side samples < MIN_RELIABLE_SAMPLES
+     *   • Trailing stop, boilerplate reasons, and confidence boost removed
+     *   • All regime stats pure directional (no combined averages)
      *
-     * @param symbol Trading pair (e.g. 'BTC/USDT')
-     * @param signal FINAL adjusted TradeSignal (post-excursion)
-     * @param price Current price at signal time
-     * @param tradeExecuted Flag if a live order was placed (default: true)
+     * @param symbol         Trading pair (e.g. 'BTC/USDT')
+     * @param signal         FINAL adjusted TradeSignal (post-excursion, may be reversed)
+     * @param price          Current price at signal time
+     * @param regimeScore    Optional: score from computeRegimeScore() — pass from AutoTradeService
+     * @param tradeExecuted  Whether a live order was placed (default: true)
      */
     public async sendSignalAlert(
         symbol: string,
         signal: TradeSignal,
         price: number,
+        regimeScore?: number,          // NEW: pass from AutoTradeService after getExcursionAdvice()
         tradeExecuted: boolean = true
     ): Promise<void> {
-        // Robust MarkdownV2 escape
-        const escape = (value: string | number | undefined): string => {
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // HELPERS
+        // ─────────────────────────────────────────────────────────────────────────
+
+        /** Escape all MarkdownV2 special characters */
+        const esc = (value: string | number | undefined): string => {
             if (value === undefined || value === null) return '';
-            const str = String(value);
-            return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            return String(value).replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
         };
+
+        /** Format a percentage for display — always 2dp, sign-aware */
+        const pct = (value: number, showPlus = false): string => {
+            const sign = showPlus && value > 0 ? '+' : '';
+            return `${sign}${value.toFixed(2)}%`;
+        };
+
+        /** Outcome → compact emoji + label */
+        const outcomeEmoji = (outcome: string): string => {
+            switch (outcome) {
+                case 'tp': return '✅ tp';
+                case 'partial_tp': return '✅ partial\\_tp';
+                case 'sl': return '❌ sl';
+                case 'timeout': return '⏱ timeout';
+                default: return '— unknown';
+            }
+        };
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // CONSTANTS
+        // ─────────────────────────────────────────────────────────────────────────
+
+        /** Sides with fewer than this many samples get a "thin data" warning */
+        const MIN_RELIABLE_SAMPLES = 7;
+
+        /** MFE/MAE display threshold — show even small values at scalping scale */
+        const MIN_DISPLAY_PCT = 0.15;
 
         const lines: string[] = [];
 
-        // ── Top note if no live trade placed or skipped ────────────────────────────────
+        // ─────────────────────────────────────────────────────────────────────────
+        // 1. COMPACT HEADER — direction · symbol · price on one line
+        // ─────────────────────────────────────────────────────────────────────────
+        const dirEmoji = signal.signal === 'buy' ? '🟢' : '🔴';
+        const dirLabel = signal.signal === 'buy' ? 'LONG' : 'SHORT';
+        const wasReversed = signal.reason?.some(r =>
+            r.includes('REVERSED') || r.includes('reverse')
+        ) ?? false;
+        const reversedTag = wasReversed ? ' ↔️ _REVERSED_' : '';
+
         if (!tradeExecuted) {
-            lines.push('🔔 **SIGNAL ALERT ONLY** \\(auto\\-trade disabled or skipped\\)');
+            lines.push('🔔 _SIGNAL ONLY \\(auto\\-trade off\\)_');
         }
 
-        // ── Header with final direction + reversal tag ─────────────────────────────────
-        const signalEmoji =
-            signal.signal === 'buy' ? '🟢 LONG' :
-                signal.signal === 'sell' ? '🔴 SHORT' : '🟡 HOLD';
+        lines.push(
+            `${dirEmoji} *${dirLabel}${reversedTag}* · ${esc(symbol)} · \\$${esc(price.toFixed(6))}`
+        );
 
-        const wasReversed = signal.reason.some(r => r.includes('REVERSED') || r.includes('reverse'));
+        // ─────────────────────────────────────────────────────────────────────────
+        // 2. KEY LEVELS — SL / TP / R:R on one line
+        // ─────────────────────────────────────────────────────────────────────────
+        const slStr = signal.stopLoss
+            ? `SL \\$${esc(signal.stopLoss.toFixed(6))}`
+            : 'SL —';
 
-        lines.push(`**${signalEmoji} SIGNAL** ${wasReversed ? '↔️ REVERSED ' : ''}${escape(symbol)}`);
-        lines.push(`**Price:** $${escape(price.toFixed(6))}`);
+        const tpStr = signal.takeProfit
+            ? `TP \\$${esc(signal.takeProfit.toFixed(6))}`
+            : 'TP —';
 
-        // ── Confidence & key levels ────────────────────────────────────────────────────
+        const rrStr = signal.takeProfit && signal.stopLoss && price !== signal.stopLoss
+            ? ` · ${esc(
+                Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
+            )}R`
+            : '';
+
+        lines.push(`${slStr} · ${tpStr}${rrStr}`);
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // 3. CONFIDENCE — only if meaningful (skip internal boilerplate reasons)
+        // ─────────────────────────────────────────────────────────────────────────
+        const confParts: string[] = [];
         if (signal.confidence > 0) {
-            lines.push(`**Confidence:** ${escape(signal.confidence.toFixed(1))}%`);
+            confParts.push(`${esc(signal.confidence.toFixed(1))}%`);
         }
-
         if (signal.mlConfidence !== undefined) {
-            lines.push(`**ML Confidence:** ${escape(signal.mlConfidence.toFixed(1))}%`);
+            confParts.push(`ML ${esc(signal.mlConfidence.toFixed(1))}%`);
+        }
+        if (confParts.length > 0) {
+            lines.push(`⚡ Confidence: ${confParts.join(' · ')}`);
         }
 
-        if (signal.stopLoss) {
-            lines.push(`**SL:** $${escape(signal.stopLoss.toFixed(6))}`);
-        }
+        // ─────────────────────────────────────────────────────────────────────────
+        // 4. TECHNICAL REASONS — compact, strip boilerplate
+        // ─────────────────────────────────────────────────────────────────────────
+        const BOILERPLATE_PATTERNS = [
+            /Fixed.*leverage/i,
+            /Confidence boost/i,
+            /R:R/i,
+            /excursion/i,        // regime summary already shown below
+        ];
 
-        if (signal.takeProfit) {
-            const rrApprox = signal.takeProfit && signal.stopLoss
-                ? Math.abs((signal.takeProfit - price) / (price - signal.stopLoss)).toFixed(1)
-                : 'N/A';
-
-            lines.push(`**TP:** $${escape(signal.takeProfit.toFixed(6))} \\(≈${escape(rrApprox)}R\\)`);
-        }
-
-        if (signal.trailingStopDistance) {
-            lines.push(`**Trailing:** ${escape(signal.trailingStopDistance.toFixed(6))}`);
-        }
-
-        // ── FETCH FRESH REGIME ─────────────────────────────────────────────────────────
+        // ─────────────────────────────────────────────────────────────────────────
+        // 5. REGIME DATA
+        // ─────────────────────────────────────────────────────────────────────────
         const regime = excursionCache.getRegime(symbol);
 
+        lines.push('');
+
         if (!regime || regime.recentSampleCount === 0) {
-            lines.push('');
-            lines.push('**No recent regime data** – limited history');
+            lines.push('📊 _No regime data yet_');
         } else {
-            // ── TOTAL SIMS CONTEXT (combined count only – no other combined stats) ──────
             const totalSims = regime.recentSampleCount;
             const buySims = regime.buy?.sampleCount ?? 0;
             const sellSims = regime.sell?.sampleCount ?? 0;
 
-            lines.push('');
-            lines.push(`**Total recent sims:** ${totalSims} \\(Buys: ${buySims}, Sells: ${sellSims}\\)`);
+            lines.push(`📊 *Regime* — ${totalSims} sims \\(${buySims} buy / ${sellSims} sell\\)`);
 
-            // ── BUY / LONG SIDE ─────────────────────────────────────────────────────────
+            // ── 5a. LAST 2 SAME-DIRECTION SIMS ─────────────────────────────────
+            // Pull from historyJson, filter to signal direction, take most recent 2
+            const signalDir = signal.signal === 'buy' ? 'buy' : 'sell';
+
+            const recentSameSide: Array<{
+                outcome: string;
+                mfe: number;
+                mae: number;
+                label: number;
+            }> = [];
+
+            if ('historyJson' in regime && Array.isArray(regime.historyJson)) {
+                const filtered = regime.historyJson
+                    .filter(e => e.direction === signalDir)
+                    .slice(0, 2);   // historyJson is already newest-first
+
+                for (const e of filtered) {
+                    recentSameSide.push({
+                        outcome: e.outcome,
+                        mfe: e.mfe ?? 0,     // already in % (boundedMfe from simulator)
+                        mae: e.mae ?? 0,     // already in % (boundedMae, negative)
+                        label: e.label,
+                    });
+                }
+            }
+
+            if (recentSameSide.length > 0) {
+                lines.push('');
+                lines.push(`*Last ${recentSameSide.length} ${signalDir} sim${recentSameSide.length > 1 ? 's' : ''}:*`);
+
+                recentSameSide.forEach((sim, idx) => {
+                    const mfeStr = Math.abs(sim.mfe) >= MIN_DISPLAY_PCT
+                        ? ` MFE ${esc(pct(sim.mfe, true))}`
+                        : '';
+                    const maeStr = Math.abs(sim.mae) >= MIN_DISPLAY_PCT
+                        ? ` MAE ${esc(pct(sim.mae))}`
+                        : '';
+
+                    lines.push(
+                        `  ${idx === 0 ? '→' : '  '} ${outcomeEmoji(sim.outcome)}${mfeStr}${maeStr} \\(label ${sim.label >= 0 ? '\\+' : ''}${sim.label}\\)`
+                    );
+                });
+            }
+
+            // ── 5b. SL STREAK WARNING ───────────────────────────────────────────
+            const slStreak = signal.signal === 'buy'
+                ? (regime.slStreakBuy ?? 0)
+                : (regime.slStreakSell ?? 0);
+
+            if (slStreak >= 2) {
+                const streakIcon = slStreak >= 3 ? '🔥' : '⚠️';
+                // Data shows: after 2 SLs → 47.4% chance of another (vs 36.3% baseline)
+                //             after 3 SLs → 50.9% chance
+                const riskNote = slStreak >= 3
+                    ? `~51% chance next is also SL`
+                    : `~47% chance next is also SL`;
+                lines.push(`${streakIcon} *${slStreak} consecutive SL* on ${signalDir} side — ${esc(riskNote)}`);
+            }
+
+            // ── 5c. BUY SIDE ────────────────────────────────────────────────────
+            lines.push('');
+
             if (regime.buy && regime.buy.sampleCount > 0) {
                 const buy = regime.buy;
-                const durMin = (buy.avgDurationMs / 60000).toFixed(1);
                 const maeAbs = Math.abs(buy.mae);
-                const ratioColor = buy.excursionRatio > 2.0 ? '🟢' : buy.excursionRatio < 1.0 ? '🔴' : '🟡';
+                const ratioIcon = buy.excursionRatio > 2.0 ? '🟢'
+                    : buy.excursionRatio < 1.0 ? '🔴' : '🟡';
+                const scoreStr = regimeScore !== undefined && signal.signal === 'buy'
+                    ? ` — score *${esc(regimeScore.toFixed(1))}*`
+                    : '';
+                const thinTag = buy.sampleCount < MIN_RELIABLE_SAMPLES
+                    ? ' ⚠️ _thin_' : '';
 
-                lines.push('');
-                lines.push(`**Buy / Long Regime** \\(${buy.sampleCount} sims\\)`);
-                lines.push(`MFE: **\\+${escape(buy.mfe.toFixed(2))}%**`);
-                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
-                lines.push(`Ratio: **${escape(buy.excursionRatio.toFixed(2))}** ${ratioColor}`);
-                lines.push(`Avg Duration: **${escape(durMin)} min**`);
+                lines.push(`🧭 *Buy regime* \\(${buy.sampleCount} sims\\)${scoreStr}${thinTag}`);
 
+                // MFE / MAE / ratio (scaled for scalping — show from 0.15%)
+                const mfeDisplay = buy.mfe >= MIN_DISPLAY_PCT
+                    ? `\\+${esc(buy.mfe.toFixed(2))}%`
+                    : `\\+${esc(buy.mfe.toFixed(3))}%`;
+                const maeDisplay = maeAbs >= MIN_DISPLAY_PCT
+                    ? `\\-${esc(maeAbs.toFixed(2))}%`
+                    : `\\-${esc(maeAbs.toFixed(3))}%`;
+
+                lines.push(
+                    `  MFE ${mfeDisplay} · MAE ${maeDisplay} · ratio ${esc(buy.excursionRatio.toFixed(2))} ${ratioIcon}`
+                );
+
+                // Outcomes
                 const oc = buy.outcomeCounts;
-                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
-                if (total > 0) {
-                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
-                    const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
+                const ocTotal = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (ocTotal > 0) {
+                    const winPct = ((oc.tp + oc.partial_tp) / ocTotal * 100).toFixed(0);
+                    const slPct = (oc.sl / ocTotal * 100).toFixed(0);
+                    lines.push(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`);
                 }
 
-                if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on buy side');
+                // Duration
+                const durMin = (buy.avgDurationMs / 60000).toFixed(1);
+                lines.push(`  Avg ${esc(durMin)} min`);
 
-                // ← SL Streak warning
-                if (regime.slStreakBuy && regime.slStreakBuy >= 2) {
-                    const icon = regime.slStreakBuy >= 3 ? '🔥' : '⚠️';
-                    lines.push(`${icon} **${regime.slStreakBuy} consecutive SL** on buy side`);
+                // MFE-first % — computed from historyJson buy entries
+                if ('historyJson' in regime && Array.isArray(regime.historyJson)) {
+                    const buySims = regime.historyJson.filter(e =>
+                        e.direction === 'buy' &&
+                        (e.timeToMFE_ms ?? 0) > 0 &&
+                        (e.timeToMAE_ms ?? 0) > 0
+                    );
+                    if (buySims.length >= 3) {
+                        const mfeFirst = buySims.filter(e =>
+                            (e.timeToMFE_ms ?? Infinity) < (e.timeToMAE_ms ?? Infinity)
+                        ).length;
+                        const mfeFirstPct = (mfeFirst / buySims.length * 100).toFixed(0);
+                        // ≥60% MFE-first = cleaner entries worth noting
+                        if (Number(mfeFirstPct) >= 60 || Number(mfeFirstPct) <= 30) {
+                            const note = Number(mfeFirstPct) >= 60
+                                ? '⚡ runs before dipping'
+                                : '⚠️ dips before running';
+                            lines.push(`  MFE arrives first ${esc(mfeFirstPct)}% — ${note}`);
+                        }
+                    }
+                }
+
+                if (maeAbs >= 1.0) {
+                    lines.push(`  ⚠️ High drawdown on buy side`);
+                }
+                if (regime.slStreakBuy && regime.slStreakBuy >= 3) {
+                    lines.push(`  🔥 ${regime.slStreakBuy} consecutive SL streak`);
                 }
             } else {
-                lines.push('');
-                lines.push('**Buy / Long Regime:** No data yet');
+                lines.push('🧭 *Buy regime:* _No data yet_');
             }
 
-            // ── SELL / SHORT SIDE ───────────────────────────────────────────────────────
+            // ── 5d. SELL SIDE ───────────────────────────────────────────────────
+            lines.push('');
+
             if (regime.sell && regime.sell.sampleCount > 0) {
                 const sell = regime.sell;
-                const durMin = (sell.avgDurationMs / 60000).toFixed(1);
                 const maeAbs = Math.abs(sell.mae);
-                const ratioColor = sell.excursionRatio > 2.0 ? '🟢' : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
+                const ratioIcon = sell.excursionRatio > 2.0 ? '🟢'
+                    : sell.excursionRatio < 1.0 ? '🔴' : '🟡';
+                const scoreStr = regimeScore !== undefined && signal.signal === 'sell'
+                    ? ` — score *${esc(regimeScore.toFixed(1))}*`
+                    : '';
+                const thinTag = sell.sampleCount < MIN_RELIABLE_SAMPLES
+                    ? ' ⚠️ _thin_' : '';
 
-                lines.push('');
-                lines.push(`**Sell / Short Regime** \\(${escape(sell.sampleCount)} sims\\)`);
-                lines.push(`MFE: **\\+${escape(sell.mfe.toFixed(2))}%**`);
-                lines.push(`MAE: **\\-${escape(maeAbs.toFixed(2))}%**`);
-                lines.push(`Ratio: **${escape(sell.excursionRatio.toFixed(2))}** ${ratioColor}`);
-                lines.push(`Avg Duration: **${escape(durMin)} min**`);
+                lines.push(`🧭 *Sell regime* \\(${sell.sampleCount} sims\\)${scoreStr}${thinTag}`);
+
+                const mfeDisplay = sell.mfe >= MIN_DISPLAY_PCT
+                    ? `\\+${esc(sell.mfe.toFixed(2))}%`
+                    : `\\+${esc(sell.mfe.toFixed(3))}%`;
+                const maeDisplay = maeAbs >= MIN_DISPLAY_PCT
+                    ? `\\-${esc(maeAbs.toFixed(2))}%`
+                    : `\\-${esc(maeAbs.toFixed(3))}%`;
+
+                lines.push(
+                    `  MFE ${mfeDisplay} · MAE ${maeDisplay} · ratio ${esc(sell.excursionRatio.toFixed(2))} ${ratioIcon}`
+                );
+
                 const oc = sell.outcomeCounts;
-                const total = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
-                if (total > 0) {
-                    const tpPct = ((oc.tp + oc.partial_tp) / total * 100).toFixed(0);
-                    const slPct = (oc.sl / total * 100).toFixed(0);
-                    lines.push(`Outcomes: **${escape(tpPct)}% wins** / **${escape(slPct)}% SL** / ${escape(oc.timeout)} timeouts`);
+                const ocTotal = oc.tp + oc.partial_tp + oc.sl + oc.timeout;
+                if (ocTotal > 0) {
+                    const winPct = ((oc.tp + oc.partial_tp) / ocTotal * 100).toFixed(0);
+                    const slPct = (oc.sl / ocTotal * 100).toFixed(0);
+                    lines.push(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`);
                 }
 
-                if (maeAbs >= 2.5) lines.push('⚠️ High drawdown risk on sell side');
+                const durMin = (sell.avgDurationMs / 60000).toFixed(1);
+                lines.push(`  Avg ${esc(durMin)} min`);
 
-                // ← SL Streak warning
-                if (regime.slStreakSell && regime.slStreakSell >= 2) {
-                    const icon = regime.slStreakSell >= 3 ? '🔥' : '⚠️';
-                    lines.push(`${icon} **${regime.slStreakSell} consecutive SL** on sell side`);
+                // MFE-first % for sell side
+                if ('historyJson' in regime && Array.isArray(regime.historyJson)) {
+                    const sellSims = regime.historyJson.filter(e =>
+                        e.direction === 'sell' &&
+                        (e.timeToMFE_ms ?? 0) > 0 &&
+                        (e.timeToMAE_ms ?? 0) > 0
+                    );
+                    if (sellSims.length >= 3) {
+                        const mfeFirst = sellSims.filter(e =>
+                            (e.timeToMFE_ms ?? Infinity) < (e.timeToMAE_ms ?? Infinity)
+                        ).length;
+                        const mfeFirstPct = (mfeFirst / sellSims.length * 100).toFixed(0);
+                        if (Number(mfeFirstPct) >= 60 || Number(mfeFirstPct) <= 30) {
+                            const note = Number(mfeFirstPct) >= 60
+                                ? '⚡ runs before dipping'
+                                : '⚠️ dips before running';
+                            lines.push(`  MFE arrives first ${esc(mfeFirstPct)}% — ${note}`);
+                        }
+                    }
+                }
+
+                if (maeAbs >= 1.0) {
+                    lines.push(`  ⚠️ High drawdown on sell side`);
+                }
+                if (regime.slStreakSell && regime.slStreakSell >= 3) {
+                    lines.push(`  🔥 ${regime.slStreakSell} consecutive SL streak`);
                 }
             } else {
-                lines.push('');
-                lines.push('**Sell / Short Regime:** No data yet');
+                lines.push('🧭 *Sell regime:* _No data yet_');
             }
         }
 
-        // ── Strategy + Excursion Reasons (from passed extended array) ──────────────────
-        if (signal.reason?.length > 0) {
-            lines.push('');
-            lines.push('**Signal Reasons & Excursion Notes:**');
-            signal.reason.forEach(r => lines.push(`• ${escape(r)}`));
+
+        const meaningfulReasons = (signal.reason ?? [])
+            .filter(r => !BOILERPLATE_PATTERNS.some(p => p.test(r)))
+            .filter(Boolean);
+
+        if (meaningfulReasons.length > 0) {
+            lines.push(`→ ${meaningfulReasons.map(esc).join(' · ')}`);
         }
 
-        // ── Timestamp ────────────────────────────────────────────────────────────────
-        const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        // ─────────────────────────────────────────────────────────────────────────
+        // 6. TIMESTAMP — compact, no date (you know what day it is)
+        // ─────────────────────────────────────────────────────────────────────────
+        const timeStr = new Date().toISOString().slice(11, 19); // HH:MM:SS only
         lines.push('');
-        lines.push(`🕒 ${escape(timestamp)}`);
+        lines.push(`🕒 ${esc(timeStr)}`);
 
-        // ── SEND MESSAGE ──────────────────────────────────────────────────────────────
+        // ─────────────────────────────────────────────────────────────────────────
+        // 7. SEND
+        // ─────────────────────────────────────────────────────────────────────────
         const message = lines.join('\n');
 
         try {
             await this.sendMessage(message, { parse_mode: 'MarkdownV2' });
             logger.info(`Signal alert sent for ${symbol} (${signal.signal}${wasReversed ? ' REVERSED' : ''})`, {
-                tradeExecuted
+                tradeExecuted,
+                regimeScore,
             });
         } catch (err) {
             logger.error('Failed to send signal alert', {
                 symbol,
                 signal: signal.signal,
-                error: err instanceof Error ? err.message : String(err)
+                error: err instanceof Error ? err.message : String(err),
             });
         }
     }

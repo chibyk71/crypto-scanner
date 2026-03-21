@@ -55,7 +55,8 @@ const ConfigSchema = z.object({
     // Symbols & Timeframes
     // ──────────────────────────────────────────────────────────────
     SYMBOLS: z.string().default('BTC/USDT,ETH/USDT').transform(str => str.split(',').map(s => s.trim())),
-    TIMEFRAME: z.string().default('3m'),
+    TIMEFRAME: z.string().default('5m'),
+    TIMEFRAME_SIMULATION: z.string().default('1m'),  // only for backtesting / simulation / excursion calc
     HTF_TIMEFRAME: z.string().default('1h'),
 
     // ──────────────────────────────────────────────────────────────
@@ -112,8 +113,8 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Simulation Engine
     // ──────────────────────────────────────────────────────────────
-    SIMULATION_TIMEOUT_MINUTES: z.coerce.number().default(60),
-    SIMULATION_POLL_INTERVAL_MS: z.coerce.number().default(15_000),
+    SIMULATION_TIMEOUT_MINUTES: z.coerce.number().default(10),
+    SIMULATION_POLL_INTERVAL_MS: z.coerce.number().default(60_000),
     SIMULATION_DEFAULT_RISK_PCT: z.coerce.number().default(1.5),
 
     // ──────────────────────────────────────────────────────────────
@@ -240,6 +241,8 @@ export const config = {
         primaryTimeframe: rawConfig.TIMEFRAME,
         /** Higher timeframe for trend filter (e.g., '1h') */
         htfTimeframe: rawConfig.HTF_TIMEFRAME,
+        /**  */
+        simulationTimeframe: rawConfig.TIMEFRAME_SIMULATION,
         /** How often to run a full market scan (milliseconds) */
         scanIntervalMs: rawConfig.SCAN_INTERVAL_MS,
         /** Send heartbeat every N cycles */

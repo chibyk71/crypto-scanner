@@ -313,6 +313,7 @@ export class AutoTradeService {
                     symbol,
                     adjustedSignal,
                     currentPrice,
+                    advice.score, // Include score in alert
                     orderId !== null // show if order was actually placed
                 );
 

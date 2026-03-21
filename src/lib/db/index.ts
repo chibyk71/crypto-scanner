@@ -954,6 +954,9 @@ class DatabaseService {
                 .update(simulatedTrades)
                 .set({
                     closedAt: data.closedAt,
+                    trailingDist: data.trailingDist,
+                    stopLoss: data.stoploss,
+                    tpLevels: data.tpLevels,
                     outcome: data.outcome,
                     pnl: Math.round(data.pnl * 1e8),                              // ×1e8
                     rMultiple: Math.round(data.rMultiple * 1e4),                  // ×1e4

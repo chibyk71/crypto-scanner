@@ -157,7 +157,7 @@ export async function simulateTrade(
     const isLong = signal.signal === 'buy';
 
     // Get polling interval from config (should match primary timeframe, e.g. 60_000 ms for 1m)
-    const pollIntervalMs = ExchangeService.toTimeframeMs(config.scanner.primaryTimeframe);
+    const pollIntervalMs = ExchangeService.toTimeframeMs(config.scanner.simulationTimeframe);
 
     // ────────────────────────────────────────────────────────────────
     // 1. START DATABASE RECORD – generate unique signalId
@@ -193,7 +193,7 @@ export async function simulateTrade(
         await waitForNextCandle(pollIntervalMs);
 
         // Get latest candle high/low
-        const candle = getCurrentCandle(exchangeService, symbol);
+        const candle = await getCurrentCandle(exchangeService, symbol);
         if (!candle) {
             logger.warn(`No candle data yet for ${symbol} – waiting`);
             continue;
@@ -310,7 +310,7 @@ export async function simulateTrade(
     // ────────────────────────────────────────────────────────────────
     // 4. TIMEOUT – forced exit after exactly 10 candles
     // ────────────────────────────────────────────────────────────────
-    const finalCandle = getCurrentCandle(exchangeService, symbol);
+    const finalCandle = await getCurrentCandle(exchangeService, symbol);
     const exitPrice = finalCandle
         ? calculateExitPriceForTimeout(
             isLong,
@@ -531,37 +531,32 @@ async function waitForNextCandle(pollIntervalMs: number): Promise<void> {
  * @param symbol - Trading pair (e.g. 'BTC/USDT')
  * @returns Latest completed candle's high/low or null if unavailable/invalid
  */
-function getCurrentCandle(
+async function getCurrentCandle(
     exchangeService: ExchangeService,
     symbol: string
-): { high: number; low: number } | null {
+): Promise<{ high: number; low: number } | null> {
     // ────────────────────────────────────────────────────────────────
     // 1. Fetch the full OHLCV array from the exchange service cache
     //    getPrimaryOhlcvData() should return number[][] where each row is:
     //    [timestamp, open, high, low, close, volume]
     // ────────────────────────────────────────────────────────────────
-    const rawData = exchangeService.getPrimaryOhlcvData(symbol);
+    const rawData = await exchangeService.getOHLCV(symbol, config.scanner.simulationTimeframe);
 
     // ────────────────────────────────────────────────────────────────
     // 2. Basic existence & length checks
     //    We need at least 2 candles to safely use the latest one
     //    (1 candle might be the forming one, not completed)
     // ────────────────────────────────────────────────────────────────
-    if (!rawData || !Array.isArray(rawData) || rawData.length < 2) {
+    if (!rawData || !Array.isArray(rawData.timestamps) || rawData.timestamps.length < 2) {
         // No data or too little data → nothing usable yet
         return null;
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 3. Take the LAST candle (most recent completed one)
-    // ────────────────────────────────────────────────────────────────
-    const latestCandle = rawData[rawData.length - 1];
-
-    // ────────────────────────────────────────────────────────────────
     // 4. Extract high and low – be extremely defensive
     // ────────────────────────────────────────────────────────────────
-    const high = Number(latestCandle[2]);  // index 2 = high
-    const low = Number(latestCandle[3]);  // index 3 = low
+    const high = rawData.highs[rawData.highs.length - 1];  // last element = high
+    const low = rawData.lows[rawData.lows.length - 1];  // last element = low
 
     // ────────────────────────────────────────────────────────────────
     // 5. Validate extracted values before returning
@@ -576,9 +571,9 @@ function getCurrentCandle(
         low > high
     ) {
         logger.warn(`Invalid candle values received for ${symbol}`, {
-            high: latestCandle[2],
-            low: latestCandle[3],
-            timestamp: latestCandle[0]
+            high,
+            low,
+            timestamp: rawData.timestamps[rawData.timestamps.length - 1]
         });
         return null;
     }
@@ -588,8 +583,7 @@ function getCurrentCandle(
     //    (e.g. 100x pump/dump in one candle – likely exchange glitch)
     //    You can tune or remove this threshold later
     // ────────────────────────────────────────────────────────────────
-    const previousCandle = rawData[rawData.length - 2];
-    const prevClose = Number(previousCandle[4]); // close of previous candle
+    const prevClose = rawData.closes[rawData.closes.length - 2]; // close of previous candle
 
     if (
         !isNaN(prevClose) && prevClose > 0 &&
