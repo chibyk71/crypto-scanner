@@ -161,44 +161,63 @@ export class AutoTradeService {
             }
 
             // ────────────────────────────────────────────────────────────────
-            // 6. FIXED TP: Always 0.4% price move = 10% account gain on 25×
-            //    Ignores tpMultiplier completely
+            // 6. STOP LOSS: Use the signal's ATR-based SL directly.
+            //    This is the same SL the simulation ran with, so live-trade
+            //    risk matches the excursion data regime decisions are based on.
+            //    Safety floor: reject if SL is unrealistically close to current
+            //    price (handles stale signal where price has moved far).
             // ────────────────────────────────────────────────────────────────
-            const TARGET_ACCOUNT_GAIN = 0.10;  // 10% account target
-            const LEVERAGE = 25;
-            const TP_PRICE_MOVE = TARGET_ACCOUNT_GAIN / LEVERAGE; // 0.004 = 0.4%
-
-            const finalTakeProfit = finalSide === 'buy'
-                ? currentPrice * (1 + TP_PRICE_MOVE)
-                : currentPrice * (1 - TP_PRICE_MOVE);
-
-            // ────────────────────────────────────────────────────────────────
-            // 7. SL: Use original signal SL distance, but CAP at 1% account risk
-            //    (0.04% price move → 1% account loss on 25×)
-            //    Ignores slMultiplier completely
-            // ────────────────────────────────────────────────────────────────
-            const MAX_ACCOUNT_RISK = 0.01;     // 1% max account loss
-            const SL_PRICE_CAP_MOVE = MAX_ACCOUNT_RISK / LEVERAGE; // 0.0004 = 0.04%
+            const MIN_SL_DISTANCE_PCT = 0.0001; // 0.01% absolute floor
 
             let finalStopLoss: number;
 
-            if (signal.stopLoss !== undefined) {
-                // Calculate original risk distance from raw signal
-                const originalRiskDistance = finalSide === 'buy'
-                    ? currentPrice - signal.stopLoss
-                    : signal.stopLoss - currentPrice;
+            if (signal.stopLoss !== undefined && signal.stopLoss > 0) {
+                const signalSlDistance = Math.abs(currentPrice - signal.stopLoss);
+                const minSlDistance = currentPrice * MIN_SL_DISTANCE_PCT;
 
-                // Cap at 0.04% price move
-                const cappedRiskDistance = Math.min(originalRiskDistance, currentPrice * SL_PRICE_CAP_MOVE);
+                if (signalSlDistance < minSlDistance) {
+                    logger.warn(`Signal SL too close to current price – skipping`, {
+                        symbol, currentPrice, signalSL: signal.stopLoss, signalSlDistance,
+                    });
+                    return;
+                }
 
+                // Preserve the SL distance, anchored to current price rather than
+                // signal-time price, so the SL is always on the correct side of the fill.
                 finalStopLoss = finalSide === 'buy'
-                    ? currentPrice - cappedRiskDistance
-                    : currentPrice + cappedRiskDistance;
+                    ? currentPrice - signalSlDistance
+                    : currentPrice + signalSlDistance;
             } else {
-                // Fallback: hard 0.04% SL if no original SL provided
+                // No SL in signal — fall back to ~ATR×1.5 expressed as % of price.
+                const FALLBACK_SL_PCT = 0.005; // 0.5% matches typical strategy output
                 finalStopLoss = finalSide === 'buy'
-                    ? currentPrice * (1 - SL_PRICE_CAP_MOVE)
-                    : currentPrice * (1 + SL_PRICE_CAP_MOVE);
+                    ? currentPrice * (1 - FALLBACK_SL_PCT)
+                    : currentPrice * (1 + FALLBACK_SL_PCT);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // 7. TAKE PROFIT: Use signal TP anchored to current price.
+            //    Mirrors the simulation exactly so excursion data is comparable.
+            //    Falls back to SL distance × R:R target when no TP in signal.
+            // ────────────────────────────────────────────────────────────────
+            const slDistanceFromEntry = Math.abs(currentPrice - finalStopLoss);
+
+            let finalTakeProfit: number;
+
+            if (signal.takeProfit !== undefined && signal.takeProfit > 0) {
+                const signalTpDistance = Math.abs(signal.takeProfit - (signal.stopLoss ?? 0) !== undefined
+                    ? signal.takeProfit - (finalSide === 'buy'
+                        ? currentPrice - slDistanceFromEntry
+                        : currentPrice + slDistanceFromEntry)
+                    : signal.takeProfit - currentPrice);
+                finalTakeProfit = finalSide === 'buy'
+                    ? currentPrice + Math.abs(signalTpDistance)
+                    : currentPrice - Math.abs(signalTpDistance);
+            } else {
+                const rrTarget = config.strategy.riskRewardTarget ?? 2;
+                finalTakeProfit = finalSide === 'buy'
+                    ? currentPrice + slDistanceFromEntry * rrTarget
+                    : currentPrice - slDistanceFromEntry * rrTarget;
             }
 
             // ────────────────────────────────────────────────────────────────
@@ -239,7 +258,7 @@ export class AutoTradeService {
                     wasReversed ? '↔️ DIRECTION REVERSED' : '',
                     ...signal.reason, // original technical reasons
                     advice.advice,
-                    `Fixed 1:10 account R:R (25× leverage) – TP 0.4% move, SL capped at 0.04%`,
+                    `ATR-based SL: ${(Math.abs(currentPrice - finalStopLoss) / currentPrice * 100).toFixed(3)}% | TP: ${(Math.abs(finalTakeProfit - currentPrice) / currentPrice * 100).toFixed(3)}% | R:R ≈ ${(Math.abs(finalTakeProfit - currentPrice) / Math.abs(currentPrice - finalStopLoss)).toFixed(2)}×`,
                     confidenceBoost !== 0 ? `Confidence boost: ${confidenceBoost > 0 ? '+' : ''}${confidenceBoost.toFixed(2)}` : ''
                 ].filter(Boolean)
             };

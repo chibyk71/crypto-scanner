@@ -166,7 +166,7 @@ export function computeIndicators(
 
     // Oscillators – overbought/oversold detection
     const rsi = calculateRSI(pCloses, 14);
-    const macdResult = calculateMACD(pCloses, 12, 26, 9);
+    const macdResult = calculateMACD(pCloses, 8, 21, 5);
     const macdLine = macdResult.map(m => m.MACD);
     const macdSignal = macdResult.map(m => m.signal);
     const macdHistogram = macdResult.map(m => m.histogram);

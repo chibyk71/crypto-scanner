@@ -54,9 +54,9 @@ export function calculateMomentum(closes: number[], period: number = 10): number
 // -----------------------------------------------------------------------------
 export function calculateMACD(
     values: number[],
-    fastPeriod = 5,
-    slowPeriod = 13,
-    signalPeriod = 8
+    fastPeriod = 8,
+    slowPeriod = 21,
+    signalPeriod = 5
 ): MACDOutput[] {
     if (values.length < slowPeriod + signalPeriod) return [];
 

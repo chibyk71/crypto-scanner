@@ -122,14 +122,14 @@ const MAX_ATR_MULTIPLIER = 5;
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.25;                      // ← Realistic volatility range for crypto scalping
+const MIN_ATR_PCT = 0.35;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 20;
 
-const MIN_BB_BANDWIDTH_PCT = 0.12;             // ← Minimum Bollinger Band width percentage to avoid flat markets
+const MIN_BB_BANDWIDTH_PCT = 0.4;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
 const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative volume check
 
-const MIN_DI_DIFF = 4;                       // ← Minimum difference between +DI and -DI for trend dominance
+const MIN_DI_DIFF = 10;                       // ← Minimum difference between +DI and -DI for trend dominance
 
 const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
@@ -572,7 +572,10 @@ export class Strategy {
         }
 
         // Dynamic margin – stricter when scores are low
-        const dynamicMargin = Math.min(SCORE_MARGIN_REQUIRED, CONFIDENCE_THRESHOLD * 0.29);
+        const winningScore = Math.max(buyScore, sellScore);
+        const marginFraction = Math.min(winningScore / MAX_SCORE_PER_SIDE, 1);
+        const dynamicMargin = 10 + (SCORE_MARGIN_REQUIRED - 10) * marginFraction;
+
 
         let signal: TradeSignal['signal'] = 'hold';
         let confidence = 0;
@@ -725,14 +728,18 @@ export class Strategy {
         // ──────────────────────────────────────────────────────────────
         const stopLoss = signal === 'buy' ? price - riskDistance : price + riskDistance;
         const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
-        const takeProfitLevels: PartialTPLevel[] = [];
 
-        for (let index = 1; index < riskRewardTarget; index++) {
-            takeProfitLevels.push({
-                price: signal === 'buy' ? price + riskDistance * index : price - riskDistance * index,
-                weight: index / riskRewardTarget,
-            });
-        }
+        // Build partial TP levels from config (e.g. PARTIAL_TP_LEVELS = "1.5:0.4,3.0:0.3,6.0:0.3").
+        // Each entry is { rMultiple, weight }; we convert R-multiple to an absolute price.
+        // Levels whose rMultiple exceeds riskRewardTarget are omitted — they're beyond the full TP.
+        const takeProfitLevels: PartialTPLevel[] = config.simulation.partialTpLevels
+            .filter(lvl => lvl.rMultiple < riskRewardTarget)
+            .map(lvl => ({
+                price: signal === 'buy'
+                    ? Number((price + riskDistance * lvl.rMultiple).toFixed(8))
+                    : Number((price - riskDistance * lvl.rMultiple).toFixed(8)),
+                weight: lvl.weight,
+            }));
 
         // ──────────────────────────────────────────────────────────────
         // 5. Trailing stop – 75% of initial risk (aggressive for scalping)
