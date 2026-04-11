@@ -99,6 +99,9 @@ export async function simulateTrade(
         entryPrice, startTime, features,
     );
 
+    // wait a moment before starting to poll to allow the first candle to complete
+    await waitForNextCandle(15000);
+
     // ─────────────────────────────────────────────────────────────────────────
     // MAIN SIMULATION LOOP
     // Processes up to 10 valid 1m candles. Candle skips (null / invalid data)

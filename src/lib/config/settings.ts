@@ -248,7 +248,7 @@ export const config = {
         /** Send heartbeat every N cycles */
         heartBeatInterval: rawConfig.HEARTBEAT_INTERVAL,
 
-        signalCooldownMs: 8 * 60 * 1000,
+        signalCooldownMs: 12 * 60 * 1000,
     },
 
     // =========================================================================

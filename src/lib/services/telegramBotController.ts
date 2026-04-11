@@ -2419,7 +2419,7 @@ export class TelegramBotController {
                 if (ocTotal > 0) {
                     const winPct = ((oc.tp + oc.partial_tp) / ocTotal * 100).toFixed(0);
                     const slPct = (oc.sl / ocTotal * 100).toFixed(0);
-                    lines.push(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`);
+                    lines.push(esc(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`));
                 }
 
                 // Duration
@@ -2490,7 +2490,7 @@ export class TelegramBotController {
                 if (ocTotal > 0) {
                     const winPct = ((oc.tp + oc.partial_tp) / ocTotal * 100).toFixed(0);
                     const slPct = (oc.sl / ocTotal * 100).toFixed(0);
-                    lines.push(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`);
+                    lines.push(esc(`  ${winPct}% wins · ${slPct}% SL · ${oc.timeout} timeouts`));
                 }
 
                 const durMin = (sell.avgDurationMs / 60000).toFixed(1);
@@ -2617,6 +2617,7 @@ export class TelegramBotController {
                 errorMessage: error.message,
                 errorCode: error.code,
                 response: error.response?.body,
+                messagePreview: message.length > 100 ? message.substring(0, 157) + '...' : message,
             });
 
             // Re-throw to allow callers to handle gracefully (e.g., retry or fallback)

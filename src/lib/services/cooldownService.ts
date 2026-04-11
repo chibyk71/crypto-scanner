@@ -35,7 +35,7 @@ export class CooldownService {
 
     constructor(
         backend: CooldownBackend = 'memory',
-        defaultDurationMs: number = config.scanner?.signalCooldownMs ?? 8 * 60 * 1000
+        defaultDurationMs: number = config.scanner?.signalCooldownMs ?? 12 * 60 * 1000
     ) {
         this.backend = backend;
         this.defaultDurationMs = defaultDurationMs;
