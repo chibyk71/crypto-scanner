@@ -125,13 +125,13 @@ const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trend
 const MIN_ATR_PCT = 0.35;                      // ← Realistic volatility range for crypto scalping
 const MAX_ATR_PCT = 20;
 
-const MIN_BB_BANDWIDTH_PCT = 0.4;             // ← Minimum Bollinger Band width percentage to avoid flat markets
+const MIN_BB_BANDWIDTH_PCT = 0.5;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
 const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative volume check
 
-const MIN_DI_DIFF = 10;                       // ← Minimum difference between +DI and -DI for trend dominance
+const MIN_DI_DIFF = 15;                       // ← Minimum difference between +DI and -DI for trend dominance
 
-const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
+const MIN_ADX = 25;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
 
 /**

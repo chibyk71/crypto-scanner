@@ -111,6 +111,7 @@ export interface ExcursionScore {
 // CONSTANTS
 // =============================================================================
 const MAX_SIMS = 10; // Maximum number of recent sims to consider
+const MIN_SIDE_SAMPLES = 1; // Minimum samples on intended side for take/reverse
 
 /**
  * Analyze recent regime and return actionable advice + adjustments
@@ -178,9 +179,9 @@ export function getExcursionAdvice(
     // ────────────────────────────────────────────────────────────────
     const combinedCount = regime.recentSampleCount ?? 0;
 
-    if (combinedCount < 3) {
+    if (combinedCount < MIN_SIDE_SAMPLES) {
         return {
-            advice: `⚠️ Too few total simulations (${combinedCount}/3) – no alert/trade`,
+            advice: `⚠️ Too few total simulations (${combinedCount}/${MIN_SIDE_SAMPLES}) – no alert/trade`,
             adjustments: {
                 slMultiplier: 1.0,
                 tpMultiplier: 1.0,
@@ -200,7 +201,7 @@ export function getExcursionAdvice(
     const sideCount = sideAgg?.sampleCount ?? 0;
 
     // Use updated hasEnoughSamples with direction parameter (pure directional)
-    const sideHasEnough = ExcursionHistoryCache.hasEnoughSamples(regime, 3, direction);
+    const sideHasEnough = ExcursionHistoryCache.hasEnoughSamples(regime, MIN_SIDE_SAMPLES, direction);
 
     if (!sideHasEnough) {
         logger.info('getExcursionAdvice: insufficient samples on intended side – forced skip', {
@@ -208,11 +209,11 @@ export function getExcursionAdvice(
             direction,
             sideCount,
             combinedCount,
-            required: 3
+            required: MIN_SIDE_SAMPLES
         });
 
         return {
-            advice: `⚠️ Too few ${direction} simulations (${sideCount}/3) – holding`,
+            advice: `⚠️ Too few ${direction} simulations (${sideCount}/${MIN_SIDE_SAMPLES}) – holding`,
             adjustments: {
                 slMultiplier: 1.0,
                 tpMultiplier: 1.0,

@@ -2271,11 +2271,11 @@ export class TelegramBotController {
         // 2. KEY LEVELS — SL / TP / R:R on one line
         // ─────────────────────────────────────────────────────────────────────────
         const slStr = signal.stopLoss
-            ? `SL \\$${esc(signal.stopLoss.toFixed(6))}`
+            ? `SL **\\$${esc(signal.stopLoss.toFixed(6))}**`
             : 'SL —';
 
         const tpStr = signal.takeProfit
-            ? `TP \\$${esc(signal.takeProfit.toFixed(6))}`
+            ? `TP **\\$${esc(signal.takeProfit.toFixed(6))}**`
             : 'TP —';
 
         const rrStr = signal.takeProfit && signal.stopLoss && price !== signal.stopLoss
