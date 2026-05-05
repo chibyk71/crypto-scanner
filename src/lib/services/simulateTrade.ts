@@ -96,7 +96,7 @@ export async function simulateTrade(
 
     await dbService.createNewSimulation(
         signalId, signal.symbol, signal.signal as 'buy' | 'sell',
-        entryPrice, startTime, features,
+        entryPrice, startTime, features, signal.confidence ?? 0,
     );
 
     // wait a moment before starting to poll to allow the first candle to complete

@@ -1,288 +1,235 @@
 // src/lib/services/mlService.ts
 // =============================================================================
-// ML SERVICE – 5-TIER RANDOM FOREST CLASSIFIER (FULLY TYPE-SAFE + PRODUCTION READY)
+// ML SERVICE – ONNX INFERENCE (XGBoost trained locally via ml/train.py)
 //
 // Purpose:
-//   • Continuously learns from high-fidelity simulated trade outcomes
-//   • Predicts probability of profitable trades using 5-tier labeling
-//   • Integrates excursion data (MAE/MFE) for better risk-aware predictions
-//   • Provides model status, training control, and performance reporting
+//   • Load and run a pre-trained XGBoost model exported as ONNX
+//   • Extract features from market data for prediction
+//   • Provide status and control interface via Telegram
 //
-// Key Features:
-//   • 5-tier labels: -2 (disaster), -1 (loss), 0 (neutral), +1 (good), +2 (monster win)
-//   • Automatic retraining when enough new samples are collected
-//   • Persistent model (saved/loaded from JSON file)
-//   • Training can be paused/resumed/forced via Telegram commands
-//   • Uses centralized indicators + symbol-specific excursion history
+// Training workflow (no longer happens in Node.js):
+//   1. Send /export_training_data to Telegram → download CSV
+//   2. Run ml/train.py locally → produces ml/models/model.onnx
+//   3. Run ml/validate.py → confirm model is healthy
+//   4. Upload model.onnx to production models/model.onnx
+//   5. Send /ml_reload to Telegram → hot-swap without restart
+//
+// Key changes from previous version:
+//   • RandomForestClassifier removed entirely
+//   • onnxruntime-node used for inference
+//   • predict() is now async (ONNX Runtime is async)
+//   • reloadModel() added for hot-swap via Telegram
+//   • extractFeatures() adds symbol index as feature [25] → length 26
+//   • retrain/saveModel/loadModel (RF versions) removed
 // =============================================================================
 
 import * as fs from 'fs/promises';
-import { RandomForestClassifier } from 'ml-random-forest';
+import * as ort from 'onnxruntime-node';
 import { createLogger } from '../logger';
 import { config } from '../config/settings';
 import { dbService } from '../db';
-import type { StrategyInput, SignalLabel } from '../../types'; // ← Critical: from single source of truth
-import { computeIndicators } from '../utils/indicatorUtils';   // ← Centralized indicator calculations
+import type { StrategyInput, SignalLabel } from '../../types';
+import { computeIndicators } from '../utils/indicatorUtils';
 import { excursionCache } from './excursionHistoryCache';
+import { symbolRegistry } from '../utils/symbolRegistry';
 import path from 'path';
 
-/**
- * Dedicated logger for all ML-related operations
- * Tagged as 'MLService' for easy filtering in logs
- */
 const logger = createLogger('MLService');
 
-/**
- * MLService – The adaptive learning brain of the trading bot
- *
- * Responsibilities:
- *   • Extract features from market data (indicators + excursions)
- *   • Predict outcome probability and label for new signals
- *   • Ingest completed simulation results as training data
- *   • Retrain model periodically
- *   • Persist model to disk
- *   • Provide status and control interface (via Telegram)
- */
 export class MLService {
-    // Core Random Forest classifier instance
-    private classifier: RandomForestClassifier;
+    // ONNX inference session — null until model is loaded
+    private session: ort.InferenceSession | null = null;
 
-    // Flags for model state
-    private isModelLoaded = false;     // Has a valid model been loaded from disk?
-    private isTrainingPaused = false;  // Manual pause (via /ml_pause command)
-
-    // Hyperparameters – tuned for crypto market characteristics
-    private readonly N_ESTIMATORS = 300;         // Number of trees (more = better but slower)
-    private readonly MAX_DEPTH = 14;             // Tree depth limit (prevents overfitting)
-    private readonly MIN_SAMPLES_SPLIT = 4;      // Minimum samples to split a node
-    private readonly MAX_FEATURES = 0.85;        // Fraction of features per tree (randomness)
-
-    private readonly INTERNAL_TO_LABEL: Record<number, SignalLabel> = {
-        0: -2,
-        1: -1,
-        2: 0,
-        3: 1,
-        4: 2
-    };
+    // Model state flags
+    private isModelLoaded = false;
+    private isTrainingPaused = false;  // kept for API compatibility with Telegram commands
 
     // =========================================================================
-    // CONSTRUCTOR – Initialize classifier and attempt to load saved model
+    // CONSTRUCTOR
     // =========================================================================
     constructor() {
-        // Create fresh classifier with tuned hyperparameters
-        this.classifier = new RandomForestClassifier({
-            nEstimators: this.N_ESTIMATORS,
-            seed: 42,                                   // Fixed seed for reproducibility
-            treeOptions: { maxDepth: this.MAX_DEPTH, minSamplesSplit: this.MIN_SAMPLES_SPLIT },
-            maxFeatures: this.MAX_FEATURES,
-            replacement: true,                          // Bootstrap sampling
-            useSampleBagging: true,
+        // Non-blocking load — bot starts immediately, predictions become
+        // available once the file is read (usually < 1 second)
+        this.loadModel().catch(err => {
+            logger.warn('Model load failed at startup — predictions disabled', {
+                error: err instanceof Error ? err.message : String(err),
+            });
         });
 
-        // Attempt to load existing model from disk
-        this.loadModel();
-        logger.info('MLService initialized (5-tier labeling + excursion features enabled)');
+        logger.info('MLService initialized (ONNX inference mode)');
     }
 
     // =========================================================================
-    // MODEL PERSISTENCE – Load saved Random Forest model from disk
+    // MODEL LOADING
     // =========================================================================
     /**
-     * Attempts to load a previously trained model from the filesystem.
+     * Loads the ONNX model from disk into an inference session.
      *
-     * Called automatically:
-     *   • In the constructor during MLService initialization
-     *
-     * Why this matters:
-     *   • Avoids retraining from scratch on every bot restart
-     *   • Enables continuous learning over days/weeks
-     *   • Fast startup – predictions available immediately if model exists
+     * Called:
+     *   • Automatically in constructor at startup
+     *   • Manually via reloadModel() after uploading a new model
      *
      * Behavior:
-     *   • Reads JSON file at config.ml.modelPath
-     *   • Parses and validates structure (must have valid trees)
-     *   • On success: sets classifier and flags isModelLoaded = true
-     *   • On failure (missing file, corrupt, invalid): starts with fresh classifier
-     *
-     * @private – only called internally during init
+     *   • Reads model.onnx from config.ml.modelPath
+     *   • Creates an ort.InferenceSession
+     *   • Sets isModelLoaded = true on success
+     *   • On failure: logs warning, leaves isModelLoaded = false
+     *     (bot continues without ML predictions rather than crashing)
      */
     private async loadModel(): Promise<void> {
         try {
-            // Read raw JSON string from disk
-            const data = await fs.readFile(config.ml.modelPath, 'utf-8');
+            const modelPath = path.resolve(config.ml.modelPath);
 
-            // Parse JSON into object
-            const parsed = JSON.parse(data);
+            // Check file exists before attempting to create session
+            // (ort gives a cryptic error if the file is missing)
+            await fs.access(modelPath);
 
-            // Load into ml-random-forest's format
-            const model = RandomForestClassifier.load(parsed);
+            logger.info('Loading ONNX model...', { path: modelPath });
 
-            // Basic validation: ensure model has trees and they are well-formed
-            if (!model?.estimators?.length || model.estimators.some((t: any) => !t.root)) {
-                throw new Error('Invalid or corrupt model structure');
-            }
+            this.session = await ort.InferenceSession.create(modelPath, {
+                executionProviders: ['cpu'],   // shared hosting has no GPU
+                graphOptimizationLevel: 'all', // maximize CPU inference speed
+            });
 
-            // Success – replace current classifier with loaded one
-            this.classifier = model;
             this.isModelLoaded = true;
 
-            // Log success with useful diagnostics
-            logger.info('ML model loaded successfully', {
-                trees: model.estimators.length,
-                path: config.ml.modelPath,
+            // Log input/output info so mismatches are immediately visible
+            const inputNames = this.session.inputNames;
+            const outputNames = this.session.outputNames;
+
+            logger.info('ONNX model loaded successfully', {
+                path: modelPath,
+                inputs: inputNames,
+                outputs: outputNames,
             });
-        } catch (err) {
-            // Expected cases: file not found, JSON parse error, corrupt data
-            logger.warn('No valid model found – starting fresh', {
-                error: err instanceof Error ? err.message : 'Unknown',
-            });
 
-            // Keep fresh classifier, mark as not loaded
-            this.isModelLoaded = false;
-        }
-    }
-
-    // =========================================================================
-    // MODEL PERSISTENCE – Save current model to disk
-    // =========================================================================
-    /**
- * MLService.ts (excerpt: saveModel method)
- *
- * This private method serializes the trained machine learning classifier (e.g., Random Forest) to a JSON file and saves it to disk.
- * It ensures the model persists across application restarts, allowing the crypto trading bot to retain learned patterns from historical data
- * for ongoing predictions (e.g., market signals for auto-trading).
- *
- * Features / Problems Solved:
- * - Atomic file write: Overwrites the existing model file safely using fs.writeFile, minimizing corruption risks during saves.
- * - Directory assurance: Checks and creates the target directory (recursive) if it doesn't exist, preventing ENOENT errors (no such file or directory).
- * - JSON serialization: Converts the classifier object to a pretty-printed JSON string for readability and easy debugging/loading.
- * - Configurable path: Uses config.ml.modelPath (e.g., from environment vars or config file) for flexibility in development/production (recommend absolute paths in prod to avoid relative path issues).
- * - Robust error handling: Catches and logs specific FS errors (e.g., permissions, disk full), re-throws for caller (e.g., retrain()) to handle gracefully (e.g., fallback to in-memory model or alert admin via Telegram).
- * - Asynchronous I/O: Uses promises for non-blocking operation, suitable for Node.js event loop in a bot environment where responsiveness is key.
- * - Security: No user input involved; path is config-driven—ensure config.ml.modelPath is sanitized/validated at startup to prevent path traversal (not handled here; assume upstream).
- * - Performance: Minimal—JSON.stringify is efficient for typical ML models; file write is O(1) for small models (<1MB assumed for RF classifiers in crypto data).
- *
- * Fits into the ML Module:
- * - Called exclusively from retrain() and forceRetrain() after successful model training, as part of the adaptation pipeline.
- * - Integrates with loadModel() (counterpart for deserialization on startup/reload).
- * - Supports the bot's long-term learning: Retraining on new market data (e.g., via historical OHLCV from Bybit) updates the model, which is then saved here.
- * - Aligns with error-resilient design: If save fails, the bot can continue with the in-memory model until next restart; critical logs trigger monitoring/alerts.
- * - Production considerations: In Docker/K8s deployments, map /models dir to persistent volume; use absolute paths (e.g., '/app/models/rf_model.json') via env vars to avoid build-time relative issues.
- *
- * Dependencies:
- * - Node.js 'fs/promises' and 'path' for async FS ops.
- * - Assumes 'config' is a loaded config object (e.g., from config.ts) with ml.modelPath (string, e.g., './models/rf_model.json').
- * - 'logger' (e.g., winston) for structured logging.
- * - ML library (e.g., ml-random-forest) where this.classifier is JSON-serializable; if not, extend with custom toJSON().
- *
- * Potential Improvements (not implemented here):
- * - Backup old model before overwrite (e.g., to .bak) for rollback.
- * - Compression (e.g., gzip) if models grow large.
- * - Validation: Post-save, read back and verify JSON integrity.
- */
-    private async saveModel(): Promise<void> {
-        try {
-            // Resolve full path and ensure directory exists
-            const modelPath = path.resolve(config.ml.modelPath); // Use resolve for absolute path safety
-            const modelDir = path.dirname(modelPath);
-            await fs.mkdir(modelDir, { recursive: true }); // Create dir if missing (idempotent)
-
-            // Serialize classifier to JSON (pretty-printed for human readability)
-            const json = JSON.stringify(this.classifier, null, 2);
-
-            // Atomic write (overwrites if exists)
-            await fs.writeFile(modelPath, json, 'utf-8');
-
-            // Log success for monitoring
-            logger.info('ML model saved successfully', { path: modelPath });
-        } catch (err: any) {
-            // Enhanced error classification for better debugging/alerting
-            let errorMessage = 'Failed to save ML model';
-            if (err.code === 'ENOENT') {
-                errorMessage = 'Directory or file path not found';
-            } else if (err.code === 'EACCES') {
-                errorMessage = 'Permission denied';
-            } else if (err.code === 'ENOSPC') {
-                errorMessage = 'Disk full—no space left';
-            } else if (err instanceof SyntaxError) { // JSON.stringify failure
-                errorMessage = 'Model serialization failed (non-JSON-serializable data)';
+            // Sanity check — warn if output node name is wrong
+            // mlService reads 'probabilities' — must match what train.py exports
+            if (!outputNames.includes('probabilities')) {
+                logger.warn(
+                    'ONNX model does not have a "probabilities" output node. ' +
+                    `Found: [${outputNames.join(', ')}]. ` +
+                    'Predictions will fail. Retrain and re-export.'
+                );
             }
 
-            logger.error(errorMessage, {
-                path: config.ml.modelPath,
-                error: err.stack || err.message,
-            });
+        } catch (err) {
+            this.session = null;
+            this.isModelLoaded = false;
 
-            throw new Error(`${errorMessage}: ${err.message}`); // Re-throw with context for caller
+            const isNotFound = (err as NodeJS.ErrnoException).code === 'ENOENT';
+
+            if (isNotFound) {
+                logger.warn('No ONNX model found — predictions disabled until model.onnx is uploaded', {
+                    path: config.ml.modelPath,
+                    hint: 'Run ml/train.py locally then upload models/model.onnx',
+                });
+            } else {
+                logger.error('Failed to load ONNX model', {
+                    path: config.ml.modelPath,
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
         }
     }
 
+    // =========================================================================
+    // HOT-SWAP: Reload model without restarting the bot
+    // =========================================================================
     /**
- * Extracts a fixed-length feature vector from market data for ML prediction.
- *
- * Called from:
- *   • Strategy.generateSignal() – for every potential signal (live prediction)
- *   • simulateTrade() – to store features with simulation outcome (training data)
- *
- * 2026+ pure directional design:
- *   - Technical indicators (RSI, EMA, MACD, etc.) remain unchanged
- *   - Excursion regime features now come **exclusively from the intended side** (buy/sell)
- *     - No combined MFE/MAE/ratio used — pure side isolation
- *     - If intended side missing or has 0 samples → neutral values (0/0.2)
- *   - Fixed length: always returns the same number of features (currently 22)
- *   - Normalized values: most features scaled to [0,1] or small range
- *   - Consistent: uses same computeIndicators() as training
- *   - Async: fetches live excursion regime from cache
- *   - Defensive: no NaN/Infinity, safe fallbacks for missing data
- *
- * Feature groups (order matters – do not reorder without updating model):
- *   1. Technical indicators (normalized latest values from primary + HTF) – 15 features
- *   2. Real-time excursion regime (MFE/MAE/ratio from **intended side only**) – 3 features
- *   3. Market context (volume, price scaling) – 4 features
- *
- * @param input Full market context at signal time
- * @returns Fixed-length number[] ready for classifier.predict()
- * @throws Error if feature length mismatch detected (critical for model integrity)
- */
+     * Reloads the ONNX model from disk.
+     *
+     * Called from:
+     *   • TelegramBotController — /ml_reload command
+     *
+     * Use case:
+     *   After uploading a new model.onnx to the server, send /ml_reload
+     *   to activate it immediately without restarting the bot process.
+     *
+     * Behavior:
+     *   • Clears current session
+     *   • Re-runs loadModel()
+     *   • Returns status string for Telegram reply
+     */
+    public async reloadModel(): Promise<string> {
+        logger.info('Model reload requested');
+
+        // Clear existing session first
+        this.session = null;
+        this.isModelLoaded = false;
+
+        try {
+            await this.loadModel();
+
+            if (this.isModelLoaded) {
+                return '✅ Model reloaded successfully. Predictions are active.';
+            } else {
+                return '❌ Model reload failed — check logs for details.';
+            }
+        } catch (err) {
+            return `❌ Model reload error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+    }
+
+    // =========================================================================
+    // FEATURE EXTRACTION
+    // =========================================================================
+    /**
+     * Extracts a fixed-length feature vector from market data.
+     *
+     * Called from:
+     *   • Strategy._computeScores() — for every potential signal
+     *   • simulateTrade() — to store features with simulation outcome
+     *
+     * Feature groups (order is fixed — do not reorder without retraining):
+     *   [0–14]  Technical indicators (RSI, EMA deviations, MACD, etc.)
+     *   [15–20] Excursion regime (buy MFE/MAE/ratio + sell MFE/MAE/ratio)
+     *   [21–24] Market context (OBV, VWAP, VWMA, price scaled)
+     *   [25]    Symbol index (normalized stable index from symbolRegistry)
+     *
+     * Total: 26 features
+     *
+     * @param input Full market context at signal time
+     * @returns Fixed-length number[] of length 26
+     */
     public async extractFeatures(input: StrategyInput): Promise<number[]> {
         const { symbol, primaryData, htfData, price } = input;
 
-        // Safety: prevent division by zero or invalid price
         if (price <= 0) {
-            logger.warn('Invalid price in extractFeatures – using fallback neutral vector', { symbol, price });
-            return new Array(25).fill(0);
+            logger.warn('Invalid price in extractFeatures – returning neutral vector', { symbol, price });
+            return new Array(26).fill(0);
         }
 
         const f: number[] = [];
 
-        // ── 1. Technical indicators (primary + HTF) – unchanged ─────────────────────────
+        // ── 1. Technical indicators [0–14] ───────────────────────────────────
         const indicators = computeIndicators(primaryData, htfData);
         const last = indicators.last;
 
         f.push(
-            last.rsi ? last.rsi / 100 : 0.5,                        // 0–1
-            last.emaShort ? (price - last.emaShort) / price : 0,    // relative deviation
-            last.emaMid ? (price - last.emaMid) / price : 0,
-            last.emaLong ? (price - last.emaLong) / price : 0,
-            last.macdLine ?? 0,                                     // raw (usually small)
-            last.macdSignal ?? 0,
-            last.macdHistogram ?? 0,
-            last.stochasticK ? last.stochasticK / 100 : 0.5,
-            last.stochasticD ? last.stochasticD / 100 : 0.5,
-            last.atr ? last.atr / price : 0,                        // volatility relative to price
-            last.htfAdx ? last.htfAdx / 100 : 0,                    // trend strength
-            last.percentB ?? 0.5,                                   // Bollinger position
-            last.bbBandwidth ? last.bbBandwidth / 100 : 0,          // volatility squeeze
-            last.momentum ? last.momentum / price : 0,              // momentum relative
-            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // categorical
+            last.rsi ? last.rsi / 100 : 0.5,  // [0]
+            last.emaShort ? (price - last.emaShort) / price : 0,  // [1]
+            last.emaMid ? (price - last.emaMid) / price : 0,  // [2]
+            last.emaLong ? (price - last.emaLong) / price : 0,  // [3]
+            last.macdLine ?? 0,                                 // [4]
+            last.macdSignal ?? 0,                                 // [5]
+            last.macdHistogram ?? 0,                                 // [6]
+            last.stochasticK ? last.stochasticK / 100 : 0.5,        // [7]
+            last.stochasticD ? last.stochasticD / 100 : 0.5,        // [8]
+            last.atr ? last.atr / price : 0,         // [9]
+            last.htfAdx ? last.htfAdx / 100 : 0,         // [10]
+            last.percentB ?? 0.5,                               // [11]
+            last.bbBandwidth ? last.bbBandwidth / 100 : 0,         // [12]
+            last.momentum ? last.momentum / price : 0,         // [13]
+            last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // [14]
         );
 
-        // ── 2. Pure directional excursion regime features (both sides) ──────────────────
+        // ── 2. Excursion regime features [15–20] ─────────────────────────────
         let regime;
         try {
             regime = excursionCache.getRegimeLite(symbol);
         } catch (err) {
-            logger.warn('Failed to fetch regime in extractFeatures – using neutral excursion features', { symbol, err });
+            logger.warn('Failed to fetch regime in extractFeatures', { symbol, err });
         }
 
         let buyMfe = 0, buyMae = 0, buyRatio = 0.2;
@@ -300,435 +247,233 @@ export class MLService {
             sellRatio = Math.min(10, regime.sell.excursionRatio ?? 1) / 5;
         }
 
-        // Push both sides (6 features)
-        f.push(buyMfe, buyMae, buyRatio);
-        f.push(sellMfe, sellMae, sellRatio);
+        f.push(buyMfe, buyMae, buyRatio);    // [15–17]
+        f.push(sellMfe, sellMae, sellRatio); // [18–20]
 
-        // Debug log (optional)
         if (logger.isDebugEnabled()) {
-            logger.debug('Added both-side excursion features', {
+            logger.debug('Excursion features', {
                 symbol,
                 buy: { mfe: buyMfe.toFixed(3), mae: buyMae.toFixed(3), ratio: buyRatio.toFixed(3), samples: regime?.buy?.sampleCount ?? 0 },
-                sell: { mfe: sellMfe.toFixed(3), mae: sellMae.toFixed(3), ratio: sellRatio.toFixed(3), samples: regime?.sell?.sampleCount ?? 0 }
+                sell: { mfe: sellMfe.toFixed(3), mae: sellMae.toFixed(3), ratio: sellRatio.toFixed(3), samples: regime?.sell?.sampleCount ?? 0 },
             });
         }
 
-        // ── 3. Market context features (volume, scaling) – unchanged ─────────────────────
+        // ── 3. Market context [21–24] ─────────────────────────────────────────
         f.push(
-            last.obv ? last.obv / 1e9 : 0,           // OBV scaled down
-            last.vwap ? last.vwap / 1e6 : 0,         // VWAP scaled
-            last.vwma ? last.vwma / 1e6 : 0,         // VWMA scaled
-            price / 1e5                              // price scaled (e.g. BTC ~60k → 0.6)
+            last.obv ? last.obv / 1e9 : 0,   // [21] OBV scaled
+            last.vwap ? last.vwap / 1e6 : 0,   // [22] VWAP scaled
+            last.vwma ? last.vwma / 1e6 : 0,   // [23] VWMA scaled
+            price / 1e5                        // [24] price scaled
         );
 
-        // ── Final validation: fixed length check (critical for model) ────────────────────
-        const expectedLength = 25; // 15 technical + 6 excursion + 4 context
-        if (f.length !== expectedLength) {
-            logger.error('Feature length mismatch in extractFeatures', {
-                expected: expectedLength,
-                actual: f.length,
-                symbol
+        // ── 4. Symbol identity [25] ───────────────────────────────────────────
+        // Allows the model to learn symbol-specific patterns.
+        // Without this, 250 samples from BTC/ETH/SOL train a model that has
+        // no way to know it's predicting for PEPE — which behaves differently.
+        //
+        // Unknown symbols get 0.0 (safe neutral fallback).
+        // See src/lib/utils/symbolRegistry.ts for index mapping.
+        if (!symbolRegistry.isKnown(symbol)) {
+            logger.warn('Unknown symbol in extractFeatures — model may generalize poorly', {
+                symbol,
+                hint: 'Add to config.symbols and retrain',
             });
+        }
+        f.push(symbolRegistry.getIndex(symbol)); // [25]
+
+        // ── Validation ────────────────────────────────────────────────────────
+        // 15 technical + 6 excursion + 4 context + 1 symbol = 26
+        const expectedLength = 26;
+        if (f.length !== expectedLength) {
+            logger.error('Feature length mismatch', { expected: expectedLength, actual: f.length, symbol });
             throw new Error(`Feature vector length error: expected ${expectedLength}, got ${f.length}`);
         }
 
-        // Final NaN/Infinity guard (should never happen)
         if (f.some(v => isNaN(v) || !isFinite(v))) {
-            logger.error('NaN or Infinity detected in final features – returning neutral vector', { symbol });
+            logger.error('NaN or Infinity in features — returning neutral vector', { symbol });
             return new Array(expectedLength).fill(0);
         }
 
         return f;
     }
 
-    // ===========================================================================
-    // PREDICTION – Evaluate feature vector and return label + confidence
-    // ===========================================================================
+    // =========================================================================
+    // PREDICTION
+    // =========================================================================
     /**
-     * Runs prediction on a feature vector using the loaded Random Forest model.
+     * Runs inference on a feature vector using the loaded ONNX model.
      *
      * Called from:
-     *   • Strategy.generateSignal() – to add ML bonus to signal score
+     *   • Strategy._computeScores() — await this.mlService.predict(features)
      *
-     * Logic:
-     *   • If no model loaded → neutral (0 confidence)
-     *   • Queries probability for all 5 labels
-     *   • Confidence = P(label 1) + P(label 2) → probability of profit
-     *   • Predicted label: 2 if strong win likely, 1 if moderate, else 0
+     * Note: This is async because onnxruntime-node's session.run() is async.
+     * The caller in strategy.ts must await this call.
      *
-     * @param features - Vector from extractFeatures()
-     * @returns { label: predicted outcome, confidence: profit probability }
+     * @param features Vector from extractFeatures() — must be length 26
+     * @returns { label, confidence } where confidence = P(label +1) + P(label +2)
      */
-    public predict(features: number[]): { label: SignalLabel; confidence: number } {
-        // Safety check – no model available yet
-        if (!this.isModelLoaded || this.classifier.estimators?.length === 0) {
+    public async predict(features: number[]): Promise<{ label: SignalLabel; confidence: number }> {
+        if (!this.isModelLoaded || !this.session) {
             return { label: 0, confidence: 0 };
         }
 
         try {
-            // Initialize probability map for all labels (original -2..2)
-            const probabilities: Record<SignalLabel, number> = {
-                [-2]: 0, [-1]: 0, [0]: 0, [1]: 0, [2]: 0,
-            };
+            // ONNX Runtime expects a Float32Array in a named tensor
+            // Input name must match what train.py exported ('float_input')
+            const inputTensor = new ort.Tensor(
+                'float32',
+                Float32Array.from(features),
+                [1, features.length]  // batch of 1
+            );
 
-            // Query probability for each possible internal label (0..4)
-            for (let internalLabel = 0; internalLabel < 5; internalLabel++) {
-                const probArray = this.classifier.predictProbability([features], internalLabel);
-                const originalLabel = this.INTERNAL_TO_LABEL[internalLabel];  // Map back to -2..2
-                probabilities[originalLabel] = probArray[0];  // Single-sample array
+            const feeds = { float_input: inputTensor };
+            const results = await this.session.run(feeds);
+
+            // XGBoost ONNX exports two outputs:
+            //   'label'         — argmax class (int64)
+            //   'probabilities' — softmax probabilities per class (float32)
+            // We use probabilities for nuanced confidence calculation
+            const probTensor = results['probabilities'];
+            if (!probTensor) {
+                logger.error('ONNX output "probabilities" not found', {
+                    availableOutputs: Object.keys(results),
+                });
+                return { label: 0, confidence: 0 };
             }
 
-            // Extract individual probabilities
-            const pNeg2 = probabilities[-2];
-            const pNeg1 = probabilities[-1];
-            const pZero = probabilities[0];
-            const pPos1 = probabilities[1];
-            const pPos2 = probabilities[2];
+            const probData = probTensor.data as Float32Array;
 
-            // Confidence = probability of any profitable outcome
+            // Internal labels 0..4 map back to -2..+2
+            const pNeg2 = probData[0];
+            const pNeg1 = probData[1];
+            const pZero = probData[2];
+            const pPos1 = probData[3];
+            const pPos2 = probData[4];
+
+            // Confidence = combined probability of any profitable outcome
             const positiveConfidence = pPos1 + pPos2;
 
-            // Determine strongest predicted label
-            // Prioritize strong wins (2), then moderate (1), else neutral
+            // Strongest predicted label
             const predictedLabel: SignalLabel = pPos2 > pPos1 ? 2 : pPos1 >= 0.35 ? 1 : 0;
 
-            // Debug log for monitoring prediction quality
-            logger.debug('ML Prediction', {
-                confidence: positiveConfidence.toFixed(4),
+            logger.debug('ONNX Prediction', {
                 predictedLabel,
-                probs: { '-2': pNeg2.toFixed(3), '-1': pNeg1.toFixed(3), '0': pZero.toFixed(3), '1': pPos1.toFixed(3), '2': pPos2.toFixed(3) },
+                confidence: positiveConfidence.toFixed(4),
+                probs: {
+                    '-2': pNeg2.toFixed(3),
+                    '-1': pNeg1.toFixed(3),
+                    ' 0': pZero.toFixed(3),
+                    '+1': pPos1.toFixed(3),
+                    '+2': pPos2.toFixed(3),
+                },
             });
 
             return { label: predictedLabel, confidence: positiveConfidence };
+
         } catch (err) {
-            // Any error → fall back to neutral (safe default)
-            logger.error('ML prediction failed', { error: err instanceof Error ? err.message : err });
+            logger.error('ONNX prediction failed', {
+                error: err instanceof Error ? err.message : String(err),
+                featuresLength: features.length,
+            });
             return { label: 0, confidence: 0 };
         }
     }
 
-    /**
- * Retrains the Random Forest model using all labeled simulations from the DB.
- *
- * Called from:
- *   • forceRetrain() – manually via Telegram /ml_train
- *   • (Future: optional periodic trigger after N new samples)
- *
- * Current reality (after merging trainingSamples → simulatedTrades):
- *   - Source table: simulatedTrades
- *   - Filter: WHERE label IS NOT NULL
- *   - Labels remapped internally (-2..2 → 0..4) to avoid ml-cart negative index crash
- *   - Heavy filtering for clean data (NaN/Infinity, invalid labels)
- *   - No separate ingestion step — simulations already stored complete
- *
- * @private – called internally or via force command
- */
-    public async retrain(): Promise<void> {
-        if (this.isTrainingPaused) {
-            logger.info('Training is paused — skipping retrain');
-            return;
-        }
-
-        try {
-            // 1. Load all labeled simulations (WHERE label IS NOT NULL)
-            const allSamples = await dbService.getLabeledSimulations();
-            logger.info(`Loaded ${allSamples.length} labeled simulations for retraining`);
-
-            if (allSamples.length < config.ml.minSamplesToTrain) {
-                logger.warn(`Not enough labeled samples to retrain (${allSamples.length} < ${config.ml.minSamplesToTrain})`);
-                return;
-            }
-
-            // 2. Label remapping: -2→0, -1→1, 0→2, 1→3, 2→4
-            const labelToInternal: Record<SignalLabel, number> = {
-                '-2': 0,
-                '-1': 1,
-                '0': 2,
-                '1': 3,
-                '2': 4
-            };
-
-            // 3. Filter & clean samples (critical for stability)
-            const validSamples = allSamples.filter(sample => {
-                // Must have valid features array
-                if (!Array.isArray(sample.features) || sample.features.length === 0) {
-                    return false;
-                }
-
-                // No NaN/Infinity in features
-                const hasInvalidFeature = sample.features.some(v =>
-                    typeof v !== 'number' || isNaN(v) || !isFinite(v)
-                );
-
-                // Label must be valid integer -2..2
-                const label = sample.label;
-                const validLabel = typeof label === 'number' && Number.isInteger(label) && [-2, -1, 0, 1, 2].includes(label);
-
-                return !hasInvalidFeature && validLabel;
-            });
-
-            if (validSamples.length < allSamples.length) {
-                logger.warn(
-                    `Filtered out ${allSamples.length - validSamples.length} invalid samples ` +
-                    `(NaN/Infinity features or invalid labels)`
-                );
-            }
-
-            if (validSamples.length < Math.max(20, config.ml.minSamplesToTrain / 2)) {
-                logger.error(`Too few valid samples after filtering (${validSamples.length}) — cannot train`);
-                return;
-            }
-
-            // 4. Prepare training matrices
-            const X = validSamples.map(s => s.features).filter(f => Array.isArray(f) && f.length > 0) as number[][];
-            const y = validSamples.map(s => labelToInternal[s.label as SignalLabel]);
-
-            // Debug: internal label distribution (0–4)
-            const internalCounts = y.reduce((acc: Record<number, number>, lbl) => {
-                acc[lbl] = (acc[lbl] || 0) + 1;
-                return acc;
-            }, {});
-            logger.info('Internal label distribution (0–4):', internalCounts);
-
-            // Debug: original label distribution (-2..2)
-            const originalCounts = validSamples.reduce((acc: Record<number, number>, s) => {
-                acc[s.label!] = (acc[s.label!] || 0) + 1;
-                return acc;
-            }, {});
-            logger.info('Original label distribution (-2..+2):', originalCounts);
-
-            logger.info(`Starting training on ${X.length} clean samples (${X[0]?.length ?? 0} features)`);
-
-            // 5. Train the model
-            this.classifier.train(X, y);
-
-            logger.info('Training completed successfully');
-
-            // 6. Persist the model
-            await this.saveModel();
-            this.isModelLoaded = true;
-
-            // 7. Final report
-            const dist = await dbService.getLabelDistribution();
-            logger.info('Model retrained & saved', {
-                samplesUsed: X.length,
-                originalDistribution: dist.map(d => `${d.label}:${d.count}`).join(', ')
-            });
-
-        } catch (err) {
-            logger.error('Retraining failed', {
-                error: err instanceof Error ? err.stack : String(err),
-                message: err instanceof Error ? err.message : 'Unknown error'
-            });
-        }
-    }
-
     // =========================================================================
-    // TRAINING CONTROL: Manually pause ML training
+    // TRAINING CONTROL (no-ops in ONNX mode — kept for API compatibility)
     // =========================================================================
-    /**
-     * Pauses automatic ML model training.
-     *
-     * Called from:
-     *   • TelegramBotController – /ml_pause command
-     *
-     * Purpose:
-     *   • Temporarily stop ingesting new samples and retraining
-     *   • Useful during market anomalies, backtesting, or debugging
-     *   • Does NOT affect predictions (loaded model still works)
-     *
-     * State:
-     *   • Sets isTrainingPaused = true
-     *   • ingestSimulatedOutcome() will skip saving samples
-     *   • retrain() will early-return
-     */
-    public pauseTraining() {
+    // These methods are called by existing Telegram commands (/ml_pause etc).
+    // They are kept so nothing else in the codebase needs to change.
+    // Actual training happens in ml/train.py on your local machine.
+
+    public pauseTraining(): void {
         this.isTrainingPaused = true;
-        logger.warn('ML training PAUSED');
+        logger.info('ML training paused (no-op in ONNX mode — training is local)');
     }
 
-    // =========================================================================
-    // TRAINING CONTROL: Resume normal ML training
-    // =========================================================================
-    /**
-     * Resumes automatic training after a pause.
-     *
-     * Called from:
-     *   • TelegramBotController – /ml_resume command
-     *
-     * Behavior:
-     *   • Clears pause flag
-     *   • New simulations will again be saved and trigger retraining
-     */
-    public resumeTraining() {
+    public resumeTraining(): void {
         this.isTrainingPaused = false;
-        logger.info('ML training RESUMED');
+        logger.info('ML training resumed (no-op in ONNX mode — training is local)');
     }
 
-    // =========================================================================
-    // TRAINING CONTROL: Force immediate retraining
-    // =========================================================================
-    /**
-     * Triggers a full model retrain regardless of sample count or pause state.
-     *
-     * Called from:
-     *   • TelegramBotController – /ml_train command
-     *
-     * Use cases:
-     *   • After manual data fixes or imports
-     *   • When you want fresh predictions immediately
-     *   • Debugging model performance
-     *
-     * Note:
-     *   • Still respects minimum sample threshold in retrain()
-     *   • Logs clearly for monitoring
-     */
+    public async retrain(): Promise<void> {
+        logger.info('retrain() called — in ONNX mode, run ml/train.py locally');
+    }
+
     public async forceRetrain(): Promise<void> {
-        logger.info('Force retrain triggered');
-        await this.retrain();
+        logger.info(
+            'forceRetrain() called — training now happens locally.\n' +
+            '  Steps: export CSV → run ml/train.py → validate → upload → /ml_reload'
+        );
     }
 
     // =========================================================================
-    // STATUS REPORTING: Formatted ML system status
+    // STATUS REPORTING
     // =========================================================================
-    /**
-     * Returns a human-readable status summary of the ML system.
-     *
-     * Used by:
-     *   • TelegramBotController – /ml_status command
-     *   • Debugging and monitoring tools
-     *
-     * Includes:
-     *   • Whether model is loaded and how many trees
-     *   • Training pause state
-     *   • Total training samples
-     *   • Current label distribution (-2 to +2)
-     *
-     * @returns Multi-line string formatted for easy reading
-     */
     public async getStatus(): Promise<string> {
-        // Fetch latest counts from database
         const count = await dbService.getSampleCount();
         const dist = await dbService.getLabelDistribution();
 
-        // Tree-style formatted status
+        const modelInfo = this.isModelLoaded
+            ? 'YES (ONNX — XGBoost)'
+            : 'NO — upload model.onnx and send /ml_reload';
+
         return [
-            `ML Model Status`,
-            `├─ Loaded: ${this.isModelLoaded ? 'YES' : 'NO'} (${this.classifier.estimators?.length ?? 0} trees)`,
-            `├─ Training Paused: ${this.isTrainingPaused ? 'YES' : 'NO'}`,
-            `├─ Total Samples: ${count}`,
-            `└─ Label Distribution: ${dist.map(d => `${d.label}(${d.count})`).join(', ')}`,
+            'ML Model Status',
+            `├─ Engine:          ONNX Runtime (inference only)`,
+            `├─ Model Loaded:    ${modelInfo}`,
+            `├─ Training Paused: ${this.isTrainingPaused ? 'YES' : 'NO'} (training is local)`,
+            `├─ Total Samples:   ${count}`,
+            `└─ Label Dist:      ${dist.map(d => `${d.label}(${d.count})`).join(', ')}`,
         ].join('\n');
     }
 
-    /**
- * Generates a formatted summary of labeled simulations broken down by symbol.
- *
- * Called from:
- *   • TelegramBotController – /ml_samples command
- *
- * Output format (Telegram-friendly):
- *   SYMBOL: X simulations (B buys, S sells; W% wins)
- *
- * Details:
- *   • Uses dbService.getSimulationSummaryBySymbol() – efficient GROUP BY query
- *   • Calculates win rate client-side (label >= 1 = win)
- *   • Safe handling: empty result or DB error
- *
- * @returns Multi-line string ready for Telegram message
- */
     public async getSampleSummary(): Promise<string> {
         try {
-            // Fetch pre-aggregated per-symbol stats from DB
             const summary = await dbService.getSimulationSummaryBySymbol();
-
-            if (summary.length === 0) {
-                return 'No labeled simulations yet.';
-            }
-
-            // Format each symbol line (same style as before)
+            if (summary.length === 0) return 'No labeled simulations yet.';
             return summary
                 .map(s =>
                     `${s.symbol}: ${s.total} simulations ` +
                     `(${s.buys} buys, ${s.sells} sells; ${((s.wins / s.total) * 100).toFixed(1)}% wins)`
                 )
                 .join('\n');
-        } catch (error) {
-            logger.error('Failed to retrieve simulation summary', {
-                error: error instanceof Error ? error.stack : String(error),
-            });
+        } catch (err) {
+            logger.error('Failed to retrieve simulation summary', { error: err });
             return 'Error retrieving simulation summary.';
         }
     }
 
-    // =========================================================================
-    // REPORTING: Overall ML performance metrics
-    // =========================================================================
-    /**
-     * Provides high-level performance statistics across all simulations.
-     *
-     * Called from:
-     *   • TelegramBotController – /ml_performance command
-     *
-     * Metrics:
-     *   • Total simulated trades
-     *   • Global win rate (label >= 1)
-     *   • Per-symbol win rate breakdown
-     *
-     * Why separate from getSampleSummary?
-     *   • Focuses on performance (win rate) vs raw sample counts
-     *   • Used for quick health check of the strategy
-     *
-     * @returns Multi-line string with global + per-symbol metrics
-     */
     public async getPerformanceMetrics(): Promise<string> {
         try {
-            // Load full dataset for global calculation
             const samples = await dbService.getTrainingSamples();
             if (samples.length === 0) return 'No trade data available.';
 
             const totalTrades = samples.length;
-
-            // Count profitable outcomes (label 1 or 2)
             const wins = samples.filter(s => s.label! >= 1).length;
             const winRate = ((wins / totalTrades) * 100).toFixed(1);
-
-            // Per-symbol breakdown (reuses efficient query)
             const bySymbol = await dbService.getSimulationSummaryBySymbol();
 
-            // Build formatted report
             return [
                 `Total trades: ${totalTrades}`,
                 `Win rate: ${winRate}%`,
-                ...bySymbol.map(s => `${s.symbol}: ${s.total} trades, ${((s.wins / s.total) * 100).toFixed(1)}% wins`),
+                ...bySymbol.map(s =>
+                    `${s.symbol}: ${s.total} trades, ${((s.wins / s.total) * 100).toFixed(1)}% wins`
+                ),
             ].join('\n');
-        } catch (error) {
-            logger.error('Failed to retrieve performance metrics', { error: (error as Error).stack });
-            return 'Error retrieving performance metrics';
+        } catch (err) {
+            logger.error('Failed to retrieve performance metrics', { error: err });
+            return 'Error retrieving performance metrics.';
         }
     }
 
     // =========================================================================
-    // HEALTH CHECK: Is the ML model ready for predictions?
+    // HEALTH CHECK
     // =========================================================================
-    /**
-     * Quick check if a trained model is loaded and valid.
-     *
-     * Used by:
-     *   • Strategy.generateSignal() – to decide whether to use ML bonus
-     *   • Status commands and monitoring
-     *
-     * Returns true only if:
-     *   • Model successfully loaded from disk
-     *   • Has at least one decision tree
-     *
-     * @returns true if predictions are available
-     */
     public isReady(): boolean {
-        // Must be loaded AND have actual trees
-        return this.isModelLoaded && (this.classifier.estimators?.length ?? 0) > 0;
+        return this.isModelLoaded && this.session !== null;
     }
 }
 
-// Export singleton for easy import
+// Singleton — same pattern as before, nothing else needs to change
 export const mlService = new MLService();

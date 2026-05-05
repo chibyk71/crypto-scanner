@@ -1,0 +1,4 @@
+# Training data exports — not committed
+# Download via /export_training_data Telegram command
+*.csv
+*.json

@@ -173,6 +173,9 @@ export class TelegramBotController {
         this.bot.onText(/\/ml_train/, this.handleMLForceTrain.bind(this));
         this.bot.onText(/\/ml_samples/, this.handleMLSamples.bind(this));
         this.bot.onText(/\/ml_performance/, this.handleMLPerformance.bind(this));
+        // Inside registerListeners(), in the ML section:
+        this.bot.onText(/\/ml_reload/, this.handleMLReload.bind(this));
+        this.bot.onText(/\/export_training_data/, this.handleExportTrainingData.bind(this));
 
         // 5. Live Trading & Position Monitoring
         this.bot.onText(/\/positions/, this.handlePositions.bind(this));
@@ -1293,6 +1296,9 @@ export class TelegramBotController {
             '• `/ml_train` — Force immediate model retraining',
             '• `/ml_samples` — Training sample breakdown by symbol',
             '• `/ml_performance` — Overall strategy performance metrics',
+            // Inside the helpText array in handleHelp():
+            '• `/ml_reload` — Load newly uploaded model.onnx without restarting',
+            '• `/export_training_data` — Download labeled simulations as CSV for local training',
             '',
             '*⚙️ System Control*',
             '• `/stopbot` — Emergency shutdown (releases lock, clears state)',
@@ -1604,6 +1610,117 @@ export class TelegramBotController {
                 'Sorry, there was an error fetching the taken trade statistics.\n' +
                 'Please check the logs or try again later.',
                 { parse_mode: 'Markdown' }
+            );
+        }
+    };
+
+    /**
+ * Handles /ml_reload command.
+ * Reloads the ONNX model from disk without restarting the bot.
+ * Use after uploading a new model.onnx to the server.
+ */
+    private handleMLReload = async (msg: TelegramBot.Message): Promise<void> => {
+        if (!this.isAuthorized(msg.chat.id)) return;
+
+        const chatId = msg.chat.id;
+
+        try {
+            await this.bot.sendMessage(chatId, '🔄 Reloading ONNX model from disk...');
+
+            const result = await this.mlService.reloadModel();
+
+            await this.bot.sendMessage(chatId, result);
+
+            logger.info('ML model reloaded via Telegram command', { chatId });
+        } catch (err: any) {
+            logger.error('Failed to reload ML model', { error: err.message });
+            await this.bot.sendMessage(chatId, '❌ Model reload failed. Check server logs.');
+        }
+    };
+
+    /**
+     * Handles /export_training_data command.
+     * Queries all labeled simulations, builds a CSV in memory,
+     * and sends it as a file attachment in Telegram.
+     *
+     * The user downloads this file and drops it in ml/data/training_export.csv
+     * before running ml/train.py locally.
+     */
+    private handleExportTrainingData = async (msg: TelegramBot.Message): Promise<void> => {
+        if (!this.isAuthorized(msg.chat.id)) return;
+
+        const chatId = msg.chat.id;
+
+        try {
+            await this.bot.sendMessage(chatId, '⏳ Exporting training data...');
+
+            const rows = await dbService.getExportableSimulations();
+
+            if (rows.length === 0) {
+                await this.bot.sendMessage(
+                    chatId,
+                    'ℹ️ No labeled simulations found yet.\n' +
+                    'The bot needs to run simulations and label them before export is possible.'
+                );
+                return;
+            }
+
+            // ── Build CSV in memory ───────────────────────────────────────────────
+            // Header must match exactly what ml/utils.py expects
+            const header = 'symbol,side,label,outcome,closed_at,features';
+
+            const csvRows = rows.map(row => {
+                // Escape the features JSON string for CSV:
+                //   • wrap in double quotes
+                //   • escape any existing double quotes by doubling them
+                const escapedFeatures = `"${row.features.replace(/"/g, '""')}"`;
+
+                return [
+                    row.symbol,
+                    row.side,
+                    row.label,
+                    row.outcome ?? '',
+                    row.closedAt ?? '',
+                    escapedFeatures,
+                ].join(',');
+            });
+
+            const csv = [header, ...csvRows].join('\n');
+
+            // ── Send as file attachment ───────────────────────────────────────────
+            // Telegram's sendDocument accepts a Buffer with a filename
+            // No temp file needed — stays in memory
+            const buffer = Buffer.from(csv, 'utf-8');
+            const filename = `training_export_${Date.now()}.csv`;
+
+            await this.bot.sendDocument(
+                chatId,
+                buffer,
+                {
+                    caption:
+                        `✅ ${rows.length} labeled simulations exported.\n` +
+                        `Drop this file in ml/data/training_export.csv then run ml/train.py`,
+                },
+                {
+                    filename,
+                    contentType: 'text/csv',
+                }
+            );
+
+            logger.info('Training data exported via Telegram', {
+                chatId,
+                rowCount: rows.length,
+                filename,
+            });
+
+        } catch (err: any) {
+            logger.error('Failed to export training data', {
+                error: err.message,
+                stack: err.stack,
+            });
+            await this.bot.sendMessage(
+                chatId,
+                '❌ Export failed. Check server logs for details.'
             );
         }
     };

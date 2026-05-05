@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "6ce5b13d-1455-47c8-ba49-ffb4fcd41be4",
+  "id": "ffc78803-20d8-4ff7-a8f0-d13d92b791d2",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -401,6 +401,14 @@
           "notNull": false,
           "autoincrement": false
         },
+        "confidence": {
+          "name": "confidence",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false,
+          "default": 0
+        },
         "tp_levels": {
           "name": "tp_levels",
           "type": "json",
@@ -493,6 +501,13 @@
         "features": {
           "name": "features",
           "type": "json",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "was_taken": {
+          "name": "was_taken",
+          "type": "boolean",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

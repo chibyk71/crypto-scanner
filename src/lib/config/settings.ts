@@ -134,7 +134,7 @@ const ConfigSchema = z.object({
     // ML Training
     // ──────────────────────────────────────────────────────────────
     MIN_SAMPLES_TO_TRAIN: z.coerce.number().default(150),
-    MODEL_PATH: z.string().default('./models/rf_model.json'),
+    MODEL_PATH: z.string().default('./models/model.onnx'),
     TRAINING_MODE: z.coerce.boolean().default(true),
 
     // ──────────────────────────────────────────────────────────────

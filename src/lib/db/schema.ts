@@ -239,6 +239,9 @@ export const simulatedTrades = mysqlTable(
         /** Trailing stop distance ×1e8 (nullable if no trailing) */
         trailingDist: float('trailing_dist'),
 
+        /* Confidence score from strategy (1 to 100) */
+        confidence: float('confidence').default(0),
+
         /**
          * Partial take-profit levels
          * Array of objects: { price: number ×1e8, weight: number (0-1) }

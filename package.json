@@ -56,6 +56,7 @@
         "ml-random-forest": "^2.1.0",
         "mysql2": "^3.14.5",
         "node-telegram-bot-api": "^0.66.0",
+        "onnxruntime-node": "^1.25.1",
         "pm2": "^6.0.10",
         "technicalindicators": "^3.1.0",
         "winston": "^3.17.0",

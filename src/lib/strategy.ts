@@ -97,7 +97,8 @@ const VWMA_SLOPE_POINTS = 5;                  // ← Direction of VWMA itself
 const ADX_POINTS = 10;                        // ← Confirms a trending market
 const ENGULFING_POINTS = 15;                  // ← Strong price-action candle
 const ML_BONUS_MAX = 20;                      // ← Max points added from ML probability
-
+const PERCENT_B_POINTS = 10;        // BB position directional scoring
+const PERCENT_B_COMBO_POINTS = 5;   // bonus when percent_b + engulfing align
 
 // Total possible points per side (used later to normalise confidence)
 const MAX_SCORE_PER_SIDE =
@@ -112,6 +113,8 @@ const MAX_SCORE_PER_SIDE =
     VWMA_SLOPE_POINTS +
     ADX_POINTS +
     ENGULFING_POINTS +
+    PERCENT_B_POINTS +
+    PERCENT_B_COMBO_POINTS +
     ML_BONUS_MAX;
 
 const ML_CONFIDENCE_DISCOUNT = 0.8;           // ← If model not trained, cut its vote by 20%
@@ -461,6 +464,38 @@ export class Strategy {
             reasons.push('Bearish Engulfing candle confirmed with volume surge');
         }
 
+        // -------------------- BOLLINGER BAND POSITION --------------------
+        // Data shows: buying in lower BB zone (percent_b < 0.4) has 47% win rate
+        // vs 24% when buying near top (percent_b > 0.7) — almost 2x difference.
+        // Mirror logic for sells: selling near the top of the band is favourable.
+        //
+        // Thresholds are conservative starting points — revisit after 1000+ samples.
+        const percentB = indicators.last.percentB ?? 0.5;
+
+        if (percentB < 0.4) {
+            // Price in lower third of BB — good entry zone for buys
+            buyScore += PERCENT_B_POINTS;
+            sellScore -= PERCENT_B_POINTS;  // penalty: selling at a low is risky
+            reasons.push(`Bullish BB position: percent_b=${percentB.toFixed(3)} (lower zone)`);
+        } else if (percentB > 0.7) {
+            // Price in upper third of BB — good entry zone for sells
+            sellScore += PERCENT_B_POINTS;
+            buyScore -= PERCENT_B_POINTS;  // penalty: buying near the top is risky
+            reasons.push(`Bearish BB position: percent_b=${percentB.toFixed(3)} (upper zone)`);
+        }
+        // percent_b 0.4–0.7 is neutral — no points awarded either way
+
+        // -------------------- PERCENT_B + ENGULFING COMBO BONUS --------------------
+        // 22% of good trades had both percent_b < 0.5 AND an engulfing signal
+        // vs only 14% of bad trades — a meaningful combination worth a small bonus.
+        if (lastPattern === 'bullish' && percentB < 0.5) {
+            buyScore += PERCENT_B_COMBO_POINTS;
+            reasons.push(`BB+Engulfing combo: bullish engulfing in lower BB half`);
+        } else if (lastPattern === 'bearish' && percentB > 0.5) {
+            sellScore += PERCENT_B_COMBO_POINTS;
+            reasons.push(`BB+Engulfing combo: bearish engulfing in upper BB half`);
+        }
+
         // -------------------- ML PREDICTION INTEGRATION --------------------
         const features = await this.mlService.extractFeatures(input);
 
@@ -469,7 +504,7 @@ export class Strategy {
         let predictedLabel: SignalLabel = 0;
 
         if (this.mlService.isReady()) {
-            const prediction = this.mlService.predict(features);
+            const prediction = await this.mlService.predict(features);
 
             predictedLabel = prediction.label;
             mlWinConfidence = prediction.confidence;

@@ -1,0 +1,7 @@
+xgboost-cpu==3.2.0
+onnxmltools==1.16.0
+skl2onnx==1.20.0
+onnx==1.21.0
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0

@@ -847,6 +847,7 @@ class DatabaseService {
      * @param entryPrice Entry price (raw number, will be stored as-is)
      * @param openedAt Unix ms timestamp when simulation was started (defaults to now)
      * @param features Optional initial feature vector
+     * @param confidence Confidence score from strategy (1 to 100)
      * @returns The created row (with defaults applied)
      */
     public async createNewSimulation(
@@ -855,7 +856,8 @@ class DatabaseService {
         side: 'buy' | 'sell',
         entryPrice: number,
         openedAt: number = Date.now(),
-        features?: number[]
+        features?: number[],
+        confidence: number = 0
     ): Promise<string> {
         try {
             const [inserted] = await this.db
@@ -867,6 +869,7 @@ class DatabaseService {
                     entryPrice,               // stored as raw float
                     openedAt,
                     wasTaken: false,
+                    confidence,
                     // Default/starting values
                     pnl: 0,
                     rMultiple: 0,
@@ -1159,6 +1162,77 @@ class DatabaseService {
                 totalPnL: 0,
                 outcomes: { tp: 0, partial_tp: 0, sl: 0, timeout: 0 },
             };
+        }
+    }
+
+
+    // =========================================================================
+    // TRAINING DATA EXPORT: Fetch all labeled simulations for CSV export
+    // =========================================================================
+    /**
+     * Fetches all labeled simulations formatted for CSV export.
+     * Called by TelegramBotController /export_training_data command.
+     *
+     * Returns only the columns Python needs:
+     *   • features  — JSON array string (parsed by ml/utils.py)
+     *   • label     — integer -2..+2
+     *   • symbol    — for debugging/filtering in Python
+     *   • side      — 'buy' | 'sell' (useful for per-side analysis)
+     *   • outcome   — 'tp' | 'sl' | 'timeout' etc
+     *   • closed_at — timestamp (useful for time-based filtering)
+     *
+     * Deliberately excludes heavy columns (pnl raw bytes, tpLevels JSON etc)
+     * to keep the CSV file small and fast to send via Telegram.
+     */
+    public async getExportableSimulations(): Promise<Array<{
+        symbol: string;
+        side: string;
+        label: number;
+        outcome: string | null;
+        closedAt: number | null;
+        features: string;  // JSON string — Python parses this
+    }>> {
+        try {
+            const rows = await this.db
+                .select({
+                    symbol: simulatedTrades.symbol,
+                    side: simulatedTrades.side,
+                    label: simulatedTrades.label,
+                    outcome: simulatedTrades.outcome,
+                    closedAt: simulatedTrades.closedAt,
+                    features: simulatedTrades.features,
+                })
+                .from(simulatedTrades)
+                .where(
+                    and(
+                        isNotNull(simulatedTrades.label),
+                        isNotNull(simulatedTrades.features),
+                        isNotNull(simulatedTrades.closedAt),
+                    )
+                )
+                .orderBy(desc(simulatedTrades.closedAt))
+                .execute();
+
+            // Serialize features to JSON string so CSV stays flat
+            // Python's pandas reads this as a string then json.loads() each cell
+            return rows.map(row => ({
+                symbol: row.symbol,
+                side: row.side,
+                label: row.label!,
+                outcome: row.outcome,
+                closedAt: row.closedAt,
+                // features may already be an object if Drizzle parsed it —
+                // always stringify so the CSV cell is a clean JSON string
+                features: typeof row.features === 'string'
+                    ? row.features
+                    : JSON.stringify(row.features),
+            }));
+
+        } catch (err) {
+            logger.error('Failed to fetch exportable simulations', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return [];
         }
     }
 
