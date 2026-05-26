@@ -25,6 +25,12 @@ export interface SimulationHistoryEntry {
 
     /** Time from entry to peak adverse excursion (ms) */
     timeToMAE_ms: number;
+
+    /**
+  * The label the ML model predicted when this signal was generated.
+  * Undefined if model was not loaded at signal time.
+  */
+    mlPredictedLabel?: SignalLabel;
 }
 
 /**

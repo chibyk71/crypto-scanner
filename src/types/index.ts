@@ -128,6 +128,7 @@ export interface PartialTPLevel {
  *   • Trailing stops
  *   • MFE/MAE tracking
  *   • Feature vector for immediate ML ingestion
+ *   • ML prediction at signal time (mlPredictedLabel + mlConfidence)
  */
 export interface TradeSignal {
     /** Trading pair (e.g., 'BTC/USDT') */
@@ -157,7 +158,19 @@ export interface TradeSignal {
     /** Scale position size based on confidence/risk (0.1 → 1.0) */
     positionSizeMultiplier?: number;
 
-    /** Raw probability from ML model (0–1) – only present if model trained */
+    /**
+     * The label the ML model predicted at signal generation time (-2 to +2).
+     * This is what the model THOUGHT would happen, stored for later comparison
+     * against the actual simulation outcome label.
+     * Only present when the ML model was loaded and made a prediction.
+     */
+    mlPredictedLabel?: SignalLabel;
+
+    /**
+     * Raw probability from ML model (0–1).
+     * For the single-model setup this is P(label +1) + P(label +2).
+     * Only present if model is loaded and trained.
+     */
     mlConfidence?: number;
 
     /** Feature vector used for this prediction – critical for training */

@@ -379,7 +379,9 @@ export class MarketScanner {
                         signal,
                         currentPrice,
                         signal.features,
-                        correlationId
+                        correlationId,
+                        signal.mlPredictedLabel,  // ← ADD
+                        signal.mlConfidence,      // ← ADD
                     ).catch(err => {
                         logger.error(`[${correlationId}] Background simulation failed`, {
                             symbol,

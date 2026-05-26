@@ -298,7 +298,13 @@ export const simulatedTrades = mysqlTable(
          */
         features: json('features').$type<number[] | null>(),
 
-        wasTaken: boolean('was_taken').$default(() => false)
+        wasTaken: boolean('was_taken').$default(() => false),
+
+        /** ML model's predicted label at signal generation time (-2 to +2) */
+        mlPredictedLabel: int('ml_predicted_label'),  // ← ADD
+
+        /** ML model's combined positive confidence at signal time (0-1) */
+        mlPredictedConfidence: float('ml_predicted_confidence'),  // ← ADD
     },
     (table) => ({
         /** Fast lookup by signal UUID */

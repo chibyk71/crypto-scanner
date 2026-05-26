@@ -857,7 +857,9 @@ class DatabaseService {
         entryPrice: number,
         openedAt: number = Date.now(),
         features?: number[],
-        confidence: number = 0
+        confidence: number = 0,
+        mlPredictedLabel?: number,
+        mlPredictedConfidence?: number,
     ): Promise<string> {
         try {
             const [inserted] = await this.db
@@ -887,6 +889,8 @@ class DatabaseService {
                     label: null,
                     // Optional features
                     features: features && features.length > 0 ? features : null,
+                    mlPredictedLabel: mlPredictedLabel ?? null,
+                    mlPredictedConfidence: mlPredictedConfidence ?? null,
                 })
                 .$returningId()
 

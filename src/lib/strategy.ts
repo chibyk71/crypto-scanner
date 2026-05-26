@@ -77,6 +77,7 @@ interface ScoresAndML {
      *   - Helps ensure continuous simulation and history population for better future excursion decisions.
      */
     potentialDirection: 'long' | 'short' | null;
+    mlPredictedLabel?: SignalLabel;  // Optional: the raw label predicted by the ML model at signal generation time (for later comparison with actual outcome)
 }
 
 // ---------------------------------------------------------------
@@ -558,7 +559,7 @@ export class Strategy {
             reasons.push('No clear pre-excursion potential direction');
         }
 
-        return { buyScore, sellScore, features, mlConfidence: mlWinConfidence, potentialDirection };
+        return { buyScore, sellScore, features, mlConfidence: mlWinConfidence, potentialDirection, mlPredictedLabel: this.mlService.isReady() ? predictedLabel : undefined };
     }
 
     // =========================================================================
@@ -950,6 +951,7 @@ export class Strategy {
                 trailingStopDistance,
                 positionSizeMultiplier,
                 mlConfidence: this.mlService.isReady() ? mlConfidence : undefined,
+                mlPredictedLabel: scoringResult.mlPredictedLabel,
                 tplevels
             });
 
@@ -996,6 +998,7 @@ export class Strategy {
         positionSizeMultiplier?: number;
         mlConfidence?: number;
         tplevels?: PartialTPLevel[];
+        mlPredictedLabel?: SignalLabel;
     }): TradeSignal {
         const {
             symbol,
@@ -1025,7 +1028,8 @@ export class Strategy {
             trailingStopDistance: hasValidSignal ? trailingStopDistance : undefined,
             positionSizeMultiplier: hasValidSignal ? positionSizeMultiplier : undefined,
             mlConfidence,
-            takeProfitLevels: hasValidSignal ? params.tplevels ?? [] : []
+            takeProfitLevels: hasValidSignal ? params.tplevels ?? [] : [],
+            mlPredictedLabel: hasValidSignal ? params.mlPredictedLabel : undefined,
         };
     }
 }

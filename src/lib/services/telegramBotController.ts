@@ -2359,7 +2359,7 @@ export class TelegramBotController {
         // ─────────────────────────────────────────────────────────────────────────
 
         /** Sides with fewer than this many samples get a "thin data" warning */
-        const MIN_RELIABLE_SAMPLES = 7;
+        const MIN_RELIABLE_SAMPLES = 3;
 
         /** MFE/MAE display threshold — show even small values at scalping scale */
         const MIN_DISPLAY_PCT = 0.15;
@@ -2410,11 +2410,24 @@ export class TelegramBotController {
         if (signal.confidence > 0) {
             confParts.push(`${esc(signal.confidence.toFixed(1))}%`);
         }
-        if (signal.mlConfidence !== undefined) {
-            confParts.push(`ML ${esc(signal.mlConfidence.toFixed(1))}%`);
-        }
         if (confParts.length > 0) {
             lines.push(`⚡ Confidence: ${confParts.join(' · ')}`);
+        }
+
+        // ML prediction block — only show when model made a prediction
+        if (signal.mlConfidence !== undefined && signal.mlPredictedLabel !== undefined) {
+            const labelStr = signal.mlPredictedLabel >= 0
+                ? `\\+${signal.mlPredictedLabel}`
+                : `${signal.mlPredictedLabel}`;
+            const positivePct = esc((signal.mlConfidence * 100).toFixed(1));
+            const negativePct = esc(((1 - signal.mlConfidence) * 100).toFixed(1));
+            const negativeWarning = (1 - signal.mlConfidence) >= 0.35
+                ? ` ⚠️ negative risk: ${negativePct}%`
+                : '';
+            lines.push(`🤖 ML: predicted *${labelStr}* · positive: ${positivePct}%${negativeWarning}`);
+        } else if (signal.mlConfidence !== undefined) {
+            // Model ran but label not stored (shouldn't happen after this change)
+            lines.push(`🤖 ML: ${esc((signal.mlConfidence * 100).toFixed(1))}% positive`);
         }
 
         // ─────────────────────────────────────────────────────────────────────────
@@ -2452,6 +2465,8 @@ export class TelegramBotController {
                 mfe: number;
                 mae: number;
                 label: number;
+                timestamp: number;
+                mlPredictedLabel?: number;
             }> = [];
 
             if ('historyJson' in regime && Array.isArray(regime.historyJson)) {
@@ -2465,6 +2480,8 @@ export class TelegramBotController {
                         mfe: e.mfe ?? 0,     // already in % (boundedMfe from simulator)
                         mae: e.mae ?? 0,     // already in % (boundedMae, negative)
                         label: e.label,
+                        timestamp: e.timestamp,
+                        mlPredictedLabel: e.mlPredictedLabel,
                     });
                 }
             }
@@ -2481,8 +2498,18 @@ export class TelegramBotController {
                         ? ` MAE ${esc(pct(sim.mae))}`
                         : '';
 
+                    const simAgeMs = Date.now() - sim.timestamp;
+                    const simAgeMin = Math.floor(simAgeMs / 60000);
+                    const simAgeStr = simAgeMin < 60
+                        ? `${simAgeMin}m ago`
+                        : `${Math.floor(simAgeMin / 60)}h ${simAgeMin % 60}m ago`;
+
+                    const mlPredStr = sim.mlPredictedLabel !== undefined
+                        ? ` · ML predicted ${sim.mlPredictedLabel >= 0 ? '\\+' : ''}${esc(sim.mlPredictedLabel)}`
+                        : '';
+
                     lines.push(
-                        `  ${idx === 0 ? '→' : '  '} ${outcomeEmoji(sim.outcome)}${mfeStr}${maeStr} \\(label ${sim.label >= 0 ? '\\+' : ''}${sim.label}\\)`
+                        `  ${idx === 0 ? '→' : '  '} ${outcomeEmoji(sim.outcome)} · ${esc(simAgeStr)}${mfeStr}${maeStr} \\(outcome ${sim.label >= 0 ? '\\+' : ''}${sim.label}${mlPredStr}\\)`
                     );
                 });
             }

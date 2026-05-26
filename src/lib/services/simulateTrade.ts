@@ -69,6 +69,8 @@ export async function simulateTrade(
     entryPrice: number,
     features: number[],
     correlationId: string,
+    mlPredictedLabel?: number,
+    mlPredictedConfidence?: number,
 ): Promise<SimulationResult> {
 
     if (entryPrice <= 0) {
@@ -97,6 +99,8 @@ export async function simulateTrade(
     await dbService.createNewSimulation(
         signalId, signal.symbol, signal.signal as 'buy' | 'sell',
         entryPrice, startTime, features, signal.confidence ?? 0,
+        mlPredictedLabel,       // ← ADD
+        mlPredictedConfidence,  // ← ADD
     );
 
     // wait a moment before starting to poll to allow the first candle to complete

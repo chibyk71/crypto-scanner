@@ -40,7 +40,7 @@ const STALE_WINDOW_HOURS = 3;
 const MAX_CLOSED_SIMS_PER_SYMBOL = 10;
 
 // Minimum samples per side for full trust. Below this → partial trust (not skip).
-const MIN_SAMPLES_FULL_TRUST = 3;
+const MIN_SAMPLES_FULL_TRUST = 2;
 
 // Below this per side → hard skip. 0 means genuinely no data.
 const MIN_SAMPLES_HARD_SKIP = 1;
@@ -70,6 +70,7 @@ interface CachedSimulationEntry extends SimulationHistoryEntry {
     durationMs: number;
     timeToMFE_ms: number;
     timeToMAE_ms: number;
+    mlPredictedLabel?: SignalLabel;  // ← ADD (inherited from SimulationHistoryEntry but explicit here for clarity)
 }
 
 interface SimulationScore {
@@ -512,6 +513,7 @@ export class ExcursionHistoryCache {
                         durationMs: sim.durationMs ?? 0,
                         timeToMFE_ms: sim.timeToMFEMs ?? 0,
                         timeToMAE_ms: sim.timeToMAEMs ?? 0,
+                        mlPredictedLabel: sim.mlPredictedLabel as SignalLabel ?? undefined,
                     };
                     this.addCompletedSimulation(symbol, cacheEntry);
                     totalLoaded++;
