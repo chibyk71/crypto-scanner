@@ -70,7 +70,6 @@ interface CachedSimulationEntry extends SimulationHistoryEntry {
     durationMs: number;
     timeToMFE_ms: number;
     timeToMAE_ms: number;
-    mlPredictedLabel?: SignalLabel;  // ← ADD (inherited from SimulationHistoryEntry but explicit here for clarity)
 }
 
 interface SimulationScore {
@@ -221,11 +220,80 @@ export class ExcursionHistoryCache {
         return { baseScore, timeModifier, totalScore };
     }
 
+    /**
+     * Returns rolling statistics for the last N simulations on a specific side.
+     * Used by getExcursionAdvice() for the two-gate excursion filter.
+     *
+     * Returns null if the regime has no historyJson or fewer than minSamples
+     * on the requested side — caller should treat null as pass-through (no gate).
+     *
+     * @param symbol   Trading pair
+     * @param direction  'long' (buy) or 'short' (sell)
+     * @param window   How many recent same-side sims to consider (default 5)
+     * @param minSamples Minimum sims required before returning stats (default 3)
+     * @param mfeHitThreshold MFE % that counts as a "hit" (default 0.16)
+     */
+    public getRollingStats(
+        symbol: string,
+        direction: 'long' | 'short',
+        window: number = 5,
+        minSamples: number = 2,
+        mfeHitThreshold: number = 0.30
+    ): {
+        sampleCount: number;
+        hitRate: number;       // fraction of sims where MFE >= mfeHitThreshold
+        medianMae: number;     // median MAE (negative or zero)
+        medianRatio: number;   // median MFE / |MAE|
+    } | null {
+        const normalized = symbol.trim().toUpperCase();
+        const regime = this.getRegime(normalized);
+
+        if (!regime || !('historyJson' in regime) || !regime.historyJson) {
+            return null;
+        }
+
+        const sideKey = direction === 'long' ? 'buy' : 'sell';
+        const sideSims = regime.historyJson
+            .filter(e => e.direction === sideKey)
+            .slice(0, window); // historyJson is already newest-first
+
+        if (sideSims.length < minSamples) {
+            return null;
+        }
+
+        const hitRate = sideSims.filter(e => (e.mfe ?? 0) >= mfeHitThreshold).length / sideSims.length;
+
+        const sortedMae = [...sideSims]
+            .map(e => e.mae ?? 0)
+            .sort((a, b) => a - b);
+        const mid = Math.floor(sortedMae.length / 2);
+        const medianMae = sortedMae.length % 2 !== 0
+            ? sortedMae[mid]
+            : (sortedMae[mid - 1] + sortedMae[mid]) / 2;
+
+        const sortedRatio = [...sideSims]
+            .map(e => {
+                const absMae = Math.abs(e.mae ?? 0);
+                return absMae > 0 ? (e.mfe ?? 0) / absMae : 0;
+            })
+            .sort((a, b) => a - b);
+        const medianRatio = sortedRatio.length % 2 !== 0
+            ? sortedRatio[mid]
+            : (sortedRatio[mid - 1] + sortedRatio[mid]) / 2;
+
+        return {
+            sampleCount: sideSims.length,
+            hitRate,
+            medianMae,
+            medianRatio,
+        };
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // Write path
     // ──────────────────────────────────────────────────────────────────────────
 
-    public addCompletedSimulation(symbol: string, entry: Partial<CachedSimulationEntry>): void {
+    public addCompletedSimulation(symbol: string, entry: CachedSimulationEntry): void {
         if (!entry || typeof entry !== 'object') {
             logger.warn('addCompletedSimulation: invalid entry – rejected');
             return;

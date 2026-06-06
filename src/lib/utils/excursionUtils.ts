@@ -225,11 +225,65 @@ export function getExcursionAdvice(
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 4. SELECT SIDE-SPECIFIC AGGREGATES FOR SCORING & ADVICE
+    // 4. TWO-GATE ROLLING FILTER
+    //    Gate A: rolling hit rate >= 60% AND median excursion ratio >= 1.2
+    //    Gate B: median MAE > -0.20  (strongest single discriminator, 3.2x separability)
+    //    Logic:  pass if Gate A OR Gate B passes
+    //            skip if neither passes
+    //            pass-through (no gate) if insufficient rolling samples (< 3)
+    // ────────────────────────────────────────────────────────────────
+    const rollingStats = excursionCache.getRollingStats(regime.symbol, direction);
+
+    if (rollingStats !== null) {
+        // We have enough rolling samples — apply the gates
+        const gateA = rollingStats.hitRate >= 0.60 && rollingStats.medianRatio >= 1.2;
+        const gateB = rollingStats.medianMae > -0.20;
+
+        if (!gateA && !gateB) {
+            logger.info('getExcursionAdvice: both gates failed – forced skip', {
+                symbol: regime.symbol,
+                direction,
+                hitRate: rollingStats.hitRate.toFixed(2),
+                medianMae: rollingStats.medianMae.toFixed(3),
+                medianRatio: rollingStats.medianRatio.toFixed(2),
+                sampleCount: rollingStats.sampleCount,
+            });
+
+            return {
+                advice: `🚫 Degraded regime (hitRate ${(rollingStats.hitRate * 100).toFixed(0)}%, MAE ${rollingStats.medianMae.toFixed(3)}) – both gates failed`,
+                adjustments: {
+                    slMultiplier: 1.0,
+                    tpMultiplier: 1.0,
+                    confidenceBoost: -0.40,
+                },
+                action: 'skip',
+                score: 0,
+            };
+        }
+
+        logger.debug('getExcursionAdvice: rolling gate passed', {
+            symbol: regime.symbol,
+            direction,
+            gateA,
+            gateB,
+            hitRate: rollingStats.hitRate.toFixed(2),
+            medianMae: rollingStats.medianMae.toFixed(3),
+            medianRatio: rollingStats.medianRatio.toFixed(2),
+        });
+    } else {
+        // Fewer than 3 rolling samples — pass-through, still building history
+        logger.debug('getExcursionAdvice: insufficient rolling samples – gate skipped', {
+            symbol: regime.symbol,
+            direction,
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 5. SELECT SIDE-SPECIFIC AGGREGATES FOR SCORING & ADVICE
     //    (we now trust this side – use its MFE/MAE/duration/outcomes only)
     // ────────────────────────────────────────────────────────────────
     if (!sideAgg) {
-        // Rare edge case: hasEnoughSamples said yes, but agg missing → force skip (pure – no fallback)
+        // Rare edge case: hasEnoughSamples said yes, but agg missing → force skip
         logger.warn('Side has enough samples but aggregates missing – forced skip', {
             symbol: regime.symbol,
             direction,
@@ -248,23 +302,22 @@ export function getExcursionAdvice(
     }
 
     // ────────────────────────────────────────────────────────────────
-    // 5. COMPUTE REGIME SCORE USING SIDE-SPECIFIC DATA
+    // 6. COMPUTE REGIME SCORE USING SIDE-SPECIFIC DATA
     // ────────────────────────────────────────────────────────────────
-    const scoreResult = computeRegimeScore(regime, direction); // Note: computeRegimeScore accepts DirectionalAggregates
+    const scoreResult = computeRegimeScore(regime, direction);
 
     // ────────────────────────────────────────────────────────────────
-    // 6. MAP SCORE TO ACTION + ADJUSTMENTS
+    // 7. MAP SCORE TO ACTION + ADJUSTMENTS
     // ────────────────────────────────────────────────────────────────
     const adviceResult = mapScoreToAdvice(scoreResult, direction);
 
     // ────────────────────────────────────────────────────────────────
-    // 7. BUILD FINAL HUMAN-READABLE ADVICE STRING
-    //    (now directional-aware, shows both sides if data exists)
+    // 8. BUILD FINAL HUMAN-READABLE ADVICE STRING
     // ────────────────────────────────────────────────────────────────
     const finalAdvice = buildAdviceString(scoreResult, regime, direction);
 
     // ────────────────────────────────────────────────────────────────
-    // 8. RETURN COMPLETE RESULT
+    // 9. RETURN COMPLETE RESULT
     // ────────────────────────────────────────────────────────────────
     logger.debug('getExcursionAdvice completed', {
         symbol: regime.symbol,
@@ -280,7 +333,7 @@ export function getExcursionAdvice(
         advice: finalAdvice,
         adjustments: adviceResult.adjustments,
         action: adviceResult.action,
-        score: scoreResult.totalScore // Pass the computed score for better integration with AutoTradeService
+        score: scoreResult.totalScore,
     };
 }
 

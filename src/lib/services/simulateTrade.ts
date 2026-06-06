@@ -34,7 +34,6 @@ import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
 import { excursionCache } from './excursionHistoryCache';
-import { mlService } from './mlService';
 
 const logger = createLogger('simulateTrade');
 
@@ -532,12 +531,12 @@ async function storeAndFinalizeSimulation(params: {
     }
 
     // ── Periodic ML retraining trigger ────────────────────────────────────────
-    if (config.ml.trainingEnabled) {
-        const count = await dbService.getSampleCount();
-        if (count >= config.ml.minSamplesToTrain && count % 20 === 0) {
-            await mlService.retrain();
-        }
-    }
+    // if (config.ml.trainingEnabled) {
+    //     const count = await dbService.getSampleCount();
+    //     if (count >= config.ml.minSamplesToTrain && count % 20 === 0) {
+    //         await mlService.retrain();
+    //     }
+    // }
 
     // ── Update excursion cache ────────────────────────────────────────────────
     excursionCache.addCompletedSimulation(symbol, {
@@ -546,6 +545,7 @@ async function storeAndFinalizeSimulation(params: {
         outcome, rMultiple, label,
         mfe: boundedMfe, mae: boundedMae,
         durationMs, timeToMFE_ms: timeToMfeMs, timeToMAE_ms: timeToMaeMs,
+        mlPredictedLabel: signal.mlPredictedLabel
     });
 
     logger.info(`[SIM] ${symbol} FINALIZED – ${outcome.toUpperCase()}`, {
@@ -569,16 +569,4 @@ async function storeAndFinalizeSimulation(params: {
         timeToMaxMFE_ms: timeToMfeMs,
         timeToMaxMAE_ms: timeToMaeMs,
     };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LEGACY EXPORT — kept for any external callers that import computeLabel
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function computeLabel(rMultiple: number): -2 | -1 | 0 | 1 | 2 {
-    if (rMultiple >= 3.0) return 2;
-    if (rMultiple >= 1.5) return 1;
-    if (rMultiple >= -0.5) return 0;
-    if (rMultiple >= -1.5) return -1;
-    return -2;
 }

@@ -1046,35 +1046,43 @@ class DatabaseService {
  */
     public async setSimulationTaken(
         signalId: string,
-        taken: boolean = true
+        taken: boolean = true,
+        maxRetries: number = 5,
+        retryDelayMs: number = 2000
     ): Promise<void> {
-        try {
-            const result = await this.db
-                .update(simulatedTrades)
-                .set({
-                    wasTaken: taken,
-                })
-                .where(eq(simulatedTrades.signalId, signalId))
-                .execute();
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const result = await this.db
+                    .update(simulatedTrades)
+                    .set({ wasTaken: taken })
+                    .where(eq(simulatedTrades.signalId, signalId))
+                    .execute();
 
-            // Check if any row was actually affected (defensive)
-            if (result[0].affectedRows === 0) {
-                logger.warn(`No simulation found to update was_taken`, { signalId, taken });
-                return;
+                if (result[0].affectedRows > 0) {
+                    logger.debug(`Updated simulation was_taken status`, {
+                        signalId, wasTaken: taken, attempt
+                    });
+                    return; // success
+                }
+
+                // Row doesn't exist yet — sim hasn't been created yet
+                if (attempt < maxRetries) {
+                    logger.debug(`setSimulationTaken: row not found yet, retrying in ${retryDelayMs}ms`, {
+                        signalId, attempt, maxRetries
+                    });
+                    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+                } else {
+                    logger.warn(`setSimulationTaken: row never appeared after ${maxRetries} attempts`, {
+                        signalId, taken
+                    });
+                }
+            } catch (error) {
+                logger.error(`Failed to update was_taken for simulation`, {
+                    signalId, taken, attempt,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                throw error;
             }
-
-            logger.debug(`Updated simulation was_taken status`, {
-                signalId,
-                wasTaken: taken,
-            });
-        } catch (error) {
-            logger.error(`Failed to update was_taken for simulation`, {
-                signalId,
-                taken,
-                error: error instanceof Error ? error.message : String(error),
-            });
-            // Re-throw if you want callers to handle failure, or swallow if non-critical
-            throw error;
         }
     }
 

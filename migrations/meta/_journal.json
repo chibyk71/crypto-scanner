@@ -8,6 +8,13 @@
       "when": 1777955453023,
       "tag": "0000_many_night_thrasher",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1779764147112,
+      "tag": "0001_slimy_the_renegades",
+      "breakpoints": true
     }
   ]
 }

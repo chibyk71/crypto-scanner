@@ -143,7 +143,9 @@ export class AutoTradeService {
                 return;
             }
 
-            void dbService.setSimulationTaken(correlationId); // Mark original sim as taken (for tracking)
+            dbService.setSimulationTaken(correlationId).catch(err => {
+                logger.warn(`Failed to mark simulation as taken`, { correlationId, error: err.message });
+            }); // Mark original sim as taken (for tracking)
 
             // Extract adjustments (ignore SL/TP multipliers, keep confidence boost)
             const { confidenceBoost = 0 } = advice.adjustments ?? {};

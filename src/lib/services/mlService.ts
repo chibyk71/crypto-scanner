@@ -184,10 +184,17 @@ export class MLService {
      * Feature groups (order is fixed — do not reorder without retraining):
      *   [0–14]  Technical indicators (RSI, EMA deviations, MACD, etc.)
      *   [15–20] Excursion regime (buy MFE/MAE/ratio + sell MFE/MAE/ratio)
-     *   [21–24] Market context (OBV, VWAP, VWMA, price scaled)
+     *   [21–24] Market context (OBV delta, VWAP deviation, VWMA-VWAP spread, relative volume)
      *   [25]    Symbol index (normalized stable index from symbolRegistry)
      *
      * Total: 26 features
+     *
+     * Normalization notes (2026 update):
+     *   [4,5,6]  MACD values divided by price — cross-symbol consistent scale
+     *   [21]     OBV delta / current candle volume — direction + magnitude, not cumulative level
+     *   [22]     (price - vwap) / price — deviation from VWAP, not absolute price
+     *   [23]     (vwma - vwap) / price — VWMA vs VWAP spread, not absolute value
+     *   [24]     relative volume ratio capped at 5, normalized to 0–1 — volume surge magnitude
      *
      * @param input Full market context at signal time
      * @returns Fixed-length number[] of length 26
@@ -207,20 +214,20 @@ export class MLService {
         const last = indicators.last;
 
         f.push(
-            last.rsi ? last.rsi / 100 : 0.5,  // [0]
-            last.emaShort ? (price - last.emaShort) / price : 0,  // [1]
-            last.emaMid ? (price - last.emaMid) / price : 0,  // [2]
-            last.emaLong ? (price - last.emaLong) / price : 0,  // [3]
-            last.macdLine ?? 0,                                 // [4]
-            last.macdSignal ?? 0,                                 // [5]
-            last.macdHistogram ?? 0,                                 // [6]
-            last.stochasticK ? last.stochasticK / 100 : 0.5,        // [7]
-            last.stochasticD ? last.stochasticD / 100 : 0.5,        // [8]
-            last.atr ? last.atr / price : 0,         // [9]
-            last.htfAdx ? last.htfAdx / 100 : 0,         // [10]
-            last.percentB ?? 0.5,                               // [11]
-            last.bbBandwidth ? last.bbBandwidth / 100 : 0,         // [12]
-            last.momentum ? last.momentum / price : 0,         // [13]
+            last.rsi ? last.rsi / 100 : 0.5,                                    // [0]
+            last.emaShort ? (price - last.emaShort) / price : 0,                // [1]
+            last.emaMid ? (price - last.emaMid) / price : 0,                    // [2]
+            last.emaLong ? (price - last.emaLong) / price : 0,                  // [3]
+            last.macdLine ? last.macdLine / price : 0,                          // [4] normalized by price
+            last.macdSignal ? last.macdSignal / price : 0,                      // [5] normalized by price
+            last.macdHistogram ? last.macdHistogram / price : 0,                // [6] normalized by price
+            last.stochasticK ? last.stochasticK / 100 : 0.5,                   // [7]
+            last.stochasticD ? last.stochasticD / 100 : 0.5,                   // [8]
+            last.atr ? last.atr / price : 0,                                    // [9]
+            last.htfAdx ? last.htfAdx / 100 : 0,                               // [10]
+            last.percentB ?? 0.5,                                               // [11]
+            last.bbBandwidth ? last.bbBandwidth / 100 : 0,                     // [12]
+            last.momentum ? last.momentum / price : 0,                         // [13]
             last.engulfing === 'bullish' ? 1 : last.engulfing === 'bearish' ? -1 : 0  // [14]
         );
 
@@ -259,20 +266,43 @@ export class MLService {
         }
 
         // ── 3. Market context [21–24] ─────────────────────────────────────────
+
+        // [21] OBV delta normalized by current candle volume
+        // Captures direction + relative magnitude of volume flow, not cumulative level
+        const obvDelta = indicators.obv.length > 1
+            ? indicators.last.obv - indicators.obv[indicators.obv.length - 2]
+            : 0;
+        const currentVolume = primaryData.volumes[primaryData.volumes.length - 1] || 1;
+        const obvFeature = obvDelta / currentVolume;
+
+        // [22] Price deviation from VWAP — how far price is from volume-weighted anchor
+        const vwapDeviation = last.vwap && last.vwap > 0
+            ? (price - last.vwap) / price
+            : 0;
+
+        // [23] VWMA vs VWAP spread — volume-weighted MA relative to VWAP anchor
+        const vwmaVwapSpread = last.vwma && last.vwap && last.vwap > 0
+            ? (last.vwma - last.vwap) / price
+            : 0;
+
+        // [24] Relative volume ratio — current candle volume vs 20-candle average
+        // Capped at 5x to prevent extreme spikes from dominating, then normalized to 0–1
+        const volLookback = 20;
+        const recentVolumes = primaryData.volumes.slice(-(volLookback + 1), -1);
+        const avgVolume20 = recentVolumes.length > 0
+            ? recentVolumes.reduce((sum, v) => sum + v, 0) / recentVolumes.length
+            : currentVolume;
+        const rawVolumeRatio = avgVolume20 > 0 ? currentVolume / avgVolume20 : 1;
+        const relativeVolumeFeature = Math.min(rawVolumeRatio, 5) / 5; // normalized 0–1
+
         f.push(
-            last.obv ? last.obv / 1e9 : 0,   // [21] OBV scaled
-            last.vwap ? last.vwap / 1e6 : 0,   // [22] VWAP scaled
-            last.vwma ? last.vwma / 1e6 : 0,   // [23] VWMA scaled
-            price / 1e5                        // [24] price scaled
+            obvFeature,             // [21]
+            vwapDeviation,          // [22]
+            vwmaVwapSpread,         // [23]
+            relativeVolumeFeature,  // [24]
         );
 
         // ── 4. Symbol identity [25] ───────────────────────────────────────────
-        // Allows the model to learn symbol-specific patterns.
-        // Without this, 250 samples from BTC/ETH/SOL train a model that has
-        // no way to know it's predicting for PEPE — which behaves differently.
-        //
-        // Unknown symbols get 0.0 (safe neutral fallback).
-        // See src/lib/utils/symbolRegistry.ts for index mapping.
         if (!symbolRegistry.isKnown(symbol)) {
             logger.warn('Unknown symbol in extractFeatures — model may generalize poorly', {
                 symbol,

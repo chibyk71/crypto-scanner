@@ -261,7 +261,7 @@ def main():
     # Load data for inference validation
     print("\n  Loading data for inference test...")
     try:
-        X, y = load_training_data(DATA_PATH)
+        X, y, _ = load_training_data(DATA_PATH)
     except Exception as e:
         print(f"  ERROR loading data: {e}")
         return

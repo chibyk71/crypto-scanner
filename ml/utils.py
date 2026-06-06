@@ -37,23 +37,75 @@ LABEL_NAMES = {
 
 FEATURE_NAMES = [
     'rsi', 'ema_short_dev', 'ema_mid_dev', 'ema_long_dev',
-    'macd_line', 'macd_signal', 'macd_hist',
+    'macd_line_norm', 'macd_signal_norm', 'macd_hist_norm',  # normalized by price
     'stoch_k', 'stoch_d', 'atr_pct', 'htf_adx',
     'percent_b', 'bb_bandwidth', 'momentum', 'engulfing',
     'buy_mfe', 'buy_mae', 'buy_ratio',
     'sell_mfe', 'sell_mae', 'sell_ratio',
-    'obv', 'vwap', 'vwma', 'price_scaled',
+    'obv_delta_norm',     # was: obv absolute
+    'vwap_deviation',     # was: vwap / 1e6
+    'vwma_vwap_spread',   # was: vwma / 1e6
+    'rel_volume',         # was: price / 1e5
     'symbol_index',
 ]
 
+def normalize_legacy_features(X: np.ndarray, entry_prices: np.ndarray) -> np.ndarray:
+    """
+    TEMPORARY: Normalizes feature vectors exported before the 2026 normalization fix.
 
-def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    Transforms old absolute-scale features to the new price-relative format:
+      [4]  macd_line    / price  (was raw price-unit value)
+      [5]  macd_signal  / price  (was raw price-unit value)
+      [6]  macd_hist    / price  (was raw price-unit value)
+      [21] obv_delta_norm        (was obv / 1e9 — cannot reconstruct, set to 0)
+      [22] (price - vwap) / price (was vwap / 1e6 — cannot reconstruct, set to 0)
+      [23] (vwma - vwap) / price  (was vwma / 1e6 — cannot reconstruct, set to 0)
+      [24] rel_volume             (was price / 1e5 — cannot reconstruct, set to 0.2)
+
+    Features [21,22,23] are set to 0 (neutral) since the original absolute values
+    carry no cross-symbol meaning and cannot be reverse-engineered.
+    Feature [24] is set to 0.2 (~1x volume ratio after normalization).
+    Features [4,5,6] can be properly normalized using entry_price from the CSV.
+
+    Remove this function and the call in train.py once the old data is cleared
+    and the bot has accumulated fresh normalized simulations.
+
+    Args:
+        X:             Feature matrix, shape (n_samples, 26)
+        entry_prices:  Entry price for each row, shape (n_samples,)
+
+    Returns:
+        X_norm: Normalized copy of X, same shape
+    """
+    X_norm = X.copy()
+
+    for i, price in enumerate(entry_prices):
+        if price <= 0:
+            continue
+
+        # [4,5,6] — divide raw MACD values by entry price
+        X_norm[i, 4] = X[i, 4] / price
+        X_norm[i, 5] = X[i, 5] / price
+        X_norm[i, 6] = X[i, 6] / price
+
+        # [21,22,23] — cannot reconstruct from CSV, set to neutral 0
+        X_norm[i, 21] = 0.0
+        X_norm[i, 22] = 0.0
+        X_norm[i, 23] = 0.0
+
+        # [24] — cannot reconstruct volume ratio, set to 0.2 (represents ~1x normal volume)
+        X_norm[i, 24] = 0.2
+
+    return X_norm
+
+def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Load, parse, and clean the exported training CSV.
 
     Returns:
         X: float32 array of shape (n_samples, EXPECTED_FEATURES)
         y: int array of shape (n_samples,) with values 0..4 (remapped labels)
+        entry_prices: float32 array of shape (n_samples,) with entry prices
 
     Raises:
         FileNotFoundError: if the CSV does not exist
@@ -172,7 +224,12 @@ def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
         bar = '█' * int(c / len(y) * 40)
         print(f"    {LABEL_NAMES[u]}: {c:4d} ({c/len(y)*100:5.1f}%)  {bar}")
 
-    return X, y
+    entry_prices = np.array(df['entry_price'].astype(float).values, dtype=np.float64) if 'entry_price' in df.columns else np.ones(len(X), dtype=np.float64)
+
+    if 'entry_price' not in df.columns:
+        print("  WARNING: entry_price column not found in CSV — MACD normalization will be skipped")
+
+    return X, y, entry_prices
 
 
 def check_class_balance(y: np.ndarray, min_samples_per_class: int = 10) -> bool:
