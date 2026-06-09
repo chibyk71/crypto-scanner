@@ -4,6 +4,7 @@ import { config } from '../config/settings';
 import ccxt, { type bybit, type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
 import { createLogger } from '../logger';
 import type { OhlcvData } from '../../types';
+import { HttpStatusCode } from 'axios';
 // import { dbService } from '../db';
 
 /**
@@ -74,6 +75,7 @@ export class ExchangeService {
             version: 'v5',
 
             options: { defaultType: 'futures', "trade.type": "linear" },
+            httpsProxy: config.exchange.httpsProxy, // Pass proxy from config if set
         }) as Exchange;
     }
 

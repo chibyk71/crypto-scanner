@@ -62,7 +62,7 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Scanner Behavior
     // ──────────────────────────────────────────────────────────────
-    SCAN_INTERVAL_MS: z.coerce.number().default(60_000),
+    SCAN_INTERVAL_MS: z.coerce.number().default(180_000),
     HEARTBEAT_INTERVAL: z.coerce.number().default(30),
     HISTORY_LENGTH: z.coerce.number().min(100).default(300),
 
@@ -158,6 +158,8 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     LOCK_TYPE: z.enum(['file', 'database']).default('database'),
     SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
+
+    HTTPS_PROXY: z.string().optional(), // Optional proxy for HTTP requests
 });
 
 /**
@@ -218,6 +220,8 @@ export const config = {
         apiSecret: rawConfig.EXCHANGE_API_SECRET,
         /** Use testnet/sandbox environment */
         testnet: rawConfig.EXCHANGE_TESTNET,
+        /** Optional HTTPS proxy URL (e.g., 'http://localhost:8080') */
+        httpsProxy: rawConfig.HTTPS_PROXY,
     },
 
     // =========================================================================
