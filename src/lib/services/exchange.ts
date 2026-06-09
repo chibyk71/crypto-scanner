@@ -4,7 +4,6 @@ import { config } from '../config/settings';
 import ccxt, { type bybit, type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
 import { createLogger } from '../logger';
 import type { OhlcvData } from '../../types';
-import { HttpStatusCode } from 'axios';
 // import { dbService } from '../db';
 
 /**
