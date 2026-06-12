@@ -149,6 +149,16 @@ export class TelegramBotController {
      * @private
      */
     private registerListeners(): void {
+        // TEMP DEBUG — remove after fixing
+        this.bot.on('message', (msg) => {
+            console.log('=== INCOMING MESSAGE ===');
+            console.log('From chat ID:', msg.chat.id);
+            console.log('From user ID:', msg.from?.id);
+            console.log('Text:', msg.text);
+            console.log('Your configured TELEGRAM_CHAT_ID:', this.authorizedChatId);
+            console.log('Match?', String(msg.chat.id) === this.authorizedChatId);
+            console.log('========================');
+        });
         // =================================================================
         // TELEGRAM COMMAND REGISTRATION – Centralized & Grouped
         // =================================================================
