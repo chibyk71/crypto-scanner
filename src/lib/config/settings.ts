@@ -159,7 +159,7 @@ const ConfigSchema = z.object({
     LOCK_TYPE: z.enum(['file', 'database']).default('database'),
     SCANNER_MODE: z.enum(['single', 'periodic']).default('periodic'),
 
-    HTTPS_PROXY: z.string().optional(), // Optional proxy for HTTP requests
+    HTTPS_PROXY_URL: z.string().optional(), // Optional proxy for HTTP requests
 });
 
 /**
@@ -221,7 +221,7 @@ export const config = {
         /** Use testnet/sandbox environment */
         testnet: rawConfig.EXCHANGE_TESTNET,
         /** Optional HTTPS proxy URL (e.g., 'http://localhost:8080') */
-        httpsProxy: rawConfig.HTTPS_PROXY,
+        httpsProxy: rawConfig.HTTPS_PROXY_URL,
     },
 
     // =========================================================================
