@@ -151,7 +151,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
 
     const exchange = new ExchangeService();
     const mlService = new MLService();
-    const strategy = new Strategy(mlService);
+    const strategy = new Strategy(mlService, exchange);
     let telegram: TelegramBotController | undefined = undefined;
     let scanner: MarketScanner | null = null;
     let supportedSymbols: string[] = [];
@@ -189,7 +189,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         }
 
         // Initialize MarketScanner
-        scanner = new MarketScanner(exchange, telegram, strategy, supportedSymbols, {
+        scanner = new MarketScanner(exchange, telegram, strategy, mlService, supportedSymbols, {
             mode: scannerMode,
             intervalMs: config.scanner.scanIntervalMs ?? 60_000,
             concurrency: 3,

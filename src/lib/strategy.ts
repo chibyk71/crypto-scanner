@@ -20,11 +20,12 @@
 // =============================================================================
 
 import type { OhlcvData, PartialTPLevel, SignalLabel, TradeSignal } from '../types';
+import { ExchangeService } from './services/exchange';
 import { createLogger } from './logger';
 import { MLService } from './services/mlService';
 import { config } from './config/settings';
 import { computeIndicators, type IndicatorMap } from './utils/indicatorUtils';
-import { detectEngulfing } from './indicators';
+import { detectEngulfing, detectLiquiditySweep } from './indicators';
 
 // Dedicated logger – all strategy-related messages tagged 'Strategy'
 const logger = createLogger('Strategy');
@@ -41,6 +42,7 @@ export interface StrategyInput {
     atrMultiplier: number;           // Stop-loss distance in ATR multiples
     riskRewardTarget: number;        // Target R:R ratio
     trailingStopPercent: number;     // Legacy – kept for compatibility
+    requireAtrFeasibility?: boolean;  // default true if omitted
 }
 
 /**
@@ -53,6 +55,7 @@ interface TrendAndVolume {
     trendBias: 'bullish' | 'bearish' | 'neutral';  // HTF directional bias
     isTrending: boolean;             // Strong trend confirmed by ADX + DI dominance
     engulfing: ("bullish" | "bearish" | null)[];   // Detected engulfing patterns
+    liquiditySweep: ("bullish" | "bearish" | null)[]; // Detected liquidity sweeps
 }
 
 /**
@@ -100,6 +103,13 @@ const ENGULFING_POINTS = 15;                  // ← Strong price-action candle
 const ML_BONUS_MAX = 20;                      // ← Max points added from ML probability
 const PERCENT_B_POINTS = 10;        // BB position directional scoring
 const PERCENT_B_COMBO_POINTS = 5;   // bonus when percent_b + engulfing align
+const LIQUIDITY_SWEEP_POINTS = 15;             // ← Stop-hunt reversal: swept swing high/low then reclaimed
+const VWAP_REVERSION_POINTS = 15;              // ← Price stretched from VWAP without continuation confirmation
+const VWAP_DEVIATION_ATR_THRESHOLD = 1.75;     // ← |price-vwap|/ATR above this = "stretched" (tunable 1.5-2.0)
+const BB_SQUEEZE_BREAKOUT_POINTS = 15;         // ← Bandwidth expanded out of a squeeze with directional confirmation
+const ORDER_BOOK_IMBALANCE_POINTS = 12;         // ← Max points from order-book confirmation
+const DIRECTIONAL_TIEBREAK_MAX = 15;           // ← Max points from side-specific tie-breaker
+
 
 // Total possible points per side (used later to normalise confidence)
 const MAX_SCORE_PER_SIDE =
@@ -116,9 +126,16 @@ const MAX_SCORE_PER_SIDE =
     ENGULFING_POINTS +
     PERCENT_B_POINTS +
     PERCENT_B_COMBO_POINTS +
+    LIQUIDITY_SWEEP_POINTS +
+    VWAP_REVERSION_POINTS +
+    BB_SQUEEZE_BREAKOUT_POINTS +
+    ORDER_BOOK_IMBALANCE_POINTS +
+    DIRECTIONAL_TIEBREAK_MAX +
     ML_BONUS_MAX;
 
 const ML_CONFIDENCE_DISCOUNT = 0.8;           // ← If model not trained, cut its vote by 20%
+const AMBIGUOUS_CONFIDENCE_MIN = 0.35;         // ← Combined ML confidence band treated as "uncertain"
+const AMBIGUOUS_CONFIDENCE_MAX = 0.65;
 
 const MIN_ATR_MULTIPLIER = 0.5;               // ← Safety bounds for stop-loss distance
 const MAX_ATR_MULTIPLIER = 5;
@@ -138,6 +155,17 @@ const MIN_DI_DIFF = 15;                       // ← Minimum difference between 
 const MIN_ADX = 25;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
 
+const LIQUIDITY_SWEEP_LOOKBACK = 20;           // ← Candles used to define the swing high/low range
+const BB_SQUEEZE_LOOKBACK = 10;                // ← Candles checked (excluding current) for prior squeeze condition
+const BB_SQUEEZE_MIN_SQUEEZE_RATIO = 0.7;      // ← Fraction of lookback candles that must be "squeezed" to qualify
+const BB_SQUEEZE_EXPANSION_RATIO = 1.15;       // ← Current bandwidth must be >= this x the squeeze-period average
+
+const MOMENTUM_IGNITION_LOOKBACK = 2;          // ← How many candles back to search for the trigger (engulfing+surge)
+const MOMENTUM_IGNITION_DECAY = [1.0, 0.5];    // ← Multiplier by offset: [0]=this candle, [1]=1 candle ago
+
+const ORDER_BOOK_IMBALANCE_THRESHOLD = 0.15;    // ← Minimum |imbalance| to award any points
+const ORDER_BOOK_GATE_MARGIN = 15;              // ← Only fetch book when leading score is within this of CONFIDENCE_THRESHOLD
+
 /**
  * Strategy – Core signal generation engine
  *
@@ -152,6 +180,7 @@ const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
 export class Strategy {
     // External dependencies
     private mlService: MLService;
+    private exchangeService: ExchangeService;
 
     // State
     public lastAtr: number = 0;                               // Latest ATR (exposed for debugging)
@@ -161,8 +190,9 @@ export class Strategy {
      * @param mlService - Machine learning service for prediction bonus
      * @param cooldownMinutes - Minimum minutes between signals per symbol
      */
-    constructor(mlService: MLService) {
+    constructor(mlService: MLService, exchangeService: ExchangeService) {
         this.mlService = mlService;
+        this.exchangeService = exchangeService;
     }
 
     // =========================================================================
@@ -240,6 +270,16 @@ export class Strategy {
             primaryData.closes
         );
 
+        // ------------------------------------------------------------------
+        // 2b. LIQUIDITY SWEEP DETECTION (always run – low cost)
+        // ------------------------------------------------------------------
+        const liquiditySweep = detectLiquiditySweep(
+            primaryData.highs,
+            primaryData.lows,
+            primaryData.closes,
+            LIQUIDITY_SWEEP_LOOKBACK
+        );
+
         // EARLY EXIT: Reject low-liquidity symbols entirely
         if (!hasLiquidity) {
             logger.info(
@@ -291,7 +331,143 @@ export class Strategy {
             trendBias,
             isTrending,
             engulfing,
+            liquiditySweep,
         };
+    }
+
+    // =========================================================================
+    // BB SQUEEZE → BREAKOUT DETECTION
+    // =========================================================================
+    /**
+     * Detects the transition from a low-volatility squeeze to breakout expansion.
+     *
+     * Logic:
+     *   1. Look at the `BB_SQUEEZE_LOOKBACK` candles BEFORE the current one — if at
+     *      least BB_SQUEEZE_MIN_SQUEEZE_RATIO of them had bandwidth below
+     *      MIN_BB_BANDWIDTH_PCT, the market was "squeezed."
+     *   2. Current bandwidth must have expanded by BB_SQUEEZE_EXPANSION_RATIO relative
+     *      to the average bandwidth during the squeeze window.
+     *   3. Direction is confirmed by current close breaking outside the Bollinger Bands
+     *      as they stood on the PREVIOUS candle (i.e. breaking out of the squeeze range,
+     *      not just being near band edges from bandwidth calc alone).
+     *
+     * @param indicators - Centralized indicator results (needs full bandwidth/upper/lower series)
+     * @param closes - Primary timeframe close prices
+     * @returns 'bullish' | 'bearish' | null
+     * @private
+     */
+    private _detectBbSqueezeBreakout(
+        indicators: IndicatorMap,
+        closes: number[]
+    ): 'bullish' | 'bearish' | null {
+        const bandwidth = indicators.bollingerBands.bandwidth;
+        const upper = indicators.bollingerBands.upper;
+        const lower = indicators.bollingerBands.lower;
+
+        const n = bandwidth.length;
+        if (n < BB_SQUEEZE_LOOKBACK + 1 || closes.length < n) {
+            return null;
+        }
+
+        const currentIdx = n - 1;
+        const prevIdx = n - 2;
+
+        // Window is the N candles BEFORE the current one (current excluded)
+        const windowStart = currentIdx - BB_SQUEEZE_LOOKBACK;
+        const window = bandwidth.slice(windowStart, currentIdx);
+
+        // 1. Was it squeezed for most of the window?
+        const squeezedCount = window.filter(b => b < MIN_BB_BANDWIDTH_PCT).length;
+        const wasSqueezed = squeezedCount / window.length >= BB_SQUEEZE_MIN_SQUEEZE_RATIO;
+        if (!wasSqueezed) return null;
+
+        // 2. Is bandwidth now expanding out of that squeeze?
+        const avgSqueezeBandwidth = window.reduce((a, b) => a + b, 0) / window.length;
+        const currentBandwidth = bandwidth[currentIdx];
+        const isExpanding = currentBandwidth >= avgSqueezeBandwidth * BB_SQUEEZE_EXPANSION_RATIO
+            && currentBandwidth >= MIN_BB_BANDWIDTH_PCT;
+        if (!isExpanding) return null;
+
+        // 3. Directional confirmation — close breaking outside the PREVIOUS candle's bands
+        //    (the bands as they stood while still inside/exiting the squeeze)
+        const currentClose = closes[closes.length - 1];
+        const prevUpper = upper[prevIdx];
+        const prevLower = lower[prevIdx];
+
+        if (currentClose > prevUpper) return 'bullish';
+        if (currentClose < prevLower) return 'bearish';
+
+        return null; // expansion confirmed but no clean directional break yet
+    }
+
+    // =========================================================================
+    // MOMENTUM IGNITION: Per-candle volume surge check (reusable by index)
+    // =========================================================================
+    /**
+     * Checks whether a volume surge occurred AT a specific candle index.
+     * Mirrors the surge logic in _analyzeTrendAndVolume, but parameterized so
+     * it can be evaluated at any historical index — needed for the recency gate,
+     * which must know whether the surge accompanied the trigger candle itself,
+     * not just the most recent candle.
+     *
+     * @param primaryData - Full OHLCV data
+     * @param index - Candle index to check (must have `lookback` candles before it)
+     * @returns true if both USD-value and relative base-volume surge conditions are met
+     * @private
+     */
+    private _hasVolumeSurgeAt(primaryData: OhlcvData, index: number): boolean {
+        const lookback = 20;
+        if (index - lookback < 0) return false;
+
+        const recentVols = primaryData.volumes.slice(index - lookback, index);
+        const recentPrices = primaryData.closes.slice(index - lookback, index);
+
+        const avgPrevUSD = recentVols.reduce((sum, v, i) => sum + v * recentPrices[i], 0) / lookback;
+        const currentVolUSD = primaryData.volumes[index] * primaryData.closes[index];
+        const hasUsdSurge = currentVolUSD > avgPrevUSD * VOLUME_SURGE_MULTIPLIER;
+
+        const avgBaseVol = recentVols.reduce((sum, v) => sum + v, 0) / lookback;
+        const hasRelativeSurge = primaryData.volumes[index] > avgBaseVol * RELATIVE_VOLUME_MULTIPLIER;
+
+        return hasUsdSurge && hasRelativeSurge;
+    }
+
+    // =========================================================================
+    // MOMENTUM IGNITION: Recency-gated trigger lookup
+    // =========================================================================
+    /**
+     * Searches back up to MOMENTUM_IGNITION_LOOKBACK candles for the most recent
+     * engulfing pattern that was ALSO confirmed by volume surge at that same candle.
+     *
+     * Returns the pattern type and how many candles ago it fired (offset), so the
+     * caller can apply a decay multiplier — "just ignited" (offset 0) gets full
+     * weight, "already moved" (offset 1+) gets progressively less, and anything
+     * beyond the lookback window is treated as stale (no bonus at all).
+     *
+     * @param primaryData - Full OHLCV data
+     * @param engulfing - Full engulfing pattern series (aligned with primaryData)
+     * @returns { type, offset } of the most recent confirmed trigger, or null if none found
+     * @private
+     */
+    private _findRecentIgnitionTrigger(
+        primaryData: OhlcvData,
+        engulfing: ('bullish' | 'bearish' | null)[]
+    ): { type: 'bullish' | 'bearish'; offset: number } | null {
+        const lastIdx = engulfing.length - 1;
+
+        for (let offset = 0; offset < MOMENTUM_IGNITION_LOOKBACK; offset++) {
+            const idx = lastIdx - offset;
+            if (idx < 0) break;
+
+            const pattern = engulfing[idx];
+            if (!pattern) continue;
+
+            if (this._hasVolumeSurgeAt(primaryData, idx)) {
+                return { type: pattern, offset };
+            }
+        }
+
+        return null;
     }
 
     // =========================================================================
@@ -313,6 +489,7 @@ export class Strategy {
             trendBias: 'neutral',
             isTrending: false,
             engulfing: [null],
+            liquiditySweep: [null],
         };
     }
 
@@ -427,6 +604,39 @@ export class Strategy {
             reasons.push('Bearish OBV falling with price below VWMA (momentum)');
         }
 
+        // -------------------- VWAP MEAN-REVERSION --------------------
+        // Additive to the vwma>vwap trend-following logic above, not a replacement.
+        // When price has stretched far from VWAP (in ATR terms) AND momentum/OBV
+        // isn't confirming continuation in that direction, bet on reversion back to VWAP.
+        if (indicators.last.vwap > 0 && indicators.last.atr > 0) {
+            const vwapDeviationAtr = (input.price - indicators.last.vwap) / indicators.last.atr;
+            const momentum = indicators.last.momentum ?? 0;
+
+            if (vwapDeviationAtr > VWAP_DEVIATION_ATR_THRESHOLD) {
+                // Price stretched ABOVE VWAP — continuation would need positive momentum + rising OBV.
+                // Either missing → no confirmation → bet on reversion down.
+                const continuationConfirmed = momentum > 0 && obvRising;
+                if (!continuationConfirmed) {
+                    sellScore += VWAP_REVERSION_POINTS;
+                    reasons.push(
+                        `VWAP mean-reversion: price ${vwapDeviationAtr.toFixed(2)}x ATR above VWAP, ` +
+                        `continuation unconfirmed (momentum=${momentum.toFixed(4)}, obvRising=${obvRising})`
+                    );
+                }
+            } else if (vwapDeviationAtr < -VWAP_DEVIATION_ATR_THRESHOLD) {
+                // Price stretched BELOW VWAP — continuation would need negative momentum + falling OBV.
+                const continuationConfirmed = momentum < 0 && !obvRising;
+                if (!continuationConfirmed) {
+                    buyScore += VWAP_REVERSION_POINTS;
+                    reasons.push(
+                        `VWAP mean-reversion: price ${Math.abs(vwapDeviationAtr).toFixed(2)}x ATR below VWAP, ` +
+                        `continuation unconfirmed (momentum=${momentum.toFixed(4)}, obvRising=${obvRising})`
+                    );
+                }
+            }
+        }
+
+
         // -------------------- ATR VOLATILITY RANGE --------------------
         const atrPct = (indicators.last.atr / input.price) * 100;
         logger.info(`ATR Analysis for ${input.symbol}: ATR=${indicators.last.atr.toFixed(4)}, Price=${input.price.toFixed(4)}, ATR%=${atrPct.toFixed(2)}%`);
@@ -456,14 +666,54 @@ export class Strategy {
         }
 
         // -------------------- ENGULFING PATTERN --------------------
-        const lastPattern = trendAndVolume.engulfing[trendAndVolume.engulfing.length - 1];
-        if (lastPattern === 'bullish' && trendAndVolume.hasVolumeSurge) {
-            buyScore += ENGULFING_POINTS;
-            reasons.push('Bullish Engulfing candle confirmed with volume surge');
-        } else if (lastPattern === 'bearish' && trendAndVolume.hasVolumeSurge) {
-            sellScore += ENGULFING_POINTS;
-            reasons.push('Bearish Engulfing candle confirmed with volume surge');
+        // Recency-gated: full points only if the volume-confirmed engulfing candle
+        // "just ignited" (within MOMENTUM_IGNITION_LOOKBACK candles). Decays with age
+        // so a pattern that already moved 1-2 candles ago doesn't get treated the
+        // same as one firing right now.
+        const ignitionTrigger = this._findRecentIgnitionTrigger(input.primaryData, trendAndVolume.engulfing);
+        const lastPattern = trendAndVolume.engulfing[trendAndVolume.engulfing.length - 1]; // still used by BB combo below
+
+        if (ignitionTrigger) {
+            const decay = MOMENTUM_IGNITION_DECAY[ignitionTrigger.offset] ?? 0;
+            const pts = ENGULFING_POINTS * decay;
+
+            if (pts > 0) {
+                const ageLabel = ignitionTrigger.offset === 0 ? 'this candle' : `${ignitionTrigger.offset} candle(s) ago`;
+                if (ignitionTrigger.type === 'bullish') {
+                    buyScore += pts;
+                    reasons.push(
+                        `Bullish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
+                    );
+                } else {
+                    sellScore += pts;
+                    reasons.push(
+                        `Bearish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
+                    );
+                }
+            }
         }
+
+        // -------------------- LIQUIDITY SWEEP / STOP-HUNT REVERSAL --------------------
+        // Wick beyond the recent swing high/low that closes back inside the range signals
+        // a stop-hunt. Volume confirmation gives full points; without it, half points —
+        // an unconfirmed sweep is a weaker signal but still worth flagging.
+        const lastSweep = trendAndVolume.liquiditySweep[trendAndVolume.liquiditySweep.length - 1];
+        if (lastSweep === 'bullish') {
+            const pts = trendAndVolume.hasVolumeSurge ? LIQUIDITY_SWEEP_POINTS : LIQUIDITY_SWEEP_POINTS / 2;
+            buyScore += pts;
+            reasons.push(
+                `Bullish liquidity sweep: swing low swept & reclaimed` +
+                (trendAndVolume.hasVolumeSurge ? ' (volume confirmed)' : ' (no volume confirmation)')
+            );
+        } else if (lastSweep === 'bearish') {
+            const pts = trendAndVolume.hasVolumeSurge ? LIQUIDITY_SWEEP_POINTS : LIQUIDITY_SWEEP_POINTS / 2;
+            sellScore += pts;
+            reasons.push(
+                `Bearish liquidity sweep: swing high swept & rejected` +
+                (trendAndVolume.hasVolumeSurge ? ' (volume confirmed)' : ' (no volume confirmation)')
+            );
+        }
+
 
         // -------------------- BOLLINGER BAND POSITION --------------------
         // Data shows: buying in lower BB zone (percent_b < 0.4) has 47% win rate
@@ -497,8 +747,62 @@ export class Strategy {
             reasons.push(`BB+Engulfing combo: bearish engulfing in upper BB half`);
         }
 
+        // -------------------- BB SQUEEZE → BREAKOUT --------------------
+        const squeezeBreakout = this._detectBbSqueezeBreakout(indicators, input.primaryData.closes);
+        if (squeezeBreakout === 'bullish') {
+            buyScore += BB_SQUEEZE_BREAKOUT_POINTS;
+            reasons.push(
+                `Bullish BB squeeze breakout: bandwidth expanded from squeeze, close broke above prior upper band`
+            );
+        } else if (squeezeBreakout === 'bearish') {
+            sellScore += BB_SQUEEZE_BREAKOUT_POINTS;
+            reasons.push(
+                `Bearish BB squeeze breakout: bandwidth expanded from squeeze, close broke below prior lower band`
+            );
+        }
+
+        // -------------------- ORDER BOOK IMBALANCE (gated, lazy fetch) --------------------
+        // Only fetch the order book when the leading side is already close to
+        // CONFIDENCE_THRESHOLD — avoids a REST call for symbols nowhere near a signal.
+        // Cached with a short TTL in ExchangeService so repeated calls within the same
+        // scan cycle (e.g. AutoTradeService re-checking) don't refetch.
+        const leadingScore = Math.max(buyScore, sellScore);
+        if (leadingScore >= CONFIDENCE_THRESHOLD - ORDER_BOOK_GATE_MARGIN) {
+            try {
+                const book = await this.exchangeService.getOrderBookImbalance(input.symbol);
+                if (book && Math.abs(book.imbalance) >= ORDER_BOOK_IMBALANCE_THRESHOLD) {
+                    // Scale points linearly between threshold and 1.0 imbalance
+                    const magnitude = Math.min(1, Math.abs(book.imbalance));
+                    const scaledPts = ORDER_BOOK_IMBALANCE_POINTS *
+                        ((magnitude - ORDER_BOOK_IMBALANCE_THRESHOLD) / (1 - ORDER_BOOK_IMBALANCE_THRESHOLD));
+
+                    if (book.imbalance > 0) {
+                        buyScore += scaledPts;
+                        reasons.push(
+                            `Order book bid-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
+                        );
+                    } else {
+                        sellScore += scaledPts;
+                        reasons.push(
+                            `Order book ask-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
+                        );
+                    }
+                } else if (book) {
+                    reasons.push(`Order book balanced (imbalance ${book.imbalance.toFixed(3)}) → no bonus`);
+                }
+            } catch (err) {
+                logger.warn(`Order book fetch failed during scoring for ${input.symbol}`, {
+                    error: err instanceof Error ? err.message : String(err),
+                });
+                // Fail-open: no points, no crash — order book is a bonus signal, not a gate
+            }
+        }
+
+
         // -------------------- ML PREDICTION INTEGRATION --------------------
         const features = await this.mlService.extractFeatures(input);
+        const preMlBuyScore = buyScore;
+        const preMlSellScore = sellScore;
 
         let mlWinConfidence = 0;
         let mlLossConfidence = 0;
@@ -531,6 +835,44 @@ export class Strategy {
                 buyScore: buyScore.toFixed(1),
                 sellScore: sellScore.toFixed(1),
             });
+
+            // ---------------- HYBRID TIE-BREAKER (dual buy/sell models) ----------------
+            // Only engages when the COMBINED model's confidence is ambiguous — a strong
+            // combined prediction is left alone. When ambiguous, defer to the side-specific
+            // model matching the raw technical leader (pre-ML scores), if that side has
+            // enough training data to be trusted.
+            if (mlWinConfidence >= AMBIGUOUS_CONFIDENCE_MIN && mlWinConfidence <= AMBIGUOUS_CONFIDENCE_MAX) {
+                const leaderSide: 'buy' | 'sell' | null =
+                    preMlBuyScore > preMlSellScore ? 'buy' :
+                        preMlSellScore > preMlBuyScore ? 'sell' : null;
+
+                if (!leaderSide) {
+                    reasons.push('ML confidence ambiguous, no clear technical leader → tie-breaker skipped');
+                } else if (!this.mlService.isDirectionalReady(leaderSide)) {
+                    reasons.push(
+                        `ML confidence ambiguous (${(mlWinConfidence * 100).toFixed(1)}%) but ${leaderSide} model not ready → tie-breaker skipped`
+                    );
+                } else {
+                    const dirResult = await this.mlService.predictDirectional(leaderSide, features);
+
+                    if (dirResult.label >= 1) {
+                        const bonus = dirResult.confidence * DIRECTIONAL_TIEBREAK_MAX;
+                        if (leaderSide === 'buy') buyScore += bonus; else sellScore += bonus;
+                        reasons.push(
+                            `Directional tie-break: ${leaderSide}-model confirms (label ${dirResult.label}) → +${bonus.toFixed(1)}pts`
+                        );
+                    } else if (dirResult.label <= -1) {
+                        const penalty = dirResult.confidence * DIRECTIONAL_TIEBREAK_MAX;
+                        if (leaderSide === 'buy') buyScore = Math.max(0, buyScore - penalty);
+                        else sellScore = Math.max(0, sellScore - penalty);
+                        reasons.push(
+                            `Directional tie-break: ${leaderSide}-model predicts LOSS (label ${dirResult.label}) → -${penalty.toFixed(1)}pts penalty`
+                        );
+                    } else {
+                        reasons.push(`Directional tie-break: ${leaderSide}-model neutral → no adjustment`);
+                    }
+                }
+            }
         } else {
             reasons.push('ML model not ready → no prediction bonus');
             buyScore *= ML_CONFIDENCE_DISCOUNT;
@@ -690,7 +1032,8 @@ export class Strategy {
         confidence: number,
         lastAtr: number,
         trendBias: TrendAndVolume['trendBias'],
-        accountBalance: number | undefined = 1000
+        accountBalance: number | undefined = 1000,
+        requireAtrFeasibility: boolean = true
     ): {
         stopLoss?: number;
         takeProfit?: number;
@@ -698,7 +1041,9 @@ export class Strategy {
         positionSizeUsd: number;
         positionSizeMultiplier?: number;
         riskAmountUsd: number;
-        takeProfitLevels: PartialTPLevel[]
+        takeProfitLevels: PartialTPLevel[];
+        feasible: boolean;
+        infeasibleReason?: string;
     } {
         // No signal → zero risk
         if (signal === 'hold') {
@@ -710,7 +1055,8 @@ export class Strategy {
                 positionSizeUsd: 0,
                 positionSizeMultiplier: 0,
                 riskAmountUsd: 0,
-                takeProfitLevels: []
+                takeProfitLevels: [],
+                feasible: false,
             };
         }
 
@@ -731,12 +1077,14 @@ export class Strategy {
         const riskAmountUsd = accountBalance * finalRiskPercent;
 
         // ──────────────────────────────────────────────────────────────
-        // 2. Stop-loss distance (ATR-based with bounds)
+        // 2. Stop-loss distance (ATR-based with bounds) — UNCHANGED.
+        //    This is the "natural" risk: whatever volatility actually gives us.
+        //    We do NOT shrink this to force a ratio — see feasibility gate below.
         // ──────────────────────────────────────────────────────────────
         const clampedMultiplier = Math.min(Math.max(atrMultiplier, MIN_ATR_MULTIPLIER), MAX_ATR_MULTIPLIER);
         const riskDistance = lastAtr * clampedMultiplier;
 
-        // Safety: reject absurd stops (>10% move)
+        // Absolute safety bound: reject absurd stops (>10% move) regardless of feasibility gate
         if (riskDistance <= 0 || riskDistance / price > 0.10) {
             logger.info(`Unrealistic risk distance calculated: ${riskDistance.toFixed(4)} (skipping trade)`);
             return {
@@ -746,7 +1094,42 @@ export class Strategy {
                 positionSizeUsd: 0,
                 positionSizeMultiplier: 0,
                 riskAmountUsd: 0,
-                takeProfitLevels: []
+                takeProfitLevels: [],
+                feasible: false,
+                infeasibleReason: `Risk distance ${(riskDistance / price * 100).toFixed(2)}% exceeds 10% absolute cap`,
+
+            };
+        }
+
+        // ──────────────────────────────────────────────────────────────
+        // 2b. FIXED TAKE-PROFIT TARGET (the actual 0.3% goal — not derived from SL)
+        // ──────────────────────────────────────────────────────────────
+        const takeProfitDistance = price * (config.strategy.targetProfitPct / 100);
+        const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
+        // ──────────────────────────────────────────────────────────────
+        // 2c. ATR FEASIBILITY GATE
+        //    Does the natural (ATR-derived) stop distance support an acceptable
+        //    R:R against the FIXED target? If not, skip the trade entirely —
+        //    never force-shrink the stop to manufacture a better ratio.
+        // ──────────────────────────────────────────────────────────────
+        const achievedRR = takeProfitDistance / riskDistance;
+
+        if (requireAtrFeasibility && achievedRR < config.strategy.minAcceptableRR) {
+            const reason =
+                `ATR-implied stop (${(riskDistance / price * 100).toFixed(3)}%) too wide for ` +
+                `${config.strategy.targetProfitPct}% target: achieved R:R ${achievedRR.toFixed(2)} ` +
+                `< min ${config.strategy.minAcceptableRR}`;
+            logger.info(`Feasibility gate rejected ${signal} signal: ${reason}`);
+            return {
+                stopLoss: undefined,
+                takeProfit: undefined,
+                trailingStopDistance: undefined,
+                positionSizeUsd: 0,
+                positionSizeMultiplier: 0,
+                riskAmountUsd: 0,
+                takeProfitLevels: [],
+                feasible: false,
+                infeasibleReason: reason,
             };
         }
 
@@ -760,16 +1143,15 @@ export class Strategy {
         const positionSizeUsd = Math.min(rawPositionSizeUsd, maxAllowedNotional);
 
         // ──────────────────────────────────────────────────────────────
-        // 4. Stop Loss & Take Profit levels
+        // 4. Stop Loss level (TP already computed above as the fixed target)
         // ──────────────────────────────────────────────────────────────
         const stopLoss = signal === 'buy' ? price - riskDistance : price + riskDistance;
-        const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
 
-        // Build partial TP levels from config (e.g. PARTIAL_TP_LEVELS = "1.5:0.4,3.0:0.3,6.0:0.3").
-        // Each entry is { rMultiple, weight }; we convert R-multiple to an absolute price.
-        // Levels whose rMultiple exceeds riskRewardTarget are omitted — they're beyond the full TP.
+        // Build partial TP levels from config. Filtered against the ACHIEVED R:R
+        // (not the old riskRewardTarget) since that's now the real ceiling — a
+        // partial level beyond achievedRR would sit past the fixed final target.
         const takeProfitLevels: PartialTPLevel[] = config.simulation.partialTpLevels
-            .filter(lvl => lvl.rMultiple < riskRewardTarget)
+            .filter(lvl => lvl.rMultiple < achievedRR)
             .map(lvl => ({
                 price: signal === 'buy'
                     ? Number((price + riskDistance * lvl.rMultiple).toFixed(8))
@@ -797,7 +1179,8 @@ export class Strategy {
             positionSizeUsd: Number(positionSizeUsd.toFixed(2)),
             positionSizeMultiplier: Number(positionSizeMultiplier.toFixed(3)),
             riskAmountUsd: Number(riskAmountUsd.toFixed(2)),
-            takeProfitLevels
+            takeProfitLevels,
+            feasible: true,
         };
     }
 
@@ -886,7 +1269,7 @@ export class Strategy {
                 reasons // reasons may be appended here (e.g., counter-trend penalty)
             );
 
-            const finalSignal = decision.signal; // 'buy' | 'sell' | 'hold'
+            let finalSignal = decision.signal; // 'buy' | 'sell' | 'hold' — may be demoted below
             const finalConfidence = decision.confidence; // Normalized 0-100%
 
             // Add a clear reason summarizing the raw score direction
@@ -914,19 +1297,32 @@ export class Strategy {
                     riskRewardTarget,
                     finalConfidence,
                     indicators.last.atr,
-                    trendAndVolume.trendBias
+                    trendAndVolume.trendBias,
+                    1000,
+                    input.requireAtrFeasibility ?? true
                 );
 
-                stopLoss = baseRiskParams.stopLoss ?? 0;
-                takeProfit = baseRiskParams.takeProfit ?? 0;
-                trailingStopDistance = baseRiskParams.trailingStopDistance;
-                positionSizeMultiplier = baseRiskParams.positionSizeMultiplier;
-                tplevels = baseRiskParams.takeProfitLevels;
+                if (!baseRiskParams.feasible) {
+                    // Demote to hold — a signal with no valid risk levels must not
+                    // be forwarded as buy/sell (previously this silently zeroed
+                    // SL/TP while keeping the signal direction — a latent bug).
+                    finalSignal = 'hold';
+                    reasons.push(
+                        `Signal demoted to HOLD: ${baseRiskParams.infeasibleReason ?? 'risk params infeasible'}`
+                    );
+                } else {
+                    stopLoss = baseRiskParams.stopLoss;
+                    takeProfit = baseRiskParams.takeProfit;
+                    trailingStopDistance = baseRiskParams.trailingStopDistance;
+                    positionSizeMultiplier = baseRiskParams.positionSizeMultiplier;
+                    tplevels = baseRiskParams.takeProfitLevels;
 
-                reasons.push(
-                    `Base risk levels: SL $${stopLoss.toFixed(6)}, TP $${takeProfit.toFixed(6)} ` +
-                    `(≈${(Math.abs(takeProfit - price) / Math.abs(price - stopLoss)).toFixed(1)}R)`
-                );
+                    reasons.push(
+                        `Base risk levels: SL $${stopLoss!.toFixed(6)}, TP $${takeProfit!.toFixed(6)} ` +
+                        `(≈${(Math.abs(takeProfit! - price) / Math.abs(price - stopLoss!)).toFixed(2)}R, ` +
+                        `target ${config.strategy.targetProfitPct}%)`
+                    );
+                }
             }
 
             // === 8. Logging (technical-only for clarity) ===

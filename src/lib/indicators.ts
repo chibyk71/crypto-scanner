@@ -253,6 +253,61 @@ export function detectEngulfing(
 }
 
 // -----------------------------------------------------------------------------
+// 11. LIQUIDITY SWEEP / STOP-HUNT REVERSAL DETECTION
+// -----------------------------------------------------------------------------
+export type LiquiditySweepType = 'bullish' | 'bearish' | null;
+
+/**
+ * Detects liquidity sweeps (stop-hunts): a candle wicks beyond the recent
+ * swing high/low but closes back inside that prior range.
+ *
+ *   - Wick BELOW the swing low, close reclaims back above it → 'bullish'
+ *     (long stop-losses + breakout shorts got swept, buyers step back in)
+ *   - Wick ABOVE the swing high, close rejects back below it → 'bearish'
+ *     (short stop-losses + breakout longs got swept, sellers step back in)
+ *
+ * Swing high/low is computed from the `lookback` candles PRECEDING the
+ * current candle (current candle excluded, so it can never sweep itself).
+ *
+ * @param highs
+ * @param lows
+ * @param closes
+ * @param lookback - candles used to define the swing range (default 20)
+ * @returns array aligned with input; null where there's no sweep or insufficient history
+ */
+export function detectLiquiditySweep(
+    highs: number[],
+    lows: number[],
+    closes: number[],
+    lookback: number = 20
+): LiquiditySweepType[] {
+    const result: LiquiditySweepType[] = new Array(highs.length).fill(null);
+
+    if (highs.length < lookback + 1) return result;
+
+    for (let i = lookback; i < highs.length; i++) {
+        const windowHighs = highs.slice(i - lookback, i);
+        const windowLows = lows.slice(i - lookback, i);
+
+        const swingHigh = Math.max(...windowHighs);
+        const swingLow = Math.min(...windowLows);
+
+        const sweptHigh = highs[i] > swingHigh && closes[i] <= swingHigh;
+        const sweptLow = lows[i] < swingLow && closes[i] >= swingLow;
+
+        // A candle could theoretically satisfy both on a huge-range bar —
+        // treat that as noise, not a clean sweep, and leave it null.
+        if (sweptHigh && !sweptLow) {
+            result[i] = 'bearish';
+        } else if (sweptLow && !sweptHigh) {
+            result[i] = 'bullish';
+        }
+    }
+
+    return result;
+}
+
+// -----------------------------------------------------------------------------
 // EXPORT SUMMARY (for easy import elsewhere)
 // -----------------------------------------------------------------------------
 export const Indicators = {
@@ -269,4 +324,5 @@ export const Indicators = {
     calculateMomentum,
     calculateADX,
     detectEngulfing,
+    detectLiquiditySweep,
 };

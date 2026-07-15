@@ -131,11 +131,22 @@ const ConfigSchema = z.object({
     }),
 
     // ──────────────────────────────────────────────────────────────
+    // Fixed Profit Target & ATR Feasibility Gate
+    // ──────────────────────────────────────────────────────────────
+    /** Fixed take-profit target as % of entry price (e.g. 0.3 = 0.3%) */
+    TARGET_PROFIT_PCT: z.coerce.number().default(0.3),
+    /** Minimum acceptable takeProfitDistance/riskDistance ratio to take the trade */
+    MIN_ACCEPTABLE_RR: z.coerce.number().default(1.0),
+
+    // ──────────────────────────────────────────────────────────────
     // ML Training
     // ──────────────────────────────────────────────────────────────
     MIN_SAMPLES_TO_TRAIN: z.coerce.number().default(150),
     MODEL_PATH: z.string().default('./models/model.onnx'),
     TRAINING_MODE: z.coerce.boolean().default(true),
+    /** Optional paths for side-specific models — default to same dir as MODEL_PATH */
+    MODEL_BUY_PATH: z.string().optional(),
+    MODEL_SELL_PATH: z.string().optional(),
 
     // ──────────────────────────────────────────────────────────────
     // Confidence & Filters
@@ -251,7 +262,7 @@ export const config = {
         scanIntervalMs: rawConfig.SCAN_INTERVAL_MS,
         /** Send heartbeat every N cycles */
         heartBeatInterval: rawConfig.HEARTBEAT_INTERVAL,
-
+        /** Cooldown time between signals (milliseconds) */
         signalCooldownMs: 12 * 60 * 1000,
     },
 
@@ -269,6 +280,10 @@ export const config = {
         positionSizePercent: rawConfig.POSITION_SIZE_PERCENT,
         /** Leverage to use (e.g., 5x) */
         leverage: rawConfig.LEVERAGE,
+        /** Fixed profit target (% of entry price) — the actual trade goal, e.g. 0.3 */
+        targetProfitPct: rawConfig.TARGET_PROFIT_PCT,
+        /** Minimum takeProfitDistance/riskDistance ratio required to take a trade */
+        minAcceptableRR: rawConfig.MIN_ACCEPTABLE_RR,
 
         /** Minimum confidence score to consider a signal valid */
         confidenceThreshold: rawConfig.CONFIDENCE_THRESHOLD,
@@ -330,6 +345,9 @@ export const config = {
         modelPath: rawConfig.MODEL_PATH,
         /** Master switch for ML training */
         trainingEnabled: rawConfig.TRAINING_MODE,
+        /** Defaults to model-buy.onnx / model-sell.onnx alongside MODEL_PATH if not set */
+        modelBuyPath: rawConfig.MODEL_BUY_PATH,
+        modelSellPath: rawConfig.MODEL_SELL_PATH,
     },
 
     // =========================================================================

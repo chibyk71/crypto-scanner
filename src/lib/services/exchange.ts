@@ -17,6 +17,13 @@ interface CacheEntry {
     timestamp: number;
 }
 
+interface OrderBookCacheEntry {
+    imbalance: number;      // (bidVol - askVol) / (bidVol + askVol), range -1..1
+    bidVolume: number;
+    askVolume: number;
+    timestamp: number;
+}
+
 /**
  * Manages interactions with the exchange (e.g., Bybit) using the CCXT library.
  * - Handles testnet/live mode switching, order placement, position management, and data fetching.
@@ -27,6 +34,9 @@ export class ExchangeService {
     private exchange: Exchange;
     // private primaryOhlcvData: { [symbol: string]: OHLCV[] } = {};
     private ohlcvCache: { [symbol: string]: { [timeframe: string]: CacheEntry } } = {};
+    private orderBookCache: { [symbol: string]: OrderBookCacheEntry } = {};
+    private readonly ORDER_BOOK_CACHE_TTL_MS = 2500; // short TTL — order book staleness matters
+    private readonly ORDER_BOOK_DEPTH = 25;          // top-N levels per side used for imbalance
     private pollingIntervals: { [symbol: string]: NodeJS.Timeout } = {};
     private supportedSymbols: string[] = [];
     private readonly MAX_EXCHANGE_LIMIT = 1000;
@@ -398,6 +408,91 @@ export class ExchangeService {
                 forceRefresh,
             });
             throw err;
+        }
+    }
+
+    /**
+     * Computes top-of-book bid/ask volume imbalance for a symbol.
+     *
+     * Lazy/on-demand fetch (Option B design): NOT part of the background polling
+     * loop — callers request this only when they actually need it (e.g. Strategy
+     * gating on near-threshold signals). Backed by a short TTL cache so multiple
+     * callers within the same scan cycle (e.g. Strategy scoring + AutoTradeService
+     * re-check) don't each trigger a fresh REST call.
+     *
+     * Imbalance formula: (bidVolume - askVolume) / (bidVolume + askVolume)
+     *   +1.0 → all volume on bid side (buy pressure)
+     *   -1.0 → all volume on ask side (sell pressure)
+     *    0.0 → balanced
+     *
+     * @param symbol - Trading pair (e.g. 'BTC/USDT')
+     * @param forceRefresh - Bypass cache (rarely needed; default false)
+     * @returns Imbalance data, or null if the fetch fails or symbol is invalid
+     */
+    public async getOrderBookImbalance(
+        symbol: string,
+        forceRefresh = false
+    ): Promise<{ imbalance: number; bidVolume: number; askVolume: number } | null> {
+        const cached = this.orderBookCache[symbol];
+        const now = Date.now();
+
+        if (!forceRefresh && cached && (now - cached.timestamp) < this.ORDER_BOOK_CACHE_TTL_MS) {
+            logger.debug(`Order book cache hit for ${symbol}`, {
+                ageMs: now - cached.timestamp,
+            });
+            return {
+                imbalance: cached.imbalance,
+                bidVolume: cached.bidVolume,
+                askVolume: cached.askVolume,
+            };
+        }
+
+        try {
+            if (!(await this.validateSymbol(symbol))) {
+                logger.warn(`getOrderBookImbalance: invalid symbol ${symbol}`);
+                return null;
+            }
+
+            const orderBook = await this.withRetries(
+                () => this.exchange.fetchOrderBook(symbol, this.ORDER_BOOK_DEPTH),
+                2 // fewer retries than OHLCV — this data is time-sensitive, a stale retry defeats the purpose
+            );
+
+            if (!orderBook || orderBook.bids.length === 0 || orderBook.asks.length === 0) {
+                logger.warn(`Empty order book for ${symbol}`);
+                return null;
+            }
+
+            const bidVolume = orderBook.bids.reduce((sum, [, size]) => sum + (size ?? 0), 0);
+            const askVolume = orderBook.asks.reduce((sum, [, size]) => sum + (size ?? 0), 0);
+            const totalVolume = bidVolume + askVolume;
+
+            if (totalVolume <= 0) {
+                logger.warn(`Zero total order book volume for ${symbol}`);
+                return null;
+            }
+
+            const imbalance = (bidVolume - askVolume) / totalVolume;
+
+            this.orderBookCache[symbol] = {
+                imbalance,
+                bidVolume,
+                askVolume,
+                timestamp: now,
+            };
+
+            logger.debug(`Order book fetched for ${symbol}`, {
+                imbalance: imbalance.toFixed(4),
+                bidVolume: bidVolume.toFixed(4),
+                askVolume: askVolume.toFixed(4),
+            });
+
+            return { imbalance, bidVolume, askVolume };
+        } catch (error) {
+            logger.error(`Failed to fetch order book for ${symbol}`, {
+                error: error instanceof Error ? error.message : String(error),
+            });
+            return null;
         }
     }
 
@@ -826,6 +921,7 @@ export class ExchangeService {
      */
     public clearCache(): void {
         this.ohlcvCache = {};
+        this.orderBookCache = {};
         logger.info('OHLCV cache cleared');
     }
 

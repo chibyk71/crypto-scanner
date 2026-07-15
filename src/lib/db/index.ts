@@ -1196,7 +1196,7 @@ class DatabaseService {
      * Deliberately excludes heavy columns (pnl raw bytes, tpLevels JSON etc)
      * to keep the CSV file small and fast to send via Telegram.
      */
-    public async getExportableSimulations(): Promise<Array<{
+    public async getExportableSimulations(side?: 'buy' | 'sell'): Promise<Array<{
         symbol: string;
         side: string;
         label: number;
@@ -1205,6 +1205,13 @@ class DatabaseService {
         features: string;  // JSON string — Python parses this
     }>> {
         try {
+            const conditions = [
+                isNotNull(simulatedTrades.label),
+                isNotNull(simulatedTrades.features),
+                isNotNull(simulatedTrades.closedAt),
+            ];
+            if (side) conditions.push(eq(simulatedTrades.side, side));
+
             const rows = await this.db
                 .select({
                     symbol: simulatedTrades.symbol,
@@ -1215,13 +1222,7 @@ class DatabaseService {
                     features: simulatedTrades.features,
                 })
                 .from(simulatedTrades)
-                .where(
-                    and(
-                        isNotNull(simulatedTrades.label),
-                        isNotNull(simulatedTrades.features),
-                        isNotNull(simulatedTrades.closedAt),
-                    )
-                )
+                .where(and(...conditions))
                 .orderBy(desc(simulatedTrades.closedAt))
                 .execute();
 
@@ -1417,17 +1418,19 @@ class DatabaseService {
         limit?: number;          // max rows to return (default: all)
         offset?: number;         // skip first N rows (for pagination)
         symbol?: string;         // filter to one symbol only
+        side?: 'buy' | 'sell';   //
     } = {}): Promise<SimulatedTrade[]> {
-        const { limit, offset = 0, symbol } = options;
+        const { limit, offset = 0, symbol, side } = options;
 
         try {
+            const conditions = [isNotNull(simulatedTrades.label)];
+            if (symbol) conditions.push(eq(simulatedTrades.symbol, symbol.trim().toUpperCase()));
+            if (side) conditions.push(eq(simulatedTrades.side, side));
+
             let query = this.db
                 .select()
                 .from(simulatedTrades)
-                .where(and(
-                    isNotNull(simulatedTrades.label),
-                    symbol ? eq(simulatedTrades.symbol, symbol.trim().toUpperCase()) : undefined
-                ))
+                .where(and(...conditions))
                 .orderBy(desc(simulatedTrades.closedAt))
                 .offset(offset)
                 .$dynamic();
@@ -1540,20 +1543,24 @@ class DatabaseService {
  *
  * @returns Number of simulations with a valid label (-2 to +2)
  */
-    public async getSampleCount(): Promise<number> {
+    public async getSampleCount(side?: 'buy' | 'sell'): Promise<number> {
         try {
+            const conditions = [isNotNull(simulatedTrades.label)];
+            if (side) conditions.push(eq(simulatedTrades.side, side));
+
             const result = await this.db
                 .select({ count: count() })
                 .from(simulatedTrades)
-                .where(isNotNull(simulatedTrades.label))
+                .where(and(...conditions))
                 .execute();
 
             const num = result[0]?.count ?? 0;
-            logger.debug('Fetched labeled sample count', { num });
+            logger.debug('Fetched labeled sample count', { num, side: side ?? 'all' });
             return num;
         } catch (err) {
             logger.error('Failed to get sample count', {
                 error: err instanceof Error ? err.message : String(err),
+                side,
             });
             return 0; // fail-safe: return 0 so retrain can gracefully skip
         }

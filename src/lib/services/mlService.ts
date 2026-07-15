@@ -39,22 +39,50 @@ const logger = createLogger('MLService');
 export class MLService {
     // ONNX inference session — null until model is loaded
     private session: ort.InferenceSession | null = null;
+    private sessionBuy: ort.InferenceSession | null = null;
+    private sessionSell: ort.InferenceSession | null = null;
 
     // Model state flags
     private isModelLoaded = false;
+    private isBuyModelLoaded = false;
+    private isSellModelLoaded = false;
     private isTrainingPaused = false;  // kept for API compatibility with Telegram commands
+
+    // Cached sample counts — refreshed periodically, not queried per-prediction
+    private buySampleCount = 0;
+    private sellSampleCount = 0;
+    private sampleCountRefreshTimer: NodeJS.Timeout | null = null;
+    private readonly SAMPLE_COUNT_REFRESH_MS = 5 * 60 * 1000; // 5 min
 
     // =========================================================================
     // CONSTRUCTOR
     // =========================================================================
     constructor() {
-        // Non-blocking load — bot starts immediately, predictions become
-        // available once the file is read (usually < 1 second)
         this.loadModel().catch(err => {
             logger.warn('Model load failed at startup — predictions disabled', {
                 error: err instanceof Error ? err.message : String(err),
             });
         });
+
+        this.loadDirectionalModels().catch(err => {
+            logger.warn('Directional model load failed at startup — hybrid tie-breaker disabled', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+        });
+
+        this.refreshDirectionalSampleCounts().catch(err => {
+            logger.warn('Initial directional sample count fetch failed', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+        });
+
+        this.sampleCountRefreshTimer = setInterval(() => {
+            this.refreshDirectionalSampleCounts().catch(err => {
+                logger.warn('Periodic directional sample count refresh failed', {
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            });
+        }, this.SAMPLE_COUNT_REFRESH_MS);
 
         logger.info('MLService initialized (ONNX inference mode)');
     }
@@ -134,6 +162,197 @@ export class MLService {
     }
 
     // =========================================================================
+    // DIRECTIONAL MODEL LOADING (buy/sell ONNX sessions)
+    // =========================================================================
+    /**
+     * Loads the two optional side-specific ONNX models (model-buy.onnx / model-sell.onnx).
+     *
+     * Both are OPTIONAL — if either file doesn't exist, that side simply stays
+     * unloaded and predictDirectional() returns the neutral fallback for it,
+     * mirroring how the combined model's isReady() gate already works.
+     *
+     * Paths default to sitting next to MODEL_PATH if not explicitly configured.
+     */
+    private async loadDirectionalModels(): Promise<void> {
+        const baseDir = path.dirname(path.resolve(config.ml.modelPath));
+
+        const buyPath = config.ml.modelBuyPath
+            ? path.resolve(config.ml.modelBuyPath)
+            : path.join(baseDir, 'model-buy.onnx');
+
+        const sellPath = config.ml.modelSellPath
+            ? path.resolve(config.ml.modelSellPath)
+            : path.join(baseDir, 'model-sell.onnx');
+
+        this.sessionBuy = await this._tryLoadSession(buyPath, 'buy');
+        this.isBuyModelLoaded = this.sessionBuy !== null;
+
+        this.sessionSell = await this._tryLoadSession(sellPath, 'sell');
+        this.isSellModelLoaded = this.sessionSell !== null;
+
+        logger.info('Directional model load attempt complete', {
+            buyLoaded: this.isBuyModelLoaded,
+            sellLoaded: this.isSellModelLoaded,
+        });
+    }
+
+    /**
+     * Attempts to load a single ONNX session, failing gracefully (returns null)
+     * if the file is missing — this is expected for a side that hasn't been
+     * trained yet, not an error condition worth crashing over.
+     */
+    private async _tryLoadSession(modelPath: string, label: string): Promise<ort.InferenceSession | null> {
+        try {
+            await fs.access(modelPath);
+
+            const session = await ort.InferenceSession.create(modelPath, {
+                executionProviders: ['cpu'],
+                graphOptimizationLevel: 'all',
+            });
+
+            logger.info(`${label} ONNX model loaded successfully`, {
+                path: modelPath,
+                inputs: session.inputNames,
+                outputs: session.outputNames,
+            });
+
+            if (!session.outputNames.includes('probabilities')) {
+                logger.warn(`${label} model missing "probabilities" output node — predictions will fail`, {
+                    found: session.outputNames,
+                });
+            }
+
+            return session;
+        } catch (err) {
+            const isNotFound = (err as NodeJS.ErrnoException).code === 'ENOENT';
+            if (isNotFound) {
+                logger.info(`No ${label}-specific model found — hybrid tie-breaker disabled for this side`, {
+                    path: modelPath,
+                });
+            } else {
+                logger.error(`Failed to load ${label} ONNX model`, {
+                    path: modelPath,
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
+            return null;
+        }
+    }
+
+    // =========================================================================
+    // DIRECTIONAL SAMPLE COUNT CACHE
+    // =========================================================================
+    /**
+     * Refreshes cached per-side labeled sample counts from the DB.
+     * Called on startup and on a periodic timer — NOT on every prediction,
+     * since predictDirectional() is called at signal-generation time and
+     * must stay fast.
+     */
+    private async refreshDirectionalSampleCounts(): Promise<void> {
+        const [buyCount, sellCount] = await Promise.all([
+            dbService.getSampleCount('buy'),
+            dbService.getSampleCount('sell'),
+        ]);
+        this.buySampleCount = buyCount;
+        this.sellSampleCount = sellCount;
+
+        logger.debug('Directional sample counts refreshed', {
+            buy: this.buySampleCount,
+            sell: this.sellSampleCount,
+            minRequired: config.ml.minSamplesToTrain,
+        });
+    }
+
+    // =========================================================================
+    // DIRECTIONAL READINESS CHECK
+    // =========================================================================
+    /**
+     * A side is "ready" only if its model is loaded AND it has at least
+     * config.ml.minSamplesToTrain labeled samples — same convention as the
+     * combined model's training threshold. Below that, callers should treat
+     * this side as unavailable and fall back to combined-only behavior.
+     */
+    public isDirectionalReady(direction: 'buy' | 'sell'): boolean {
+        if (direction === 'buy') {
+            return this.isBuyModelLoaded && this.sessionBuy !== null
+                && this.buySampleCount >= config.ml.minSamplesToTrain;
+        }
+        return this.isSellModelLoaded && this.sessionSell !== null
+            && this.sellSampleCount >= config.ml.minSamplesToTrain;
+    }
+
+    // =========================================================================
+    // DIRECTIONAL PREDICTION
+    // =========================================================================
+    /**
+     * Runs inference using the side-specific ONNX model.
+     *
+     * Same interface as predict() by design. Callers MUST check
+     * isDirectionalReady(direction) before calling — mirroring the existing
+     * pattern where Strategy checks mlService.isReady() before predict().
+     * If called on an unready side anyway, returns the neutral fallback
+     * rather than throwing.
+     *
+     * @param direction 'buy' or 'sell' — which side model to use
+     * @param features Vector from extractFeatures() — must be length 26
+     * @returns { label, confidence } — confidence = P(label +1) + P(label +2)
+     */
+    public async predictDirectional(
+        direction: 'buy' | 'sell',
+        features: number[]
+    ): Promise<{ label: SignalLabel; confidence: number }> {
+        const session = direction === 'buy' ? this.sessionBuy : this.sessionSell;
+
+        if (!this.isDirectionalReady(direction) || !session) {
+            return { label: 0, confidence: 0 };
+        }
+
+        try {
+            const inputTensor = new ort.Tensor(
+                'float32',
+                Float32Array.from(features),
+                [1, features.length]
+            );
+
+            const feeds = { float_input: inputTensor };
+            const results = await session.run(feeds);
+
+            const probTensor = results['probabilities'];
+            if (!probTensor) {
+                logger.error(`${direction} model output "probabilities" not found`, {
+                    availableOutputs: Object.keys(results),
+                });
+                return { label: 0, confidence: 0 };
+            }
+
+            const probData = probTensor.data as Float32Array;
+            const pPos1 = probData[3];
+            const pPos2 = probData[4];
+            const positiveConfidence = pPos1 + pPos2;
+            const predictedLabel: SignalLabel = pPos2 > pPos1 ? 2 : pPos1 >= 0.35 ? 1 : 0;
+
+            // Negative-side check mirrors combined predict()'s label derivation but
+            // this model is side-specific, so a strong pNeg indicates THIS direction
+            // is predicted to lose — the label can legitimately be -1/-2 here.
+            const pNeg1 = probData[1];
+            const pNeg2 = probData[0];
+            const finalLabel: SignalLabel = pNeg2 > 0.35 ? -2 : pNeg1 >= 0.35 ? -1 : predictedLabel;
+
+            logger.debug(`${direction} directional prediction`, {
+                label: finalLabel,
+                confidence: positiveConfidence.toFixed(4),
+            });
+
+            return { label: finalLabel, confidence: positiveConfidence };
+        } catch (err) {
+            logger.error(`${direction} directional prediction failed`, {
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return { label: 0, confidence: 0 };
+        }
+    }
+
+    // =========================================================================
     // HOT-SWAP: Reload model without restarting the bot
     // =========================================================================
     /**
@@ -161,8 +380,18 @@ export class MLService {
         try {
             await this.loadModel();
 
+            this.sessionBuy = null;
+            this.sessionSell = null;
+            this.isBuyModelLoaded = false;
+            this.isSellModelLoaded = false;
+            await this.loadDirectionalModels();
+            await this.refreshDirectionalSampleCounts();
+
             if (this.isModelLoaded) {
-                return '✅ Model reloaded successfully. Predictions are active.';
+                const dirStatus = `buy: ${this.isDirectionalReady('buy') ? '✅' : '⏳'} (${this.buySampleCount}/${config.ml.minSamplesToTrain}), ` +
+                    `sell: ${this.isDirectionalReady('sell') ? '✅' : '⏳'} (${this.sellSampleCount}/${config.ml.minSamplesToTrain})`;
+                return `✅ Combined model reloaded. Directional — ${dirStatus}`;
+
             } else {
                 return '❌ Model reload failed — check logs for details.';
             }

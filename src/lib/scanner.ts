@@ -30,6 +30,7 @@ import { AlertEvaluatorService } from './services/alertEvaluator';
 import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
 import { cooldownService } from './services/cooldownService';
+import type { MLService } from './services/mlService';
 
 const logger = createLogger('MarketScanner');
 
@@ -93,6 +94,7 @@ export class MarketScanner {
      * @param exchangeService - Handles market data and order execution
      * @param telegramService - Optional: for sending alerts and status updates
      * @param strategy - Core signal generation logic
+     * @param mlService - Machine learning service for directional confirmation
      * @param symbols - List of trading pairs to monitor
      * @param opts - Optional overrides for scanner behavior
      */
@@ -100,6 +102,7 @@ export class MarketScanner {
         private readonly exchangeService: ExchangeService,
         private readonly telegramService: TelegramBotController | undefined,
         private readonly strategy: Strategy,
+        private readonly mlService: MLService,
         private readonly symbols: string[],
         opts: ScannerOptions = {}
     ) {
@@ -116,7 +119,7 @@ export class MarketScanner {
         };
 
         // ← Initialize AutoTradeService with exchange and db
-        this.autoTradeService = new AutoTradeService(this.exchangeService, telegramService);
+        this.autoTradeService = new AutoTradeService(this.exchangeService, this.mlService, telegramService);
 
         logger.info(`MarketScanner initialized for ${symbols.length} symbols`, {
             mode: this.opts.mode,
@@ -355,6 +358,7 @@ export class MarketScanner {
                 atrMultiplier: config.strategy.atrMultiplier,
                 riskRewardTarget: config.strategy.riskRewardTarget,
                 trailingStopPercent: config.strategy.trailingStopPercent,
+                requireAtrFeasibility: this.opts.requireAtrFeasibility,
             });
 
             // Quick console visibility (useful during dev/tuning)

@@ -22,6 +22,7 @@ import type { TelegramBotController } from './telegramBotController';
 import { excursionCache } from './excursionHistoryCache';
 import { simulateTrade } from './simulateTrade';
 import { dbService } from '../db';
+import { MLService } from './mlService';
 
 const logger = createLogger('AutoTradeService');
 
@@ -43,6 +44,7 @@ export class AutoTradeService {
 
     constructor(
         private readonly exchange: ExchangeService,
+        private readonly mlService: MLService,
         private readonly telegramService?: TelegramBotController
     ) {
         // Initialize error tracking
@@ -157,7 +159,62 @@ export class AutoTradeService {
             let wasReversed = false;
 
             if (advice.action === 'reverse') {
-                finalSide = signal.signal === 'buy' ? 'sell' : 'buy';
+                const proposedReversedSide: 'buy' | 'sell' = signal.signal === 'buy' ? 'sell' : 'buy';
+
+                // ────────────────────────────────────────────────────────────
+                // ML CONFIRMATION GATE: before committing to a reversal, ask the
+                // side-specific model whether IT thinks the new (reversed) direction
+                // is a loser. If it's confident the reversed side will lose, block
+                // the reversal entirely — excursion advice alone is not enough to
+                // override a strong ML loss signal on the flipped direction.
+                //
+                // If the side-specific model isn't ready/loaded, fall back to the
+                // existing behavior unchanged (reverse based on excursion advice alone).
+                // ────────────────────────────────────────────────────────────
+                let reversalBlocked = false;
+
+                if (this.mlService.isDirectionalReady(proposedReversedSide)) {
+                    const dirPrediction = await this.mlService.predictDirectional(
+                        proposedReversedSide,
+                        signal.features
+                    );
+
+                    if (dirPrediction.label <= -1) {
+                        reversalBlocked = true;
+                        logger.info(
+                            `Reversal BLOCKED by ML confirmation gate: ${proposedReversedSide}-model predicts loss`,
+                            {
+                                symbol,
+                                originalSignal: signal.signal,
+                                proposedReversedSide,
+                                predictedLabel: dirPrediction.label,
+                                confidence: dirPrediction.confidence.toFixed(3),
+                                adviceSummary: advice.advice,
+                            }
+                        );
+                    } else {
+                        logger.debug(
+                            `Reversal ML confirmation passed: ${proposedReversedSide}-model does not predict loss`,
+                            { symbol, predictedLabel: dirPrediction.label, confidence: dirPrediction.confidence.toFixed(3) }
+                        );
+                    }
+                } else {
+                    logger.debug(
+                        `Reversal ML confirmation skipped: ${proposedReversedSide}-model not ready — falling back to excursion-only reversal`,
+                        { symbol }
+                    );
+                }
+
+                if (reversalBlocked) {
+                    logger.info(`Excursion advised REVERSE but ML gate vetoed it → skipping trade/alert entirely`, {
+                        symbol,
+                        originalSignal: signal.signal,
+                        blockedReversedSide: proposedReversedSide,
+                    });
+                    return;
+                }
+
+                finalSide = proposedReversedSide;
                 wasReversed = true;
                 logger.info(`Regime reversal applied → switching to ${finalSide.toUpperCase()}`, { symbol });
             }
@@ -257,7 +314,9 @@ export class AutoTradeService {
                 stopLoss: Number(finalStopLoss.toFixed(8)),
                 takeProfit: Number(finalTakeProfit.toFixed(8)),
                 reason: [
-                    wasReversed ? '↔️ DIRECTION REVERSED' : '',
+                    wasReversed && this.mlService.isDirectionalReady(finalSide)
+                        ? '✅ ML confirmation gate passed for reversed direction'
+                        : wasReversed ? 'ℹ️ ML confirmation gate skipped (model not ready)' : '',
                     ...signal.reason, // original technical reasons
                     advice.advice,
                     `ATR-based SL: ${(Math.abs(currentPrice - finalStopLoss) / currentPrice * 100).toFixed(3)}% | TP: ${(Math.abs(finalTakeProfit - currentPrice) / currentPrice * 100).toFixed(3)}% | R:R ≈ ${(Math.abs(finalTakeProfit - currentPrice) / Math.abs(currentPrice - finalStopLoss)).toFixed(2)}×`,
