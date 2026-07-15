@@ -414,9 +414,16 @@ export class MLService {
      *   [0–14]  Technical indicators (RSI, EMA deviations, MACD, etc.)
      *   [15–20] Excursion regime (buy MFE/MAE/ratio + sell MFE/MAE/ratio)
      *   [21–24] Market context (OBV delta, VWAP deviation, VWMA-VWAP spread, relative volume)
-     *   [25]    Symbol index (normalized stable index from symbolRegistry)
+     *   [25]    Liquidity sweep at this candle (-1 bearish / 0 none / 1 bullish)
+     *   [26]    BB squeeze breakout at this candle (-1 bearish / 0 none / 1 bullish)
+     *   [27]    Previous BUY-side simulation outcome for this symbol (0-1, 0 if none)
+     *   [28]    Previous BUY-side simulation label for this symbol (-1..1, 0 if none)
+     *   [29]    Previous SELL-side simulation outcome for this symbol (0-1, 0 if none)
+     *   [30]    Previous SELL-side simulation label for this symbol (-1..1, 0 if none)
+     *   [31]    Time since last simulation on this symbol, any side (0-1, capped; 1 = none/stale)
+     *   [32]    Symbol index (normalized stable index from symbolRegistry)
      *
-     * Total: 26 features
+     * Total: 33 features
      *
      * Normalization notes (2026 update):
      *   [4,5,6]  MACD values divided by price — cross-symbol consistent scale
@@ -424,16 +431,27 @@ export class MLService {
      *   [22]     (price - vwap) / price — deviation from VWAP, not absolute price
      *   [23]     (vwma - vwap) / price — VWMA vs VWAP spread, not absolute value
      *   [24]     relative volume ratio capped at 5, normalized to 0–1 — volume surge magnitude
+     *   [27,29]  Outcome quality scale: tp=1.0, partial_tp=0.75, timeout=0.4, sl=0.0
+     *   [28,30]  Raw label (-2..+2) divided by 2 → -1..1
+     *   [31]     min(elapsedMs / TIME_SINCE_CAP_MS, 1) — 0 = just happened, 1 = >= cap or no history
      *
      * @param input Full market context at signal time
-     * @returns Fixed-length number[] of length 26
+     * @param extras Precomputed signals from Strategy that extractFeatures should NOT
+     *               recompute itself (avoids running the same detectors twice per signal)
+     * @returns Fixed-length number[] of length 33
      */
-    public async extractFeatures(input: StrategyInput): Promise<number[]> {
+    public async extractFeatures(
+        input: StrategyInput,
+        extras?: {
+            liquiditySweep?: 'bullish' | 'bearish' | null;
+            bbSqueezeBreakout?: 'bullish' | 'bearish' | null;
+        }
+    ): Promise<number[]> {
         const { symbol, primaryData, htfData, price } = input;
 
         if (price <= 0) {
             logger.warn('Invalid price in extractFeatures – returning neutral vector', { symbol, price });
-            return new Array(26).fill(0);
+            return new Array(33).fill(0);
         }
 
         const f: number[] = [];
@@ -463,7 +481,7 @@ export class MLService {
         // ── 2. Excursion regime features [15–20] ─────────────────────────────
         let regime;
         try {
-            regime = excursionCache.getRegimeLite(symbol);
+            regime = excursionCache.getRegime(symbol); // full regime — need historyJson below
         } catch (err) {
             logger.warn('Failed to fetch regime in extractFeatures', { symbol, err });
         }
@@ -531,18 +549,66 @@ export class MLService {
             relativeVolumeFeature,  // [24]
         );
 
-        // ── 4. Symbol identity [25] ───────────────────────────────────────────
+        // ── 4. New signal features [25–26] ────────────────────────────────────
+        const sweepValue = extras?.liquiditySweep === 'bullish' ? 1
+            : extras?.liquiditySweep === 'bearish' ? -1
+                : 0;
+        const squeezeValue = extras?.bbSqueezeBreakout === 'bullish' ? 1
+            : extras?.bbSqueezeBreakout === 'bearish' ? -1
+                : 0;
+
+        f.push(sweepValue, squeezeValue); // [25], [26]
+
+        // ── 5. Previous simulation history per side [27–30] ────────────────────
+        const OUTCOME_SCORE_MAP: Record<string, number> = {
+            tp: 1.0,
+            partial_tp: 0.75,
+            timeout: 0.4,
+            sl: 0.0,
+        };
+
+        const historyJson = regime?.historyJson ?? []; // newest-first, per ExcursionHistoryCache convention
+        const prevBuySim = historyJson.find(e => e.direction === 'buy');
+        const prevSellSim = historyJson.find(e => e.direction === 'sell');
+
+        const prevBuyOutcome = prevBuySim ? (OUTCOME_SCORE_MAP[prevBuySim.outcome] ?? 0.4) : 0;
+        const prevBuyLabel = prevBuySim ? prevBuySim.label / 2 : 0; // -2..2 → -1..1
+        const prevSellOutcome = prevSellSim ? (OUTCOME_SCORE_MAP[prevSellSim.outcome] ?? 0.4) : 0;
+        const prevSellLabel = prevSellSim ? prevSellSim.label / 2 : 0;
+
+        f.push(prevBuyOutcome, prevBuyLabel, prevSellOutcome, prevSellLabel); // [27–30]
+
+        // ── 6. Time since last simulation, any side [31] ────────────────────────
+        const TIME_SINCE_CAP_MS = 60 * 60 * 1000; // 1 hour — beyond this, "stale" is fully saturated
+        const mostRecentSim = historyJson[0]; // historyJson is sorted newest-first
+        const timeSinceLastSim = mostRecentSim
+            ? Math.min((Date.now() - mostRecentSim.timestamp) / TIME_SINCE_CAP_MS, 1)
+            : 1; // no history at all → treat as maximally stale
+
+        f.push(timeSinceLastSim); // [31]
+
+        if (logger.isDebugEnabled()) {
+            logger.debug('New signal features', {
+                symbol,
+                sweepValue, squeezeValue,
+                prevBuyOutcome: prevBuyOutcome.toFixed(2), prevBuyLabel: prevBuyLabel.toFixed(2),
+                prevSellOutcome: prevSellOutcome.toFixed(2), prevSellLabel: prevSellLabel.toFixed(2),
+                timeSinceLastSim: timeSinceLastSim.toFixed(3),
+            });
+        }
+
+        // ── 7. Symbol identity [32] ───────────────────────────────────────────
         if (!symbolRegistry.isKnown(symbol)) {
             logger.warn('Unknown symbol in extractFeatures — model may generalize poorly', {
                 symbol,
                 hint: 'Add to config.symbols and retrain',
             });
         }
-        f.push(symbolRegistry.getIndex(symbol)); // [25]
+        f.push(symbolRegistry.getIndex(symbol)); // [32]
 
         // ── Validation ────────────────────────────────────────────────────────
-        // 15 technical + 6 excursion + 4 context + 1 symbol = 26
-        const expectedLength = 26;
+        // 15 technical + 6 excursion + 4 context + 2 new-signal + 4 prev-sim + 1 time-since + 1 symbol = 33
+        const expectedLength = 33;
         if (f.length !== expectedLength) {
             logger.error('Feature length mismatch', { expected: expectedLength, actual: f.length, symbol });
             throw new Error(`Feature vector length error: expected ${expectedLength}, got ${f.length}`);

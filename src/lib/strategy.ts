@@ -800,7 +800,11 @@ export class Strategy {
 
 
         // -------------------- ML PREDICTION INTEGRATION --------------------
-        const features = await this.mlService.extractFeatures(input);
+        const lastLiquiditySweep = trendAndVolume.liquiditySweep[trendAndVolume.liquiditySweep.length - 1];
+        const features = await this.mlService.extractFeatures(input, {
+            liquiditySweep: lastLiquiditySweep,
+            bbSqueezeBreakout: squeezeBreakout, // already computed above, in the BB squeeze scoring block
+        });
         const preMlBuyScore = buyScore;
         const preMlSellScore = sellScore;
 
