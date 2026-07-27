@@ -16,8 +16,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# Must match expectedLength in mlService.ts
-EXPECTED_FEATURES = 26
+# Must match expectedLength in mlService.ts extractFeatures()
+EXPECTED_FEATURES = 33
 
 # Labels your bot produces
 VALID_LABELS = {-2, -1, 0, 1, 2}
@@ -35,68 +35,29 @@ LABEL_NAMES = {
     4: 'monster  (+2)',
 }
 
+# Order MUST match mlService.ts extractFeatures() exactly — index-for-index.
+# [0-14]  Technical indicators
+# [15-20] Excursion regime (buy/sell MFE/MAE/ratio)
+# [21-24] Market context (OBV delta, VWAP dev, VWMA-VWAP spread, rel. volume)
+# [25-26] Liquidity sweep / BB squeeze breakout at this candle
+# [27-30] Previous buy/sell simulation outcome + label for this symbol
+# [31]    Time since last simulation (any side)
+# [32]    Symbol index
 FEATURE_NAMES = [
     'rsi', 'ema_short_dev', 'ema_mid_dev', 'ema_long_dev',
-    'macd_line_norm', 'macd_signal_norm', 'macd_hist_norm',  # normalized by price
+    'macd_line_norm', 'macd_signal_norm', 'macd_hist_norm',
     'stoch_k', 'stoch_d', 'atr_pct', 'htf_adx',
     'percent_b', 'bb_bandwidth', 'momentum', 'engulfing',
     'buy_mfe', 'buy_mae', 'buy_ratio',
     'sell_mfe', 'sell_mae', 'sell_ratio',
-    'obv_delta_norm',     # was: obv absolute
-    'vwap_deviation',     # was: vwap / 1e6
-    'vwma_vwap_spread',   # was: vwma / 1e6
-    'rel_volume',         # was: price / 1e5
+    'obv_delta_norm', 'vwap_deviation', 'vwma_vwap_spread', 'rel_volume',
+    'liquidity_sweep', 'bb_squeeze_breakout',
+    'prev_buy_outcome', 'prev_buy_label',
+    'prev_sell_outcome', 'prev_sell_label',
+    'time_since_last_sim',
     'symbol_index',
 ]
 
-def normalize_legacy_features(X: np.ndarray, entry_prices: np.ndarray) -> np.ndarray:
-    """
-    TEMPORARY: Normalizes feature vectors exported before the 2026 normalization fix.
-
-    Transforms old absolute-scale features to the new price-relative format:
-      [4]  macd_line    / price  (was raw price-unit value)
-      [5]  macd_signal  / price  (was raw price-unit value)
-      [6]  macd_hist    / price  (was raw price-unit value)
-      [21] obv_delta_norm        (was obv / 1e9 — cannot reconstruct, set to 0)
-      [22] (price - vwap) / price (was vwap / 1e6 — cannot reconstruct, set to 0)
-      [23] (vwma - vwap) / price  (was vwma / 1e6 — cannot reconstruct, set to 0)
-      [24] rel_volume             (was price / 1e5 — cannot reconstruct, set to 0.2)
-
-    Features [21,22,23] are set to 0 (neutral) since the original absolute values
-    carry no cross-symbol meaning and cannot be reverse-engineered.
-    Feature [24] is set to 0.2 (~1x volume ratio after normalization).
-    Features [4,5,6] can be properly normalized using entry_price from the CSV.
-
-    Remove this function and the call in train.py once the old data is cleared
-    and the bot has accumulated fresh normalized simulations.
-
-    Args:
-        X:             Feature matrix, shape (n_samples, 26)
-        entry_prices:  Entry price for each row, shape (n_samples,)
-
-    Returns:
-        X_norm: Normalized copy of X, same shape
-    """
-    X_norm = X.copy()
-
-    for i, price in enumerate(entry_prices):
-        if price <= 0:
-            continue
-
-        # [4,5,6] — divide raw MACD values by entry price
-        X_norm[i, 4] = X[i, 4] / price
-        X_norm[i, 5] = X[i, 5] / price
-        X_norm[i, 6] = X[i, 6] / price
-
-        # [21,22,23] — cannot reconstruct from CSV, set to neutral 0
-        X_norm[i, 21] = 0.0
-        X_norm[i, 22] = 0.0
-        X_norm[i, 23] = 0.0
-
-        # [24] — cannot reconstruct volume ratio, set to 0.2 (represents ~1x normal volume)
-        X_norm[i, 24] = 0.2
-
-    return X_norm
 
 def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -105,7 +66,10 @@ def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np
     Returns:
         X: float32 array of shape (n_samples, EXPECTED_FEATURES)
         y: int array of shape (n_samples,) with values 0..4 (remapped labels)
-        entry_prices: float32 array of shape (n_samples,) with entry prices
+        entry_prices: float64 array of shape (n_samples,) — kept for reference
+                       / potential future per-price analysis, not used for
+                       normalization anymore (features are pre-normalized
+                       in mlService.ts before being stored).
 
     Raises:
         FileNotFoundError: if the CSV does not exist
@@ -137,15 +101,12 @@ def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np
         )
 
     # ── Parse features column ─────────────────────────────────────────────────
-    # The features column is a JSON string like "[0.5, 0.3, ...]"
-    # We parse each row individually so bad rows can be reported and dropped
     parsed_features = []
     parse_failures = 0
 
     for i, raw in enumerate(df['features']):
         try:
             if isinstance(raw, list):
-                # Already parsed (shouldn't happen with CSV but handle it)
                 parsed_features.append(raw)
             elif isinstance(raw, str):
                 parsed_features.append(json.loads(raw))
@@ -170,7 +131,6 @@ def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np
     )
     n_wrong = wrong_length.sum()
     if n_wrong > 0:
-        # Show what lengths we actually got so you can debug
         lengths = df.loc[wrong_length, 'features_parsed'].apply(
             lambda x: len(x) if isinstance(x, list) else 'not a list'
         ).value_counts()
@@ -224,10 +184,11 @@ def load_training_data(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, np
         bar = '█' * int(c / len(y) * 40)
         print(f"    {LABEL_NAMES[u]}: {c:4d} ({c/len(y)*100:5.1f}%)  {bar}")
 
-    entry_prices = np.array(df['entry_price'].astype(float).values, dtype=np.float64) if 'entry_price' in df.columns else np.ones(len(X), dtype=np.float64)
-
-    if 'entry_price' not in df.columns:
-        print("  WARNING: entry_price column not found in CSV — MACD normalization will be skipped")
+    entry_prices = (
+        np.array(df['entry_price'].astype(float).values, dtype=np.float64)
+        if 'entry_price' in df.columns
+        else np.ones(len(X), dtype=np.float64)
+    )
 
     return X, y, entry_prices
 

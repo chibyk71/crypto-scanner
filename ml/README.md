@@ -93,7 +93,12 @@ ml/
 | 3                  | +1       | Good win      |
 | 4                  | +2       | Monster win   |
 
-## Feature Vector Reference (26 features)
+## Feature Vector Reference (33 features)
+
+Order must match `mlService.ts extractFeatures()` exactly — index-for-index.
+Changing order, adding, or removing a feature requires a full retrain from scratch.
+
+### Technical indicators [0–14]
 
 | Index | Name          | Description                     |
 | ----- | ------------- | ------------------------------- |
@@ -101,9 +106,9 @@ ml/
 | 1     | ema_short_dev | (price - EMA20) / price         |
 | 2     | ema_mid_dev   | (price - EMA50) / price         |
 | 3     | ema_long_dev  | (price - EMA200) / price        |
-| 4     | macd_line     | MACD line (raw)                 |
-| 5     | macd_signal   | MACD signal (raw)               |
-| 6     | macd_hist     | MACD histogram (raw)            |
+| 4     | macd_line     | MACD line / price               |
+| 5     | macd_signal   | MACD signal / price             |
+| 6     | macd_hist     | MACD histogram / price          |
 | 7     | stoch_k       | Stochastic %K / 100             |
 | 8     | stoch_d       | Stochastic %D / 100             |
 | 9     | atr_pct       | ATR / price                     |
@@ -112,14 +117,46 @@ ml/
 | 12    | bb_bandwidth  | BB bandwidth / 100              |
 | 13    | momentum      | Momentum / price                |
 | 14    | engulfing     | 1 bullish / -1 bearish / 0 none |
-| 15    | buy_mfe       | Buy side avg MFE (normalized)   |
-| 16    | buy_mae       | Buy side avg MAE (normalized)   |
-| 17    | buy_ratio     | Buy side excursion ratio        |
-| 18    | sell_mfe      | Sell side avg MFE (normalized)  |
-| 19    | sell_mae      | Sell side avg MAE (normalized)  |
-| 20    | sell_ratio    | Sell side excursion ratio       |
-| 21    | obv           | OBV / 1e9                       |
-| 22    | vwap          | VWAP / 1e6                      |
-| 23    | vwma          | VWMA / 1e6                      |
-| 24    | price_scaled  | price / 1e5                     |
-| 25    | symbol_index  | Normalized symbol index (0–1)   |
+
+### Excursion regime [15–20]
+
+| Index | Name       | Description                         |
+| ----- | ---------- | ----------------------------------- |
+| 15    | buy_mfe    | Buy side avg MFE (normalized, 0–1)  |
+| 16    | buy_mae    | Buy side avg MAE (normalized, 0–1)  |
+| 17    | buy_ratio  | Buy side excursion ratio (0–1)      |
+| 18    | sell_mfe   | Sell side avg MFE (normalized, 0–1) |
+| 19    | sell_mae   | Sell side avg MAE (normalized, 0–1) |
+| 20    | sell_ratio | Sell side excursion ratio (0–1)     |
+
+### Market context [21–24]
+
+| Index | Name             | Description                                      |
+| ----- | ---------------- | ------------------------------------------------ |
+| 21    | obv_delta_norm   | OBV delta / current candle volume                |
+| 22    | vwap_deviation   | (price - VWAP) / price                           |
+| 23    | vwma_vwap_spread | (VWMA - VWAP) / price                            |
+| 24    | rel_volume       | Current vol / 20-candle avg vol, capped at 5, /5 |
+
+### Signal detectors [25–26]
+
+| Index | Name                | Description                     |
+| ----- | ------------------- | ------------------------------- |
+| 25    | liquidity_sweep     | 1 bullish / -1 bearish / 0 none |
+| 26    | bb_squeeze_breakout | 1 bullish / -1 bearish / 0 none |
+
+### Previous simulation history [27–31]
+
+| Index | Name                | Description                                                                |
+| ----- | ------------------- | -------------------------------------------------------------------------- |
+| 27    | prev_buy_outcome    | Last buy sim outcome: tp=1.0, partial_tp=0.75, timeout=0.4, sl=0.0, none=0 |
+| 28    | prev_buy_label      | Last buy sim label (-2..+2) / 2 → -1..1, 0 if none                         |
+| 29    | prev_sell_outcome   | Last sell sim outcome (same scale as [27])                                 |
+| 30    | prev_sell_label     | Last sell sim label / 2, 0 if none                                         |
+| 31    | time_since_last_sim | min(elapsed_ms / 1hr, 1) — 0=just happened, 1=stale/none                   |
+
+### Identity [32]
+
+| Index | Name         | Description                          |
+| ----- | ------------ | ------------------------------------ |
+| 32    | symbol_index | Normalized stable symbol index (0–1) |

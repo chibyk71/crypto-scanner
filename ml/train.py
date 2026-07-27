@@ -25,7 +25,6 @@ import onnx
 
 from utils import (
     load_training_data,
-    normalize_legacy_features,   # TEMPORARY — remove after data refresh
     check_class_balance,
     EXPECTED_FEATURES,
     FEATURE_NAMES,
@@ -62,13 +61,6 @@ def main():
     # ── 1. Load and clean data ────────────────────────────────────────────────
     print("\n[1/4] Loading training data...")
     X, y, entry_prices = load_training_data(DATA_PATH)
-
-    # TEMPORARY: normalize legacy features to new price-relative format
-    # Remove this block once old simulated_trades data is cleared and
-    # the bot has accumulated fresh data with correct normalization
-    print("  Applying legacy feature normalization (MACD/OBV/VWAP/volume)...")
-    X = normalize_legacy_features(X, entry_prices)
-    print("  Normalization applied.")
 
     # Warn if any class is severely underrepresented
     print("\n  Checking class balance...")
