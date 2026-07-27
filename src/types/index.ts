@@ -152,8 +152,15 @@ export interface TradeSignal {
     /** Advanced: multiple partial take-profit levels (recommended) */
     takeProfitLevels?: PartialTPLevel[];
 
-    /** Distance in price units for trailing stop (if enabled) */
-    trailingStopDistance?: number;
+    /** Live/manual trailing stop activation price — trail arms once price
+    * reaches this level. Bybit's `activePrice` param. Not used by the
+    * simulation engine to exit trades — counterfactual tracking only. */
+    trailingActivePrice?: number;
+
+    /** Live/manual trailing stop giveback distance, as an ABSOLUTE PRICE
+     * VALUE (not a percentage). Bybit's `trailingStop` param. The ceiling
+     * for this trade remains `takeProfit` above — no separate hard cap. */
+    trailingGivebackPrice?: number;
 
     /** Scale position size based on confidence/risk (0.1 → 1.0) */
     positionSizeMultiplier?: number;

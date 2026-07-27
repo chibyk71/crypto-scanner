@@ -71,7 +71,10 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     ATR_MULTIPLIER: z.coerce.number().default(1.5),
     RISK_REWARD_TARGET: z.coerce.number().default(3.0),
-    TRAILING_STOP_PERCENT: z.coerce.number().default(0.6),
+    /** % favorable move required before the trailing stop arms */
+    TRAIL_ACTIVATION_PCT: z.coerce.number().default(0.2),
+    /** Giveback distance (%) maintained behind peak once armed */
+    TRAIL_GIVEBACK_PCT: z.coerce.number().default(0.15),
     POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(10).default(1.0),
     LEVERAGE: z.coerce.number().default(5),
 
@@ -274,8 +277,10 @@ export const config = {
         atrMultiplier: rawConfig.ATR_MULTIPLIER,
         /** Target risk:reward ratio (e.g., 3 = aim for 3R wins) */
         riskRewardTarget: rawConfig.RISK_REWARD_TARGET,
-        /** Trailing stop activation (% of favorable move) */
-        trailingStopPercent: rawConfig.TRAILING_STOP_PERCENT,
+        /** Trailing stop activation threshold (%) — live/manual execution only */
+        trailActivationPct: rawConfig.TRAIL_ACTIVATION_PCT,
+        /** Trailing stop giveback distance (%) once armed — live/manual execution only */
+        trailGivebackPct: rawConfig.TRAIL_GIVEBACK_PCT,
         /** Base position size as % of account balance */
         positionSizePercent: rawConfig.POSITION_SIZE_PERCENT,
         /** Leverage to use (e.g., 5x) */
@@ -330,7 +335,7 @@ export const config = {
     // =========================================================================
     ml: {
         labelThresholds: {
-            /** R-multiple for "monster win" label (+2) */
+            /** R-multiple for "monster win" label (2) */
             strongWin: rawConfig.ML_LABEL_STRONG_WIN,
             /** R-multiple for "good win" label (+1) */
             goodWin: rawConfig.ML_LABEL_GOOD_WIN,

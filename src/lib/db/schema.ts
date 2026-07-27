@@ -305,6 +305,26 @@ export const simulatedTrades = mysqlTable(
 
         /** ML model's combined positive confidence at signal time (0-1) */
         mlPredictedConfidence: float('ml_predicted_confidence'),  // ← ADD
+
+        // ─────────────────────────────────────────────────────────────
+        // COUNTERFACTUAL TRAILING STOP TRACKING
+        // These fields record what the live/manual trailing stop WOULD
+        // have done during this simulation — they never affect the
+        // official outcome/label/pnl above. Used to compare, once enough
+        // data accumulates, whether trailing exits help or hurt vs
+        // holding to the full ATR-based TP/SL.
+        // ─────────────────────────────────────────────────────────────
+        /** Whether the trailing stop would have triggered during this sim */
+        trailingTriggered: boolean('trailing_triggered').default(false),
+
+        /** Price at which the trailing stop would have exited (if triggered) */
+        trailingExitPrice: float('trailing_exit_price'),
+
+        /** PnL if exited via trailing stop, ×1e8 (same precision as `pnl`) */
+        trailingExitPnl: bigint('trailing_exit_pnl', { mode: 'number' }),
+
+        /** Time from entry to the trailing-stop exit point (ms), if triggered */
+        trailingExitAtMs: bigint('trailing_exit_at_ms', { mode: 'number' }),
     },
     (table) => ({
         /** Fast lookup by signal UUID */
@@ -391,5 +411,4 @@ export type SimulatedTrade = typeof simulatedTrades.$inferSelect;
 /** Data for starting a new simulation (excludes auto-generated fields) */
 export type NewSimulatedTrade = Omit<
     typeof simulatedTrades.$inferInsert,
-    'signalId' | 'openedAt' | 'closedAt' | 'outcome' | 'pnl' | 'rMultiple' | 'label' | 'maxFavorableExcursion' | 'maxAdverseExcursion'
->;
+    'signalId' | 'openedAt' | 'closedAt' | 'outcome' | 'pnl' | 'rMultiple' | 'label' | 'maxFavorableExcursion' | 'maxAdverseExcursion' | 'trailingTriggered' | 'trailingExitPrice' | 'trailingExitPnl' | 'trailingExitAtMs'>;

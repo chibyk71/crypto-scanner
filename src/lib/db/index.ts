@@ -949,6 +949,10 @@ class DatabaseService {
             timeToMFEMs: number;
             timeToMAEMs: number;
             features?: number[];                // optional – can overwrite if needed
+            trailingTriggered?: boolean;         // did the counterfactual trailing stop fire during this sim?
+            trailingExitPrice?: number;          // price it would have exited at, if triggered
+            trailingExitPnl?: number;            // decimal PnL if exited via trailing (same scale as `pnl`)
+            trailingExitAtMs?: number;           // ms from entry to the trailing exit point
         }
     ): Promise<boolean> {
         try {
@@ -974,6 +978,12 @@ class DatabaseService {
                     timeToMFEMs: data.timeToMFEMs,
                     timeToMAEMs: data.timeToMAEMs,
                     features: data.features !== undefined ? data.features : null, // overwrite only if provided
+                    trailingTriggered: data.trailingTriggered ?? false,
+                    trailingExitPrice: data.trailingExitPrice,
+                    trailingExitPnl: data.trailingExitPnl !== undefined
+                        ? Math.round(data.trailingExitPnl * 1e8)                  // same ×1e8 scale as `pnl`
+                        : undefined,
+                    trailingExitAtMs: data.trailingExitAtMs,
                 })
                 .where(eq(simulatedTrades.signalId, signalId))
                 .execute();
@@ -995,6 +1005,9 @@ class DatabaseService {
                 mfe: data.maxFavorableExcursion.toFixed(4) + '%',
                 mae: data.maxAdverseExcursion.toFixed(4) + '%',
                 affectedRows,
+                trailingTriggered: data.trailingTriggered ?? false,
+                trailingExitPnlPercent: data.trailingExitPnl !== undefined ? (data.trailingExitPnl * 100).toFixed(2) + '%'
+                    : 'n/a',
             });
 
             return true;

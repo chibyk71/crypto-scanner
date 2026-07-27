@@ -34,6 +34,7 @@ import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
 import { excursionCache } from './excursionHistoryCache';
+import { computeTrailingLevels } from '../utils/trailingStopUtils';
 
 const logger = createLogger('simulateTrade');
 
@@ -95,6 +96,20 @@ export async function simulateTrade(
 
     const tracking = initializeTrackingVariables(signal, entryPrice, startTime);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // COUNTERFACTUAL TRAILING STOP STATE
+    // This NEVER causes the simulation to exit — it only records what the
+    // live/manual trailing stop would have done, for later comparison
+    // against the official outcome (tp/sl/partial_tp/timeout) below.
+    // ─────────────────────────────────────────────────────────────────────
+    const trailingLevels = computeTrailingLevels(entryPrice, isLong ? 'buy' : 'sell');
+    let trailArmed = false;
+    let trailingStopPrice: number | null = null;
+    let trailingTriggered = false;
+    let trailingExitPrice: number | undefined;
+    let trailingExitAtMs: number | undefined;
+    let trailingExitTotalPnL: number | undefined;
+
     await dbService.createNewSimulation(
         signalId, signal.symbol, signal.signal as 'buy' | 'sell',
         entryPrice, startTime, features, signal.confidence ?? 0,
@@ -144,6 +159,44 @@ export async function simulateTrade(
         tracking.timeOfMaxFavorable = excursionUpdate.newTimeOfMaxFavorable;
         tracking.timeOfMaxAdverse = excursionUpdate.newTimeOfMaxAdverse;
 
+
+        // ── Counterfactual trailing stop tracking (never exits the sim) ────────
+        if (!trailingTriggered) {
+            if (!trailArmed) {
+                const armed = isLong ? high >= trailingLevels.activePrice : low <= trailingLevels.activePrice;
+                if (armed) {
+                    trailArmed = true;
+                    trailingStopPrice = isLong
+                        ? high - trailingLevels.trailingStop
+                        : low + trailingLevels.trailingStop;
+                }
+            } else if (trailingStopPrice !== null) {
+                const breached = isLong ? low <= trailingStopPrice : high >= trailingStopPrice;
+                if (breached) {
+                    trailingTriggered = true;
+                    trailingExitPrice = trailingStopPrice;
+                    trailingExitAtMs = Date.now() - startTime;
+                    const trailPnlPct = isLong
+                        ? (trailingExitPrice - entryPrice) / entryPrice
+                        : (entryPrice - trailingExitPrice) / entryPrice;
+                    trailingExitTotalPnL = tracking.totalPnL + trailPnlPct * tracking.remainingPosition;
+
+                    logger.debug(`[SIM] ${symbol} trailing WOULD HAVE exited here (sim continues)`, {
+                        correlationId,
+                        trailingExitPrice: trailingExitPrice.toFixed(8),
+                        trailingExitAtMs,
+                    });
+                } else {
+                    const candidateTrail = isLong
+                        ? high - trailingLevels.trailingStop
+                        : low + trailingLevels.trailingStop;
+                    trailingStopPrice = isLong
+                        ? Math.max(trailingStopPrice, candidateTrail)
+                        : Math.min(trailingStopPrice, candidateTrail);
+                }
+            }
+        }
+
         // ── Partial take-profits ──────────────────────────────────────────────
         const partialResult = checkPartialTakeProfits(
             signal, isLong, high, low,
@@ -162,6 +215,7 @@ export async function simulateTrade(
                     timeOfMaxFavorable: tracking.timeOfMaxFavorable,
                     timeOfMaxAdverse: tracking.timeOfMaxAdverse,
                     symbol, features,
+                    trailingTriggered, trailingExitPrice, trailingExitTotalPnL, trailingExitAtMs,
                 });
             }
         }
@@ -180,6 +234,7 @@ export async function simulateTrade(
                 timeOfMaxFavorable: tracking.timeOfMaxFavorable,
                 timeOfMaxAdverse: tracking.timeOfMaxAdverse,
                 symbol, features,
+                trailingTriggered, trailingExitPrice, trailingExitTotalPnL, trailingExitAtMs,
             });
         }
 
@@ -197,6 +252,7 @@ export async function simulateTrade(
                 timeOfMaxFavorable: tracking.timeOfMaxFavorable,
                 timeOfMaxAdverse: tracking.timeOfMaxAdverse,
                 symbol, features,
+                trailingTriggered, trailingExitPrice, trailingExitTotalPnL, trailingExitAtMs,
             });
         }
 
@@ -225,6 +281,7 @@ export async function simulateTrade(
         timeOfMaxFavorable: tracking.timeOfMaxFavorable,
         timeOfMaxAdverse: tracking.timeOfMaxAdverse,
         symbol, features,
+        trailingTriggered, trailingExitPrice, trailingExitTotalPnL, trailingExitAtMs,
     });
 }
 
@@ -454,12 +511,16 @@ async function storeAndFinalizeSimulation(params: {
     timeOfMaxFavorable: number;
     timeOfMaxAdverse: number;
     features?: number[];
+    trailingTriggered?: boolean;
+    trailingExitPrice?: number;
+    trailingExitTotalPnL?: number;
+    trailingExitAtMs?: number;
 }): Promise<SimulationResult> {
 
     const {
         signalId, symbol, signal, entryPrice, startTime, outcome,
         totalPnL, bestFavorablePrice, bestAdversePrice,
-        timeOfMaxFavorable, timeOfMaxAdverse, features,
+        timeOfMaxFavorable, timeOfMaxAdverse, features, trailingTriggered, trailingExitPrice, trailingExitTotalPnL, trailingExitAtMs,
     } = params;
 
     const isLong = signal.signal === 'buy';
@@ -509,7 +570,7 @@ async function storeAndFinalizeSimulation(params: {
         dbService.updateCompletedSimulation(signalId, {
             tpLevels: signal.takeProfitLevels ?? undefined,
             stoploss: signal.stopLoss,
-            trailingDist: signal.trailingStopDistance,
+            trailingDist: signal.trailingActivePrice ?? undefined,
             closedAt: endTime,
             outcome,
             pnl: Math.round(totalPnL * 1e8),
@@ -521,6 +582,10 @@ async function storeAndFinalizeSimulation(params: {
             timeToMFEMs: timeToMfeMs,
             timeToMAEMs: timeToMaeMs,
             features: features ?? [],
+            trailingTriggered: trailingTriggered ?? false,
+            trailingExitPrice,
+            trailingExitPnl: trailingExitTotalPnL,
+            trailingExitAtMs,
         });
     } catch (err) {
         logger.error('storeAndFinalizeSimulation: DB write failed', {

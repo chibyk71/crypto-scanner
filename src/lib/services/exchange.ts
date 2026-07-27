@@ -753,6 +753,77 @@ export class ExchangeService {
     }
 
     /**
+     * Sets a native trailing stop on an open position via Bybit V5's
+     * /v5/position/trading-stop endpoint.
+     *
+     * IMPORTANT: `privatePostV5PositionTradingStop` is CCXT's implicit method
+     * name, auto-generated from bybit's API map. Verify this exists on your
+     * installed ccxt version before relying on it — implicit method names can
+     * shift between ccxt releases. Check with:
+     *   node -e "const c = require('ccxt'); const e = new c.bybit();
+     *     console.log(Object.keys(e).filter(k => k.toLowerCase().includes('tradingstop')))"
+     * If the name differs, update the lookup below accordingly.
+     *
+     * @param symbol - Trading pair (e.g., 'BTC/USDT')
+     * @param side - Position side ('buy' or 'sell') — needed for positionIdx in hedge mode
+     * @param trailingStop - Absolute price distance (giveback), NOT a percentage
+     * @param activePrice - Trigger price that arms the trail
+     * @param stopLoss - Optional: also (re)set fixed SL in the same call
+     * @param takeProfit - Optional: also (re)set fixed hard-ceiling TP in the same call
+     * @returns {Promise<void>}
+     * @throws {Error} If auto-trade is disabled, the implicit method is missing, or the API call fails
+     */
+    public async setTrailingStop(
+        symbol: string,
+        side: 'buy' | 'sell',
+        trailingStop: number,
+        activePrice: number,
+        stopLoss?: number,
+        takeProfit?: number
+    ): Promise<void> {
+        if (!this.isAutoTradeEnvSet()) {
+            throw new Error('Auto-trade environment is not set. Cannot set trailing stop.');
+        }
+
+        try {
+            const market = this.exchange.market(symbol);
+            const positionMode = await this.getPositionMode();
+            const positionIdx = positionMode === 'hedge' ? (side === 'buy' ? 1 : 2) : 0;
+
+            const params: Record<string, any> = {
+                category: 'linear',
+                symbol: market.id,
+                trailingStop: this.exchange.priceToPrecision(symbol, trailingStop),
+                activePrice: this.exchange.priceToPrecision(symbol, activePrice),
+                positionIdx,
+            };
+            if (stopLoss) params.stopLoss = this.exchange.priceToPrecision(symbol, stopLoss);
+            if (takeProfit) params.takeProfit = this.exchange.priceToPrecision(symbol, takeProfit);
+
+            const method = (this.exchange as any).privatePostV5PositionTradingStop;
+            if (typeof method !== 'function') {
+                throw new Error(
+                    'privatePostV5PositionTradingStop not found on ccxt Exchange instance — ' +
+                    'check ccxt version / bybit API map for the correct implicit method name'
+                );
+            }
+
+            const response = await this.withRetries(() => method.call(this.exchange, params), 2);
+
+            logger.info(`Trailing stop set for ${symbol}`, {
+                side, trailingStop, activePrice, positionIdx, stopLoss, takeProfit, response,
+            });
+        } catch (error) {
+            logger.error(`Failed to set trailing stop for ${symbol}`, {
+                side, trailingStop, activePrice,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+            });
+            throw error;
+        }
+    }
+
+    /**
      * Closes an open position for a symbol.
      * @param symbol - Trading symbol (e.g., 'BTC/USDT').
      * @param side - Position side ('buy' or 'sell').

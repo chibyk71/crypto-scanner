@@ -2413,6 +2413,26 @@ export class TelegramBotController {
 
         lines.push(`${slStr} · ${tpStr}${rrStr}`);
 
+        // ─────────────────────────────────────────────────────────────────
+        // TRAILING STOP PREVIEW (live/manual execution only)
+        // Shown whenever AutoTradeService attached these — either the
+        // pre-fill preview (auto-trade off / alert-only) or the real
+        // post-fill values (auto-trade on). Gives you the numbers to
+        // punch into Bybit manually while auto-trade stays disabled.
+        // ─────────────────────────────────────────────────────────────────
+        if (signal.trailingActivePrice !== undefined && signal.trailingGivebackPrice !== undefined) {
+            const givebackPct = ((signal.trailingGivebackPrice / price) * 100).toFixed(3);
+            const activationPct = signal.signal === 'buy'
+                ? (((signal.trailingActivePrice - price) / price) * 100).toFixed(2)
+                : (((price - signal.trailingActivePrice) / price) * 100).toFixed(2);
+
+            lines.push(
+                `🎯 Trail arms \\$${esc(signal.trailingActivePrice.toFixed(6))} ` +
+                `\\(\\+${esc(activationPct)}%\\) · giveback \\$${esc(signal.trailingGivebackPrice.toFixed(6))} ` +
+                `\\(${esc(givebackPct)}%\\)`
+            );
+        }
+
         // ─────────────────────────────────────────────────────────────────────────
         // 3. CONFIDENCE — only if meaningful (skip internal boilerplate reasons)
         // ─────────────────────────────────────────────────────────────────────────

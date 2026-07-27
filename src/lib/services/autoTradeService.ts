@@ -23,6 +23,7 @@ import { excursionCache } from './excursionHistoryCache';
 import { simulateTrade } from './simulateTrade';
 import { dbService } from '../db';
 import { MLService } from './mlService';
+import { computeTrailingLevels } from '../utils/trailingStopUtils';
 
 const logger = createLogger('AutoTradeService');
 
@@ -279,6 +280,8 @@ export class AutoTradeService {
                     : currentPrice - slDistanceFromEntry * rrTarget;
             }
 
+            const previewTrailing = computeTrailingLevels(currentPrice, finalSide);
+
             // ────────────────────────────────────────────────────────────────
             // 8. VALIDATION: Ensure levels are valid after capping
             // ────────────────────────────────────────────────────────────────
@@ -313,6 +316,8 @@ export class AutoTradeService {
                 confidence: signal.confidence + confidenceBoost,
                 stopLoss: Number(finalStopLoss.toFixed(8)),
                 takeProfit: Number(finalTakeProfit.toFixed(8)),
+                trailingActivePrice: previewTrailing.activePrice,
+                trailingGivebackPrice: previewTrailing.trailingStop,
                 reason: [
                     wasReversed && this.mlService.isDirectionalReady(finalSide)
                         ? '✅ ML confirmation gate passed for reversed direction'
@@ -358,10 +363,39 @@ export class AutoTradeService {
                             amount,
                             finalStopLoss,
                             finalTakeProfit,
-                            signal.trailingStopDistance // keep original trailing if present
+                            signal.trailingGivebackPrice // keep original trailing if present
                         );
 
                         orderId = order.id || 'unknown';
+
+                        // Recompute trailing levels off the REAL fill price, not the
+                        // cached signal-time price, then push to the exchange as a
+                        // native trailing stop. finalTakeProfit stays the ceiling —
+                        // passed through so Bybit enforces both in one call.
+                        const fillPrice = order.average ?? currentPrice;
+                        const liveTrailing = computeTrailingLevels(fillPrice, finalSide);
+
+                        await this.exchange.setTrailingStop(
+                            symbol,
+                            finalSide,
+                            liveTrailing.trailingStop,
+                            liveTrailing.activePrice,
+                            finalStopLoss,
+                            finalTakeProfit
+                        ).catch(err => {
+                            // Don't fail the whole trade over this — the position is
+                            // already open with SL/TP from placeOrder. Trailing is an
+                            // enhancement on top; log and continue.
+                            logger.error(`Order placed but trailing stop setup failed for ${symbol}`, {
+                                orderId,
+                                error: err instanceof Error ? err.message : String(err),
+                            });
+                        });
+
+                        // Reflect the REAL applied numbers in the alert payload,
+                        // not the pre-fill preview values
+                        adjustedSignal.trailingActivePrice = liveTrailing.activePrice;
+                        adjustedSignal.trailingGivebackPrice = liveTrailing.trailingStop;
 
                         logger.info(`Live trade executed successfully`, {
                             symbol,
@@ -370,7 +404,9 @@ export class AutoTradeService {
                             usdValue: FIXED_QUOTE_USD,
                             orderId,
                             wasReversed,
-                            adviceSummary: advice.advice
+                            adviceSummary: advice.advice,
+                            trailingActivePrice: liveTrailing.activePrice,
+                            trailingGiveback: liveTrailing.trailingStop,
                         });
                     } catch (orderErr) {
                         logger.error(`Failed to place live order`, {
