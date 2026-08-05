@@ -75,6 +75,12 @@ CREATE TABLE `simulated_trades` (
 	`time_to_mae_ms` bigint DEFAULT 0,
 	`features` json,
 	`was_taken` boolean,
+	`ml_predicted_label` int,
+	`ml_predicted_confidence` float,
+	`trailing_triggered` boolean DEFAULT false,
+	`trailing_exit_price` float,
+	`trailing_exit_pnl` bigint,
+	`trailing_exit_at_ms` bigint,
 	CONSTRAINT `simulated_trades_id` PRIMARY KEY(`id`),
 	CONSTRAINT `simulated_trades_signal_id_unique` UNIQUE(`signal_id`)
 );

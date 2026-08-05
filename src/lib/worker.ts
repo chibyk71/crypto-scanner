@@ -162,6 +162,12 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             try {
                 await exchange.initialize();
                 supportedSymbols = exchange.getSupportedSymbols();
+                // Refresh directional sample counts after exchange initialization
+                mlService.refreshDirectionalSampleCounts().catch(err => {
+                    logger.warn('Initial directional sample count fetch failed', {
+                        error: err instanceof Error ? err.message : String(err),
+                    });
+                });
                 logger.info('Exchange initialized', { mode: exchange.isAutoTradeEnvSet() ? 'live' : 'testnet', symbols: supportedSymbols.length, });
                 break;
             } catch (err: any) {

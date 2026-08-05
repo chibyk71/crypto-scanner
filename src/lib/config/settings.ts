@@ -55,15 +55,15 @@ const ConfigSchema = z.object({
     // Symbols & Timeframes
     // ──────────────────────────────────────────────────────────────
     SYMBOLS: z.string().default('BTC/USDT,ETH/USDT').transform(str => str.split(',').map(s => s.trim())),
-    TIMEFRAME: z.string().default('5m'),
+    TIMEFRAME: z.string().default('3m'),
     TIMEFRAME_SIMULATION: z.string().default('1m'),  // only for backtesting / simulation / excursion calc
     HTF_TIMEFRAME: z.string().default('1h'),
 
     // ──────────────────────────────────────────────────────────────
     // Scanner Behavior
     // ──────────────────────────────────────────────────────────────
-    SCAN_INTERVAL_MS: z.coerce.number().default(180_000),
-    HEARTBEAT_INTERVAL: z.coerce.number().default(30),
+    SCAN_INTERVAL_MS: z.coerce.number().default(300_000),
+    HEARTBEAT_INTERVAL: z.coerce.number().default(120),
     HISTORY_LENGTH: z.coerce.number().min(100).default(300),
 
     // ──────────────────────────────────────────────────────────────
@@ -154,10 +154,10 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Confidence & Filters
     // ──────────────────────────────────────────────────────────────
-    CONFIDENCE_THRESHOLD: z.coerce.number().min(50).max(95).default(68),
+    CONFIDENCE_THRESHOLD: z.coerce.number().min(50).max(200).default(95),
     MIN_ADX_TREND: z.coerce.number().default(20),
     MIN_BB_BANDWIDTH_PCT: z.coerce.number().default(0.5),
-    MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(50_000),
+    MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(500),
 
     // ──────────────────────────────────────────────────────────────
     // Excursion-Based Strategy Adjustments

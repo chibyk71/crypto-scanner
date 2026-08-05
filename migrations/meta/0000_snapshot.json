@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "ffc78803-20d8-4ff7-a8f0-d13d92b791d2",
+  "id": "2d47b773-af83-409c-b1c0-c82831c0f968",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alert": {
@@ -508,6 +508,49 @@
         "was_taken": {
           "name": "was_taken",
           "type": "boolean",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ml_predicted_label": {
+          "name": "ml_predicted_label",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ml_predicted_confidence": {
+          "name": "ml_predicted_confidence",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "trailing_triggered": {
+          "name": "trailing_triggered",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false,
+          "default": false
+        },
+        "trailing_exit_price": {
+          "name": "trailing_exit_price",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "trailing_exit_pnl": {
+          "name": "trailing_exit_pnl",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "trailing_exit_at_ms": {
+          "name": "trailing_exit_at_ms",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

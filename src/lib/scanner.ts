@@ -357,7 +357,7 @@ export class MarketScanner {
                 price: currentPrice,
                 atrMultiplier: config.strategy.atrMultiplier,
                 riskRewardTarget: config.strategy.riskRewardTarget,
-                trailingStopPercent: config.strategy.trailingStopPercent,
+                trailingStopPercent: config.strategy.trailGivebackPct,
                 requireAtrFeasibility: this.opts.requireAtrFeasibility,
             });
 

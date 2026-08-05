@@ -152,7 +152,7 @@ const RELATIVE_VOLUME_MULTIPLIER = 1.5;       // ← Multiplier for relative vol
 
 const MIN_DI_DIFF = 15;                       // ← Minimum difference between +DI and -DI for trend dominance
 
-const MIN_ADX = 25;                          // ← Minimum ADX for trend dominance
+const MIN_ADX = 20;                          // ← Minimum ADX for trend dominance
 const VOLUME_SURGE_MULTIPLIER = 2;            // ← Multiplier for volume surge
 
 const LIQUIDITY_SWEEP_LOOKBACK = 20;           // ← Candles used to define the swing high/low range
@@ -237,11 +237,16 @@ export class Strategy {
             return this._neutral();
         }
 
-        // Calculate average volume in USD over last 50 candles
+        // Calculate average volume in USD, scaled to a true per-hour rate.
+        // avgBaseVol/avgPrice below are per-CANDLE — candle duration depends on
+        // config.scanner.primaryTimeframe, so we can't compare that directly
+        // against MIN_AVG_VOLUME_USD_PER_HOUR without scaling it up.
         const avgBaseVol = volSlice.slice(0, len).reduce((a, b) => a + b, 0) / len;
         const avgPrice = priceSlice.slice(0, len).reduce((a, b) => a + b, 0) / len;
-        const avgVolumeUSD = avgBaseVol * avgPrice;
-
+        const avgVolumePerCandleUSD = avgBaseVol * avgPrice;
+        const candleDurationMs = ExchangeService.toTimeframeMs(config.scanner.primaryTimeframe);
+        const candlesPerHour = (60 * 60 * 1000) / candleDurationMs;
+        const avgVolumeUSD = avgVolumePerCandleUSD * candlesPerHour;
         // Determine HTF trend bias using ADX and Directional Indicators
         const { htfAdx: adx, htfPdi: pdi, htfMdi: mdi } = indicators.last;
         const diDiff = Math.abs(pdi - mdi);
@@ -1425,7 +1430,7 @@ export class Strategy {
             // Base (unadjusted) levels – AutoTradeService may modify them based on excursion regime
             stopLoss: hasValidSignal ? Number(stopLoss?.toFixed(8)) : undefined,
             takeProfit: hasValidSignal ? Number(takeProfit?.toFixed(8)) : undefined,
-            trailingStopDistance: hasValidSignal ? trailingStopDistance : undefined,
+            trailingGivebackPrice: hasValidSignal ? trailingStopDistance : undefined,
             positionSizeMultiplier: hasValidSignal ? positionSizeMultiplier : undefined,
             mlConfidence,
             takeProfitLevels: hasValidSignal ? params.tplevels ?? [] : [],

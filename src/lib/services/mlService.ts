@@ -51,8 +51,7 @@ export class MLService {
     // Cached sample counts — refreshed periodically, not queried per-prediction
     private buySampleCount = 0;
     private sellSampleCount = 0;
-    private sampleCountRefreshTimer: NodeJS.Timeout | null = null;
-    private readonly SAMPLE_COUNT_REFRESH_MS = 5 * 60 * 1000; // 5 min
+    // private readonly SAMPLE_COUNT_REFRESH_MS = 5 * 60 * 1000; // 5 min
 
     // =========================================================================
     // CONSTRUCTOR
@@ -70,19 +69,13 @@ export class MLService {
             });
         });
 
-        this.refreshDirectionalSampleCounts().catch(err => {
-            logger.warn('Initial directional sample count fetch failed', {
-                error: err instanceof Error ? err.message : String(err),
-            });
-        });
-
-        this.sampleCountRefreshTimer = setInterval(() => {
-            this.refreshDirectionalSampleCounts().catch(err => {
-                logger.warn('Periodic directional sample count refresh failed', {
-                    error: err instanceof Error ? err.message : String(err),
-                });
-            });
-        }, this.SAMPLE_COUNT_REFRESH_MS);
+        // this.sampleCountRefreshTimer = setInterval(() => {
+        //     this.refreshDirectionalSampleCounts().catch(err => {
+        //         logger.warn('Periodic directional sample count refresh failed', {
+        //             error: err instanceof Error ? err.message : String(err),
+        //         });
+        //     });
+        // }, this.SAMPLE_COUNT_REFRESH_MS);
 
         logger.info('MLService initialized (ONNX inference mode)');
     }
@@ -248,7 +241,7 @@ export class MLService {
      * since predictDirectional() is called at signal-generation time and
      * must stay fast.
      */
-    private async refreshDirectionalSampleCounts(): Promise<void> {
+    public async refreshDirectionalSampleCounts(): Promise<void> {
         const [buyCount, sellCount] = await Promise.all([
             dbService.getSampleCount('buy'),
             dbService.getSampleCount('sell'),
@@ -799,6 +792,3 @@ export class MLService {
         return this.isModelLoaded && this.session !== null;
     }
 }
-
-// Singleton — same pattern as before, nothing else needs to change
-export const mlService = new MLService();
