@@ -143,8 +143,8 @@ const MAX_ATR_MULTIPLIER = 5;
 const MIN_AVG_VOLUME_USD_PER_HOUR = config.strategy.minAvgVolumeUsdPerHour;  // ← Increased for better liquidity in crypto
 const BULL_MARKET_LIQUIDITY_MULTIPLIER = 0.75; // 25 % less strict in bull trends
 
-const MIN_ATR_PCT = 0.35;                      // ← Realistic volatility range for crypto scalping
-const MAX_ATR_PCT = 20;
+const MIN_ATR_PCT = config.strategy.minAtrPct;  // ← was hardcoded 0.35; empirically unreachable (BTC never exceeded 0.08% on 3m)
+const MAX_ATR_PCT = config.strategy.maxAtrPct;
 
 const MIN_BB_BANDWIDTH_PCT = 0.5;             // ← Minimum Bollinger Band width percentage to avoid flat markets
 
@@ -963,16 +963,22 @@ export class Strategy {
         const marginFraction = Math.min(winningScore / MAX_SCORE_PER_SIDE, 1);
         const dynamicMargin = 10 + (SCORE_MARGIN_REQUIRED - 10) * marginFraction;
 
+        // CONFIDENCE_THRESHOLD (env, 50-95 range) is meant as a percentage of
+        // MAX_SCORE_PER_SIDE, not a raw point value — it was previously compared
+        // directly against buyScore/sellScore, silently requiring ~39% of a much
+        // larger max than intended as the scoring surface grew over time.
+        const buyConfidencePct = (buyScore / MAX_SCORE_PER_SIDE) * 100;
+        const sellConfidencePct = (sellScore / MAX_SCORE_PER_SIDE) * 100;
 
         let signal: TradeSignal['signal'] = 'hold';
         let confidence = 0;
 
-        if (buyScore >= CONFIDENCE_THRESHOLD && buyScore - sellScore >= dynamicMargin) {
+        if (buyConfidencePct >= CONFIDENCE_THRESHOLD && buyScore - sellScore >= dynamicMargin) {
             signal = 'buy';
-            confidence = (buyScore / MAX_SCORE_PER_SIDE) * 100;
-        } else if (sellScore >= CONFIDENCE_THRESHOLD && sellScore - buyScore >= dynamicMargin) {
+            confidence = buyConfidencePct;
+        } else if (sellConfidencePct >= CONFIDENCE_THRESHOLD && sellScore - buyScore >= dynamicMargin) {
             signal = 'sell';
-            confidence = (sellScore / MAX_SCORE_PER_SIDE) * 100;
+            confidence = sellConfidencePct;
         } else {
             reasons.push('No clear signal: Insufficient score margin or trend mismatch');
         }

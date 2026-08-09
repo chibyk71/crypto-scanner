@@ -2454,7 +2454,7 @@ export class TelegramBotController {
             const negativeWarning = (1 - signal.mlConfidence) >= 0.35
                 ? ` ⚠️ negative risk: ${negativePct}%`
                 : '';
-            lines.push(`🤖 ML: predicted *${labelStr}* · positive: ${positivePct}%${negativeWarning}`);
+            lines.push(`🤖 ML: predicted *${esc(labelStr)}* · positive: ${positivePct}%${esc(negativeWarning)}`);
         } else if (signal.mlConfidence !== undefined) {
             // Model ran but label not stored (shouldn't happen after this change)
             lines.push(`🤖 ML: ${esc((signal.mlConfidence * 100).toFixed(1))}% positive`);

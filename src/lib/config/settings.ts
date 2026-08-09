@@ -154,8 +154,11 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Confidence & Filters
     // ──────────────────────────────────────────────────────────────
-    CONFIDENCE_THRESHOLD: z.coerce.number().min(50).max(200).default(95),
+    CONFIDENCE_THRESHOLD: z.coerce.number().min(20).max(100).default(23), // Minimum confidence score to consider a signal valid
     MIN_ADX_TREND: z.coerce.number().default(20),
+    MIN_DI_DIFF_TREND: z.coerce.number().default(15),
+    MIN_ATR_PCT: z.coerce.number().default(0.12),
+    MAX_ATR_PCT: z.coerce.number().default(20),
     MIN_BB_BANDWIDTH_PCT: z.coerce.number().default(0.5),
     MIN_AVG_VOLUME_USD_PER_HOUR: z.coerce.number().default(500),
 
@@ -294,6 +297,12 @@ export const config = {
         confidenceThreshold: rawConfig.CONFIDENCE_THRESHOLD,
         /** Minimum ADX value to confirm trending market */
         minAdxTrend: rawConfig.MIN_ADX_TREND,
+        /** Minimum |+DI - -DI| separation to confirm trend dominance */
+        minDiDiff: rawConfig.MIN_DI_DIFF_TREND,
+        /** Minimum ATR% of price to consider volatility "real" (not dead-flat) */
+        minAtrPct: rawConfig.MIN_ATR_PCT,
+        /** Maximum ATR% of price before volatility is considered too chaotic */
+        maxAtrPct: rawConfig.MAX_ATR_PCT,
         /** Minimum Bollinger Bandwidth % to avoid flat/choppy markets */
         minBbBandwidthPct: rawConfig.MIN_BB_BANDWIDTH_PCT,
         /** Minimum average hourly volume (USD) for liquidity filter */
