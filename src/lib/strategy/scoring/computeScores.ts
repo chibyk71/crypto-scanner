@@ -1,27 +1,10 @@
-// src/lib/strategy/scoring/computeScores.ts
-// =============================================================================
-// POINT-BASED SCORING ENGINE
-//
-// Mechanical extraction from src/lib/strategy.ts.
-//
-// This module calculates the buy/sell technical scores, integrates order-book
-// confirmation and ML predictions, and returns the exact scoring result used
-// by Strategy.generateSignal().
-//
-// IMPORTANT:
-// The scoring order is significant because:
-//   • reasons.push() and reasons.unshift() preserve a specific output order.
-//   • ML uses the technical scores that exist before ML is applied.
-//   • The order-book request is gated by the score at that exact stage.
-//   • potentialDirection is calculated only after all scoring and ML work.
-//
-// Do not reorder or "clean up" scoring blocks during this refactor.
-// =============================================================================
-
 import type { SignalLabel } from '../../../types';
+
 import type { ExchangeService } from '../../services/exchange';
 import type { MLService } from '../../services/mlService';
+
 import { createLogger } from '../../logger';
+
 import type { IndicatorMap } from '../../utils/indicatorUtils';
 
 import type {
@@ -42,11 +25,12 @@ import {
     LIQUIDITY_SWEEP_POINTS,
     MACD_POINTS,
     MACD_ZERO_POINTS,
+    MAX_ATR_PCT,
     MIN_ADX,
     MIN_ATR_PCT,
-    MAX_ATR_PCT,
     ML_BONUS_MAX,
     ML_CONFIDENCE_DISCOUNT,
+    MOMENTUM_IGNITION_DECAY,
     OBV_VWMA_POINTS,
     ORDER_BOOK_GATE_MARGIN,
     ORDER_BOOK_IMBALANCE_POINTS,
@@ -72,10 +56,9 @@ import {
 
 const logger = createLogger('Strategy');
 
-// =============================================================================
+// =========================================================================
 // POINT-BASED SCORING: Calculate buy/sell strength with explicit reasons
-// =============================================================================
-
+// =========================================================================
 /**
  * Core scoring engine – assigns points to buy and sell sides based on technical conditions.
  *
@@ -88,16 +71,10 @@ const logger = createLogger('Strategy');
  *   • Integrates ML prediction as final bonus
  *   • Safe numeric handling for potentially undefined indicator values
  *
- * The two services that were previously accessed through `this` are explicit
- * parameters here. This preserves the same service instances while making the
- * extracted function independent of the Strategy class.
- *
  * @param indicators - Centralized indicator results
  * @param trendAndVolume - Market regime from analyzeTrendAndVolume
  * @param input - Strategy parameters and price
  * @param reasons - Mutable array filled with human-readable explanations
- * @param mlService - ML service previously accessed through this.mlService
- * @param exchangeService - Exchange service previously accessed through this.exchangeService
  * @returns Scores, ML features, and confidence for final decision
  */
 export async function computeScores(
@@ -112,10 +89,16 @@ export async function computeScores(
     let sellScore = 0;
 
     // -------------------- EMA ALIGNMENT --------------------
-    if (input.price > indicators.last.emaShort && indicators.last.emaShort > indicators.last.htfEmaMid) {
+    if (
+        input.price > indicators.last.emaShort &&
+        indicators.last.emaShort > indicators.last.htfEmaMid
+    ) {
         buyScore += EMA_ALIGNMENT_POINTS;
         reasons.push('Bullish EMA alignment: Price > EMA20 > HTF EMA50');
-    } else if (input.price < indicators.last.emaShort && indicators.last.emaShort < indicators.last.htfEmaMid) {
+    } else if (
+        input.price < indicators.last.emaShort &&
+        indicators.last.emaShort < indicators.last.htfEmaMid
+    ) {
         sellScore += EMA_ALIGNMENT_POINTS;
         reasons.push('Bearish EMA alignment: Price < EMA20 < HTF EMA50');
     }
@@ -169,7 +152,7 @@ export async function computeScores(
     }
 
     // -------------------- RSI --------------------
-    const rsi = Number(indicators.last.rsi ?? 0);
+    const rsi = indicators.last.rsi;
 
     if (rsi < 30) {
         buyScore += RSI_POINTS;
@@ -180,8 +163,8 @@ export async function computeScores(
     }
 
     // -------------------- STOCHASTIC --------------------
-    const stochK = Number(indicators.last.stochasticK ?? 0);
-    const stochD = Number(indicators.last.stochasticD ?? 0);
+    const stochK = indicators.last.stochasticK;
+    const stochD = indicators.last.stochasticD;
 
     if (stochK < 20 && stochK > stochD) {
         buyScore += STOCH_POINTS;
@@ -191,18 +174,20 @@ export async function computeScores(
         reasons.push('Bearish Stochastic reversal from overbought');
     }
 
-    // -------------------- OBV + VWMA CONFIRMATION --------------------
-    const obv = indicators.obv;
+    // -------------------- OBV + VWMA MOMENTUM --------------------
     const obvRising =
-        obv.length >= 2 &&
-        obv[obv.length - 1] > obv[obv.length - 2];
+        indicators.last.obv >
+        (
+            indicators.obv[indicators.obv.length - 2] ??
+            indicators.last.obv
+        );
 
-    if (obvRising && indicators.last.vwma > indicators.last.vwap) {
+    if (obvRising && input.price > indicators.last.vwma) {
         buyScore += OBV_VWMA_POINTS;
-        reasons.push('Bullish OBV + VWMA confirmation');
-    } else if (!obvRising && indicators.last.vwma < indicators.last.vwap) {
+        reasons.push('Bullish OBV rising with price above VWMA (momentum)');
+    } else if (!obvRising && input.price < indicators.last.vwma) {
         sellScore += OBV_VWMA_POINTS;
-        reasons.push('Bearish OBV + VWMA confirmation');
+        reasons.push('Bearish OBV falling with price below VWMA (momentum)');
     }
 
     // -------------------- LIQUIDITY SWEEP --------------------
@@ -219,32 +204,43 @@ export async function computeScores(
         reasons.push('Bearish liquidity sweep: swept high then rejected');
     }
 
-    // -------------------- VWAP MEAN REVERSION --------------------
-    const vwapDeviationAtr =
-        (input.price - indicators.last.vwap) /
-        indicators.last.atr;
+    // -------------------- VWAP MEAN-REVERSION --------------------
+    // Additive to the vwma>vwap trend-following logic above, not a replacement.
+    // When price has stretched far from VWAP (in ATR terms) AND momentum/OBV
+    // isn't confirming continuation in that direction, bet on reversion back to VWAP.
+    if (indicators.last.vwap > 0 && indicators.last.atr > 0) {
+        const vwapDeviationAtr =
+            (input.price - indicators.last.vwap) /
+            indicators.last.atr;
 
-    if (Math.abs(vwapDeviationAtr) >= VWAP_DEVIATION_ATR_THRESHOLD) {
-        const momentum =
-            indicators.last.macdHistogram ?? 0;
+        const momentum = indicators.last.momentum ?? 0;
 
-        if (vwapDeviationAtr > 0) {
+        if (vwapDeviationAtr > VWAP_DEVIATION_ATR_THRESHOLD) {
+            // Price stretched ABOVE VWAP — continuation would need positive momentum + rising OBV.
+            // Either missing → no confirmation → bet on reversion down.
             const continuationConfirmed =
                 momentum > 0 && obvRising;
 
             if (!continuationConfirmed) {
                 sellScore += VWAP_REVERSION_POINTS;
+
                 reasons.push(
-                    `VWAP mean-reversion: price ${Math.abs(vwapDeviationAtr).toFixed(2)}x ATR above VWAP, ` +
+                    `VWAP mean-reversion: price ${vwapDeviationAtr.toFixed(2)}x ATR above VWAP, ` +
                     `continuation unconfirmed (momentum=${momentum.toFixed(4)}, obvRising=${obvRising})`
                 );
             }
-        } else {
+        } else if (
+            vwapDeviationAtr <
+            -VWAP_DEVIATION_ATR_THRESHOLD
+        ) {
+            // Price stretched BELOW VWAP — continuation would need negative momentum + falling OBV.
+            // Either missing → no confirmation → bet on reversion up.
             const continuationConfirmed =
                 momentum < 0 && !obvRising;
 
             if (!continuationConfirmed) {
                 buyScore += VWAP_REVERSION_POINTS;
+
                 reasons.push(
                     `VWAP mean-reversion: price ${Math.abs(vwapDeviationAtr).toFixed(2)}x ATR below VWAP, ` +
                     `continuation unconfirmed (momentum=${momentum.toFixed(4)}, obvRising=${obvRising})`
@@ -254,8 +250,12 @@ export async function computeScores(
     }
 
     // -------------------- ATR VOLATILITY RANGE --------------------
-    const atrPct = (indicators.last.atr / input.price) * 100;
-    logger.info(`ATR Analysis for ${input.symbol}: ATR=${indicators.last.atr.toFixed(4)}, Price=${input.price.toFixed(4)}, ATR%=${atrPct.toFixed(2)}%`);
+    const atrPct =
+        (indicators.last.atr / input.price) * 100;
+
+    logger.info(
+        `ATR Analysis for ${input.symbol}: ATR=${indicators.last.atr.toFixed(4)}, Price=${input.price.toFixed(4)}, ATR%=${atrPct.toFixed(2)}%`
+    );
 
     /**
      * ATR measures market volatility, not trade direction.
@@ -267,8 +267,13 @@ export async function computeScores(
      * ATR eligibility/risk handling remains available elsewhere in the
      * strategy; this block only records that volatility is in range.
      */
-    if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) {
-        reasons.unshift(`Sane ATR volatility: ${atrPct.toFixed(2)}%`);
+    if (
+        atrPct > MIN_ATR_PCT &&
+        atrPct < MAX_ATR_PCT
+    ) {
+        reasons.unshift(
+            `Sane ATR volatility: ${atrPct.toFixed(2)}%`
+        );
     }
 
     // -------------------- VWMA SLOPE --------------------
@@ -287,7 +292,10 @@ export async function computeScores(
         } else if (trendAndVolume.trendBias === 'bearish') {
             sellScore += ADX_POINTS;
         }
-        reasons.unshift(`Strong trend confirmed by ADX >${MIN_ADX}`);
+
+        reasons.unshift(
+            `Strong trend confirmed by ADX >${MIN_ADX}`
+        );
     }
 
     // -------------------- ENGULFING PATTERN --------------------
@@ -295,10 +303,11 @@ export async function computeScores(
     // "just ignited" (within MOMENTUM_IGNITION_LOOKBACK candles). Decays with age
     // so a pattern that already moved 1-2 candles ago doesn't get treated the
     // same as one firing right now.
-    const ignitionTrigger = findRecentIgnitionTrigger(
-        input.primaryData,
-        trendAndVolume.engulfing
-    );
+    const ignitionTrigger =
+        findRecentIgnitionTrigger(
+            input.primaryData,
+            trendAndVolume.engulfing
+        );
 
     const lastPattern =
         trendAndVolume.engulfing[
@@ -307,67 +316,93 @@ export async function computeScores(
 
     if (ignitionTrigger) {
         const decay =
-            ignitionTrigger.offset;
-
-        const actualDecay =
-            [1.0, 0.5][decay] ?? 0;
+            MOMENTUM_IGNITION_DECAY[
+            ignitionTrigger.offset
+            ] ?? 0;
 
         const pts =
-            ENGULFING_POINTS * actualDecay;
+            ENGULFING_POINTS * decay;
+
+        const ageLabel =
+            ignitionTrigger.offset === 0
+                ? 'this candle'
+                : `${ignitionTrigger.offset} candle${ignitionTrigger.offset === 1 ? '' : 's'} ago`;
 
         if (ignitionTrigger.type === 'bullish') {
             buyScore += pts;
+
             reasons.push(
-                `Bullish engulfing + volume ignition (${ignitionTrigger.offset} candle(s) ago): +${pts.toFixed(1)}pts`
+                `Bullish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
             );
         } else {
             sellScore += pts;
+
             reasons.push(
-                `Bearish engulfing + volume ignition (${ignitionTrigger.offset} candle(s) ago): +${pts.toFixed(1)}pts`
+                `Bearish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
             );
         }
     }
 
     // -------------------- PERCENT_B POSITION --------------------
-    const percentB = indicators.last.percentB;
+    const percentB =
+        indicators.last.percentB ?? 0.5;
 
     if (percentB < 0.4) {
         // Price in lower third of BB — good entry zone for buys
         buyScore += PERCENT_B_POINTS;
         sellScore -= PERCENT_B_POINTS;  // penalty: selling at a low is risky
-        reasons.push(`Bullish BB position: percent_b=${percentB.toFixed(3)} (lower zone)`);
+
+        reasons.push(
+            `Bullish BB position: percent_b=${percentB.toFixed(3)} (lower zone)`
+        );
     } else if (percentB > 0.7) {
         // Price in upper third of BB — good entry zone for sells
         sellScore += PERCENT_B_POINTS;
         buyScore -= PERCENT_B_POINTS;  // penalty: buying near the top is risky
-        reasons.push(`Bearish BB position: percent_b=${percentB.toFixed(3)} (upper zone)`);
+
+        reasons.push(
+            `Bearish BB position: percent_b=${percentB.toFixed(3)} (upper zone)`
+        );
     }
     // percent_b 0.4–0.7 is neutral — no points awarded either way
 
     // -------------------- PERCENT_B + ENGULFING COMBO BONUS --------------------
     // 22% of good trades had both percent_b < 0.5 AND an engulfing signal
     // vs only 14% of bad trades — a meaningful combination worth a small bonus.
-    if (lastPattern === 'bullish' && percentB < 0.5) {
+    if (
+        lastPattern === 'bullish' &&
+        percentB < 0.5
+    ) {
         buyScore += PERCENT_B_COMBO_POINTS;
-        reasons.push(`BB+Engulfing combo: bullish engulfing in lower BB half`);
-    } else if (lastPattern === 'bearish' && percentB > 0.5) {
+        reasons.push(
+            `BB+Engulfing combo: bullish engulfing in lower BB half`
+        );
+    } else if (
+        lastPattern === 'bearish' &&
+        percentB > 0.5
+    ) {
         sellScore += PERCENT_B_COMBO_POINTS;
-        reasons.push(`BB+Engulfing combo: bearish engulfing in upper BB half`);
+        reasons.push(
+            `BB+Engulfing combo: bearish engulfing in upper BB half`
+        );
     }
 
     // -------------------- BB SQUEEZE → BREAKOUT --------------------
-    const squeezeBreakout = detectBbSqueezeBreakout(
-        indicators,
-        input.primaryData.closes
-    );
+    const squeezeBreakout =
+        detectBbSqueezeBreakout(
+            indicators,
+            input.primaryData.closes
+        );
 
     if (squeezeBreakout === 'bullish') {
         buyScore += BB_SQUEEZE_BREAKOUT_POINTS;
+
         reasons.push(
             `Bullish BB squeeze breakout: bandwidth expanded from squeeze, close broke above prior upper band`
         );
     } else if (squeezeBreakout === 'bearish') {
         sellScore += BB_SQUEEZE_BREAKOUT_POINTS;
+
         reasons.push(
             `Bearish BB squeeze breakout: bandwidth expanded from squeeze, close broke below prior lower band`
         );
@@ -378,17 +413,30 @@ export async function computeScores(
     // CONFIDENCE_THRESHOLD — avoids a REST call for symbols nowhere near a signal.
     // Cached with a short TTL in ExchangeService so repeated calls within the same
     // scan cycle (e.g. AutoTradeService re-checking) don't refetch.
-    const leadingScore = Math.max(buyScore, sellScore);
+    const leadingScore =
+        Math.max(buyScore, sellScore);
 
-    if (leadingScore >= CONFIDENCE_THRESHOLD - ORDER_BOOK_GATE_MARGIN) {
+    if (
+        leadingScore >=
+        CONFIDENCE_THRESHOLD - ORDER_BOOK_GATE_MARGIN
+    ) {
         try {
             const book =
-                await exchangeService.getOrderBookImbalance(input.symbol);
+                await exchangeService.getOrderBookImbalance(
+                    input.symbol
+                );
 
-            if (book && Math.abs(book.imbalance) >= ORDER_BOOK_IMBALANCE_THRESHOLD) {
+            if (
+                book &&
+                Math.abs(book.imbalance) >=
+                ORDER_BOOK_IMBALANCE_THRESHOLD
+            ) {
                 // Scale points linearly between threshold and 1.0 imbalance
                 const magnitude =
-                    Math.min(1, Math.abs(book.imbalance));
+                    Math.min(
+                        1,
+                        Math.abs(book.imbalance)
+                    );
 
                 const scaledPts =
                     ORDER_BOOK_IMBALANCE_POINTS *
@@ -399,11 +447,13 @@ export async function computeScores(
 
                 if (book.imbalance > 0) {
                     buyScore += scaledPts;
+
                     reasons.push(
                         `Order book bid-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
                     );
                 } else {
                     sellScore += scaledPts;
+
                     reasons.push(
                         `Order book ask-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
                     );
@@ -417,20 +467,23 @@ export async function computeScores(
             logger.warn(
                 `Order book fetch failed during scoring for ${input.symbol}`,
                 {
-                    error: err instanceof Error
-                        ? err.message
-                        : String(err),
+                    error:
+                        err instanceof Error
+                            ? err.message
+                            : String(err),
                 }
             );
+
             // Fail-open: no points, no crash — order book is a bonus signal, not a gate
         }
     }
 
     // -------------------- ML PREDICTION INTEGRATION --------------------
-    const features = await mlService.extractFeatures(input, {
-        liquiditySweep: lastLiquiditySweep,
-        bbSqueezeBreakout: squeezeBreakout,
-    });
+    const features =
+        await mlService.extractFeatures(input, {
+            liquiditySweep: lastLiquiditySweep,
+            bbSqueezeBreakout: squeezeBreakout, // already computed above, in the BB squeeze scoring block
+        });
 
     const preMlBuyScore = buyScore;
     const preMlSellScore = sellScore;
@@ -460,12 +513,14 @@ export async function computeScores(
              */
             if (preMlBuyScore > preMlSellScore) {
                 buyScore += bonus;
+
                 reasons.unshift(
                     `ML PREDICTS WIN for technical BUY leader (label ${predictedLabel}) ` +
                     `→ +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`
                 );
             } else if (preMlSellScore > preMlBuyScore) {
                 sellScore += bonus;
+
                 reasons.unshift(
                     `ML PREDICTS WIN for technical SELL leader (label ${predictedLabel}) ` +
                     `→ +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`
@@ -520,14 +575,18 @@ export async function computeScores(
                 );
             }
         } else {
-            reasons.push(`ML neutral (label 0) → no bonus`);
+            reasons.push(
+                `ML neutral (label 0) → no bonus`
+            );
         }
 
         logger.debug('ML Prediction Applied', {
             symbol: input.symbol,
             predictedLabel,
-            winConf: (mlWinConfidence * 100).toFixed(1) + '%',
-            lossConf: (mlLossConfidence * 100).toFixed(1) + '%',
+            winConf:
+                (mlWinConfidence * 100).toFixed(1) + '%',
+            lossConf:
+                (mlLossConfidence * 100).toFixed(1) + '%',
             buyScore: buyScore.toFixed(1),
             sellScore: sellScore.toFixed(1),
         });
@@ -552,7 +611,9 @@ export async function computeScores(
                 reasons.push(
                     'ML confidence ambiguous, no clear technical leader → tie-breaker skipped'
                 );
-            } else if (!mlService.isDirectionalReady(leaderSide)) {
+            } else if (
+                !mlService.isDirectionalReady(leaderSide)
+            ) {
                 reasons.push(
                     `ML confidence ambiguous (${(mlWinConfidence * 100).toFixed(1)}%) but ${leaderSide} model not ready → tie-breaker skipped`
                 );
@@ -584,10 +645,16 @@ export async function computeScores(
 
                     if (leaderSide === 'buy') {
                         buyScore =
-                            Math.max(0, buyScore - penalty);
+                            Math.max(
+                                0,
+                                buyScore - penalty
+                            );
                     } else {
                         sellScore =
-                            Math.max(0, sellScore - penalty);
+                            Math.max(
+                                0,
+                                sellScore - penalty
+                            );
                     }
 
                     reasons.push(
@@ -601,7 +668,10 @@ export async function computeScores(
             }
         }
     } else {
-        reasons.push('ML model not ready → no prediction bonus');
+        reasons.push(
+            'ML model not ready → no prediction bonus'
+        );
+
         buyScore *= ML_CONFIDENCE_DISCOUNT;
         sellScore *= ML_CONFIDENCE_DISCOUNT;
     }
@@ -614,7 +684,10 @@ export async function computeScores(
     //   - If scores are close or both low, return null (no potential) – translates to 'hold'.
     //   - This helps flag viable signals before excursion may skip/reverse them.
     // ──────────────────────────────────────────────────────────────
-    let potentialDirection: 'long' | 'short' | null = null;
+    let potentialDirection:
+        | 'long'
+        | 'short'
+        | null = null;
 
     const scoreMargin =
         SCORE_MARGIN_REQUIRED * 0.5;  // Relaxed margin for potential (pre-excursion)
