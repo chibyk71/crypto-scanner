@@ -174,6 +174,8 @@ const ORDER_BOOK_GATE_MARGIN = 15;              // ← Only fetch book when lead
  *   • ML integration
  *   • Adaptive risk management
  *   • Signal cooldown per symbol
+ *
+ *  @deprecated – moved to src/lib/strategy/ for better separation of concerns
  */
 export class Strategy {
     // External dependencies

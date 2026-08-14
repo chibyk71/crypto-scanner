@@ -21,7 +21,6 @@
 
 import { ExchangeService } from './services/exchange';
 import { dbService } from './db';
-import { Strategy } from './strategy';
 import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
 import { createLogger } from './logger';
 import { config } from './config/settings';
@@ -31,6 +30,7 @@ import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
 import { cooldownService } from './services/cooldownService';
 import type { MLService } from './services/mlService';
+import type { Strategy } from './strategy/';
 
 const logger = createLogger('MarketScanner');
 

@@ -1,7 +1,7 @@
 // src/lib/worker.ts
 
 import { ExchangeService } from './services/exchange';
-import { Strategy } from './strategy';
+import { Strategy } from './strategy/';
 import { MarketScanner } from './scanner';
 import { dbService, initializeClient, closeDb } from './db';
 import { createLogger } from './logger';
