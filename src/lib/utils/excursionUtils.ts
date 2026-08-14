@@ -111,7 +111,7 @@ export interface ExcursionScore {
 // CONSTANTS
 // =============================================================================
 const MAX_SIMS = 10; // Maximum number of recent sims to consider
-const MIN_SIDE_SAMPLES = 1; // Minimum samples on intended side for take/reverse
+const MIN_SIDE_SAMPLES = 3; // Minimum samples required before trusting either side
 
 /**
  * Analyze recent regime and return actionable advice + adjustments
@@ -309,7 +309,7 @@ export function getExcursionAdvice(
     // ────────────────────────────────────────────────────────────────
     // 7. MAP SCORE TO ACTION + ADJUSTMENTS
     // ────────────────────────────────────────────────────────────────
-    const adviceResult = mapScoreToAdvice(scoreResult, direction);
+    const adviceResult = mapScoreToAdvice(scoreResult, regime, direction);
 
     // ────────────────────────────────────────────────────────────────
     // 8. BUILD FINAL HUMAN-READABLE ADVICE STRING
@@ -527,46 +527,21 @@ function computeRegimeScore(
  * Map final regime score to trading action & adjustments
  *
  * This function translates the aggregated regime score into a concrete trading decision.
- * It uses fixed but clearly documented thresholds to make the logic:
- *   - Transparent and easy to tune
- *   - Explainable (why did we take/reverse/skip?)
- *   - Conservative by default (prefers skip over aggressive reverse)
  *
- * 2026+ pure directional rules:
- *   - Score is already computed from **only the intended side** (buy or sell)
- *   - Reversal requires:
- *     - Very low final score (≤ 1.4)
- *     - Consistent recent bad performance on this side (≥3 bad sims in last 5)
- *   - No combined or opposite-side data used — pure side isolation
- *   - Adjustments are applied to the final side (after possible reverse)
+ * Reversal safety rule:
+ *   - A bad intended-side regime alone is NOT enough to reverse.
+ *   - The opposite side must also have sufficient samples and a supportive regime.
+ *   - If the intended side is bad but the opposite side is unproven or weak,
+ *     the safest action is SKIP.
  *
- * Score interpretation guide (scalping defaults – tunable):
- *   ≥ 3.8     → strong take     (high conviction – widen TP, boost confidence)
- *   3.0–3.79  → take           (solid edge – normal size, mild boost)
- *   2.0–2.99  → cautious take  (acceptable but reduce risk – tighten SL)
- *   1.0–1.99  → skip / minimal (weak signal – very small size or skip)
- *   ≤ 1.4     → reverse if recent sims consistently bad, else skip
- *
- * Tunable thresholds (hardcoded for now – extract to config.strategy later):
- *   STRONG_TAKE_THRESHOLD   = 3.8
- *   TAKE_THRESHOLD          = 3.0
- *   CAUTIOUS_THRESHOLD      = 2.0
- *   REVERSE_SCORE_THRESHOLD = 1.4
- *   REVERSE_BAD_SIM_THRESHOLD = 1.5   // individual sim score considered "bad"
- *   REVERSE_RECENT_COUNT      = 5     // look at most recent N sims
- *   REVERSE_MIN_BAD           = 3     // need at least this many bad recent sims
- *
- * Safety principles:
- *   - Never returns extreme multipliers (clamped)
- *   - Prefers 'skip' over aggressive 'reverse' when borderline
- *   - Returns base advice string for further embellishment in buildAdviceString
- *
- * @param score      - Result from computeRegimeScore (pure directional, side-specific)
- * @param direction  - Intended trade direction (used for context/logging only)
+ * @param score      - Result from computeRegimeScore for the intended direction
+ * @param regime     - Full regime data, used to validate the opposite side before reversing
+ * @param direction  - Intended trade direction
  * @returns ExcursionAdvice with action, adjustments, and base advice string
  */
 function mapScoreToAdvice(
     score: ExcursionScore,
+    regime: ExcursionRegime | ExcursionRegimeLite,
     direction: 'long' | 'short'
 ): ExcursionAdvice {
     // ────────────────────────────────────────────────────────────────
@@ -575,7 +550,7 @@ function mapScoreToAdvice(
     if (!score || typeof score.totalScore !== 'number') {
         logger.warn('mapScoreToAdvice received invalid score – returning skip', {
             direction,
-            scoreProvided: !!score
+            scoreProvided: !!score,
         });
 
         return {
@@ -586,7 +561,7 @@ function mapScoreToAdvice(
                 confidenceBoost: -0.30,
             },
             action: 'skip',
-            score: 0
+            score: 0,
         };
     }
 
@@ -594,15 +569,25 @@ function mapScoreToAdvice(
 
     // ────────────────────────────────────────────────────────────────
     // 2. DEFINE THRESHOLDS & ADJUSTMENT MAPPINGS
-    //    All hardcoded for now – extract to config later
     // ────────────────────────────────────────────────────────────────
     const STRONG_TAKE_THRESHOLD = 3.8;
     const TAKE_THRESHOLD = 3.0;
     const CAUTIOUS_THRESHOLD = 2.0;
+
+    // A score at or below this level may qualify for reversal,
+    // but only if the opposite side independently proves itself.
     const REVERSE_SCORE_THRESHOLD = 1.4;
-    const REVERSE_BAD_SIM_THRESHOLD = 1.5; // individual sim ≤ this = "bad"
+
+    // Individual simulation score considered poor performance.
+    const REVERSE_BAD_SIM_THRESHOLD = 1.5;
+
+    // Inspect only the most recent simulations when checking whether
+    // the intended side is consistently performing badly.
     const REVERSE_RECENT_COUNT = 5;
-    const REVERSE_MIN_BAD = 3;     // need at least this many bad recent sims
+
+    // Minimum number of bad recent simulations required before
+    // considering a reversal.
+    const REVERSE_MIN_BAD = 3;
 
     let action: ExcursionAction = 'skip';
     let baseAdvice = '';
@@ -612,49 +597,162 @@ function mapScoreToAdvice(
 
     // ────────────────────────────────────────────────────────────────
     // 3. DECISION TREE – map score ranges to action & adjustments
-    //    Pure directional: score already comes from one side only
     // ────────────────────────────────────────────────────────────────
     if (finalScore >= STRONG_TAKE_THRESHOLD) {
         action = 'take';
         baseAdvice = `🟢 Strong regime (${finalScore.toFixed(2)}) – high conviction take`;
-        slMult = 1.10;    // slight widen SL (more room)
-        tpMult = 1.40;    // significantly widen TP
-        confBoost = 0.30; // strong confidence boost
+        slMult = 1.10;
+        tpMult = 1.40;
+        confBoost = 0.30;
 
     } else if (finalScore >= TAKE_THRESHOLD) {
         action = 'take';
         baseAdvice = `🟢 Good regime (${finalScore.toFixed(2)}) – take`;
-        slMult = 1.00;    // neutral SL
-        tpMult = 1.25;    // moderate TP expansion
-        confBoost = 0.15; // mild boost
+        slMult = 1.00;
+        tpMult = 1.25;
+        confBoost = 0.15;
 
     } else if (finalScore >= CAUTIOUS_THRESHOLD) {
         action = 'take';
         baseAdvice = `🟠 Cautious regime (${finalScore.toFixed(2)}) – take small/reduced`;
-        slMult = 0.85;    // tighten SL (reduce risk)
-        tpMult = 1.10;    // slight TP widen
-        confBoost = -0.05; // slight penalty
+        slMult = 0.85;
+        tpMult = 1.10;
+        confBoost = -0.05;
 
     } else {
-        // Weak to bad regime — decide between skip and reverse
-        // Check recent individual sims for consistent bad performance on this side
-        const recentSims = score.individualScores.slice(0, REVERSE_RECENT_COUNT);
-        const badRecentCount = recentSims.filter(s => s <= REVERSE_BAD_SIM_THRESHOLD).length;
+        // ────────────────────────────────────────────────────────────
+        // 3A. WEAK / ADVERSE REGIME
+        //
+        // First determine whether the intended side has been
+        // consistently bad in recent simulations.
+        // ────────────────────────────────────────────────────────────
+        const recentSims = score.individualScores.slice(
+            0,
+            REVERSE_RECENT_COUNT
+        );
 
-        const shouldReverse = finalScore <= REVERSE_SCORE_THRESHOLD && badRecentCount >= REVERSE_MIN_BAD;
+        const badRecentCount = recentSims.filter(
+            simulationScore => simulationScore <= REVERSE_BAD_SIM_THRESHOLD
+        ).length;
+
+        const intendedSideIsConsistentlyBad =
+            finalScore <= REVERSE_SCORE_THRESHOLD &&
+            badRecentCount >= REVERSE_MIN_BAD;
+
+        // ────────────────────────────────────────────────────────────
+        // 3B. OPPOSITE-SIDE VALIDATION
+        //
+        // A bad LONG does not automatically mean SHORT is good.
+        // A bad SHORT does not automatically mean LONG is good.
+        //
+        // Before reversing, independently inspect the opposite side.
+        // ────────────────────────────────────────────────────────────
+        const oppositeDirection: 'long' | 'short' =
+            direction === 'long' ? 'short' : 'long';
+
+        /**
+         * Regime data uses buy/sell aggregates, while the caller works
+         * with long/short trade directions.
+         */
+        const oppositeSideAggregate =
+            oppositeDirection === 'long'
+                ? regime.buy
+                : regime.sell;
+
+        const oppositeSideSampleCount =
+            oppositeSideAggregate?.sampleCount ?? 0;
+
+        /**
+         * MIN_SIDE_SAMPLES is the shared minimum sample requirement
+         * defined at module level.
+         *
+         * Do not reverse into a side with insufficient historical data.
+         */
+        const oppositeHasEnoughSamples =
+            oppositeSideSampleCount >= MIN_SIDE_SAMPLES;
+
+        /**
+         * Only calculate an opposite-side regime score when that side
+         * has enough samples to make the result meaningful.
+         */
+        const oppositeScore = oppositeHasEnoughSamples
+            ? computeRegimeScore(regime, oppositeDirection)
+            : null;
+
+        /**
+         * The opposite side must independently show a viable regime.
+         *
+         * Requiring CAUTIOUS_THRESHOLD means we do not reverse into
+         * another weak/adverse setup merely because the original side
+         * performed badly.
+         */
+        const oppositeHasSupportiveRegime =
+            oppositeScore !== null &&
+            oppositeScore.totalScore >= CAUTIOUS_THRESHOLD;
+
+        // ────────────────────────────────────────────────────────────
+        // 3C. FINAL REVERSAL DECISION
+        //
+        // ALL conditions must be true:
+        //   1. Intended side has a very poor aggregate score.
+        //   2. Recent intended-side simulations are consistently bad.
+        //   3. Opposite side has enough historical samples.
+        //   4. Opposite side independently has a viable regime score.
+        // ────────────────────────────────────────────────────────────
+        const shouldReverse =
+            intendedSideIsConsistentlyBad &&
+            oppositeHasEnoughSamples &&
+            oppositeHasSupportiveRegime;
 
         if (shouldReverse) {
             action = 'reverse';
-            baseAdvice = `🔴 Adverse regime (${finalScore.toFixed(2)}) – reverse (${badRecentCount}/${recentSims.length} recent bad sims)`;
-            slMult = 0.70;    // tighten SL on reversal
-            tpMult = 1.30;    // widen TP on reversal
-            confBoost = -0.10; // penalty for reversing
+
+            baseAdvice =
+                `🔴 Adverse ${direction} regime (${finalScore.toFixed(2)}) – ` +
+                `reverse to ${oppositeDirection} ` +
+                `(${badRecentCount}/${recentSims.length} recent bad sims; ` +
+                `${oppositeSideSampleCount} opposite samples; ` +
+                `opposite score ${oppositeScore!.totalScore.toFixed(2)})`;
+
+            slMult = 0.70;
+            tpMult = 1.30;
+            confBoost = -0.10;
+
         } else {
+            // ────────────────────────────────────────────────────────
+            // 3D. SKIP
+            //
+            // If the intended side is clearly bad but the opposite side
+            // cannot independently justify a trade, do not guess.
+            // ────────────────────────────────────────────────────────
             action = 'skip';
-            baseAdvice = `🟡 Weak regime (${finalScore.toFixed(2)}) – skip`;
-            slMult = 0.75;    // tighten SL on weak signal
-            tpMult = 0.90;    // reduce TP exposure
-            confBoost = -0.20; // stronger penalty
+
+            if (intendedSideIsConsistentlyBad) {
+                if (!oppositeHasEnoughSamples) {
+                    baseAdvice =
+                        `🟡 Adverse ${direction} regime (${finalScore.toFixed(2)}) – ` +
+                        `skip; ${oppositeDirection} has insufficient evidence ` +
+                        `(${oppositeSideSampleCount}/${MIN_SIDE_SAMPLES} samples)`;
+                } else if (!oppositeHasSupportiveRegime) {
+                    baseAdvice =
+                        `🟡 Adverse ${direction} regime (${finalScore.toFixed(2)}) – ` +
+                        `skip; ${oppositeDirection} regime is not supportive ` +
+                        `(score ${oppositeScore?.totalScore.toFixed(2) ?? 'n/a'})`;
+                } else {
+                    // Defensive fallback. Normally unreachable because
+                    // supportive opposite evidence + bad intended side
+                    // would have triggered shouldReverse above.
+                    baseAdvice =
+                        `🟡 Adverse ${direction} regime (${finalScore.toFixed(2)}) – skip`;
+                }
+            } else {
+                baseAdvice =
+                    `🟡 Weak regime (${finalScore.toFixed(2)}) – skip`;
+            }
+
+            slMult = 0.75;
+            tpMult = 0.90;
+            confBoost = -0.20;
         }
     }
 
@@ -676,7 +774,7 @@ function mapScoreToAdvice(
             confidenceBoost: confBoost,
         },
         action,
-        score: finalScore
+        score: finalScore,
     };
 }
 

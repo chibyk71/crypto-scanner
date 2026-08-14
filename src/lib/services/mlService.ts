@@ -671,8 +671,25 @@ export class MLService {
             // Confidence = combined probability of any profitable outcome
             const positiveConfidence = pPos1 + pPos2;
 
-            // Strongest predicted label
-            const predictedLabel: SignalLabel = pPos2 > pPos1 ? 2 : pPos1 >= 0.35 ? 1 : 0;
+            /**
+             * Determine the actual predicted class across all five outcomes.
+             *
+             * IMPORTANT:
+             * The combined model can predict:
+             *   -2 = strongly negative outcome
+             *   -1 = negative outcome
+             *    0 = neutral / no sufficiently confident directional outcome
+             *   +1 = positive outcome
+             *   +2 = strongly positive outcome
+             *
+             * Previously, only +1 and +2 could be returned, meaning negative
+             * model predictions were silently converted into 0.
+             *
+             * Keep the same 0.35 threshold semantics currently used by the
+             * directional model so both prediction paths interpret classes
+             * consistently.
+             */
+            const predictedLabel: SignalLabel = pNeg2 > 0.35 ? -2 : pPos2 > 0.35 ? 2 : pNeg1 >= 0.35 ? -1 : pPos1 >= 0.35 ? 1 : 0;
 
             logger.debug('ONNX Prediction', {
                 predictedLabel,

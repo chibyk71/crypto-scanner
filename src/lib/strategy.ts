@@ -96,7 +96,6 @@ const MACD_ZERO_POINTS = 5;                   // ← New: MACD line above/below 
 const RSI_POINTS = 10;                        // ← Classic overbought/oversold
 const STOCH_POINTS = 10;                      // ← Stochastic reversal in extreme zones
 const OBV_VWMA_POINTS = 10;                   // ← Volume confirming price direction
-const ATR_POINTS = 10;                        // ← Volatility in a sane range (not too quiet, not crazy)
 const VWMA_SLOPE_POINTS = 5;                  // ← Direction of VWMA itself
 const ADX_POINTS = 10;                        // ← Confirms a trending market
 const ENGULFING_POINTS = 15;                  // ← Strong price-action candle
@@ -120,7 +119,6 @@ const MAX_SCORE_PER_SIDE =
     RSI_POINTS +
     STOCH_POINTS +
     OBV_VWMA_POINTS +
-    ATR_POINTS +
     VWMA_SLOPE_POINTS +
     ADX_POINTS +
     ENGULFING_POINTS +
@@ -645,9 +643,18 @@ export class Strategy {
         // -------------------- ATR VOLATILITY RANGE --------------------
         const atrPct = (indicators.last.atr / input.price) * 100;
         logger.info(`ATR Analysis for ${input.symbol}: ATR=${indicators.last.atr.toFixed(4)}, Price=${input.price.toFixed(4)}, ATR%=${atrPct.toFixed(2)}%`);
+
+        /**
+         * ATR measures market volatility, not trade direction.
+         *
+         * Do not add points to both buy and sell scores here. Adding equal
+         * points inflates overall confidence without providing directional
+         * evidence and can push weak setups closer to the signal threshold.
+         *
+         * ATR eligibility/risk handling remains available elsewhere in the
+         * strategy; this block only records that volatility is in range.
+         */
         if (atrPct > MIN_ATR_PCT && atrPct < MAX_ATR_PCT) {
-            buyScore += ATR_POINTS;
-            sellScore += ATR_POINTS;
             reasons.unshift(`Sane ATR volatility: ${atrPct.toFixed(2)}%`);
         }
 
@@ -824,14 +831,73 @@ export class Strategy {
             mlWinConfidence = prediction.confidence;
             mlLossConfidence = 1 - mlWinConfidence;
 
+
             if (predictedLabel >= 1) {
                 const bonus = mlWinConfidence * ML_BONUS_MAX;
-                buyScore += bonus;
-                reasons.unshift(`ML PREDICTS WIN (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`);
+
+                /**
+                 * Combined ML predicts the quality of the CURRENT technical setup,
+                 * not an independent trade direction.
+                 *
+                 * A positive prediction therefore strengthens whichever side was
+                 * already leading before ML was applied.
+                 */
+                if (preMlBuyScore > preMlSellScore) {
+                    buyScore += bonus;
+                    reasons.unshift(
+                        `ML PREDICTS WIN for technical BUY leader (label ${predictedLabel}) ` +
+                        `→ +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`
+                    );
+                } else if (preMlSellScore > preMlBuyScore) {
+                    sellScore += bonus;
+                    reasons.unshift(
+                        `ML PREDICTS WIN for technical SELL leader (label ${predictedLabel}) ` +
+                        `→ +${bonus.toFixed(0)}pts (${(mlWinConfidence * 100).toFixed(1)}%)`
+                    );
+                } else {
+                    /**
+                     * No technical leader exists, so the combined model must not
+                     * manufacture a direction on its own.
+                     */
+                    reasons.unshift(
+                        `ML PREDICTS WIN (label ${predictedLabel}) but technical scores are tied → no bonus applied`
+                    );
+                }
             } else if (predictedLabel <= -1) {
-                const bonus = mlLossConfidence * ML_BONUS_MAX * 0.9;
-                sellScore += bonus;
-                reasons.unshift(`ML PREDICTS LOSS (label ${predictedLabel}) → +${bonus.toFixed(0)}pts (${(mlLossConfidence * 100).toFixed(1)}%)`);
+                const penalty = mlLossConfidence * ML_BONUS_MAX * 0.9;
+
+                /**
+                 * A negative combined-model prediction means the current
+                 * technical setup is expected to perform poorly.
+                 *
+                 * IMPORTANT:
+                 * Do NOT award these points to the opposite side.
+                 * A bad BUY setup does not automatically prove SELL is good.
+                 *
+                 * Instead, penalize whichever side was the technical leader
+                 * before ML was applied.
+                 */
+                if (preMlBuyScore > preMlSellScore) {
+                    buyScore = Math.max(0, buyScore - penalty);
+                    reasons.unshift(
+                        `ML PREDICTS LOSS for technical BUY leader (label ${predictedLabel}) ` +
+                        `→ -${penalty.toFixed(0)}pts penalty (${(mlLossConfidence * 100).toFixed(1)}%)`
+                    );
+                } else if (preMlSellScore > preMlBuyScore) {
+                    sellScore = Math.max(0, sellScore - penalty);
+                    reasons.unshift(
+                        `ML PREDICTS LOSS for technical SELL leader (label ${predictedLabel}) ` +
+                        `→ -${penalty.toFixed(0)}pts penalty (${(mlLossConfidence * 100).toFixed(1)}%)`
+                    );
+                } else {
+                    /**
+                     * With no technical leader, there is nothing specific to
+                     * penalize. The combined model must not create a direction.
+                     */
+                    reasons.unshift(
+                        `ML PREDICTS LOSS (label ${predictedLabel}) but technical scores are tied → no penalty applied`
+                    );
+                }
             } else {
                 reasons.push(`ML neutral (label 0) → no bonus`);
             }
@@ -1063,6 +1129,7 @@ export class Strategy {
         // No signal → zero risk
         if (signal === 'hold') {
             logger.info('No signal generated – skipping risk parameter calculation');
+
             return {
                 stopLoss: undefined,
                 takeProfit: undefined,
@@ -1076,65 +1143,75 @@ export class Strategy {
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 1. Base risk % per trade – survival first
+        // 1. BASE ACCOUNT RISK
+        //
+        // This controls how much account capital is risked on the trade.
+        // It is independent of the SL distance and TP target.
         // ──────────────────────────────────────────────────────────────
-        const BASE_RISK_PERCENT_BULL = 0.005;    // 0.50% in bull/neutral
-        const BASE_RISK_PERCENT_BEAR = 0.0025;  // 0.25% in bear (volatility hurts)
-        const MAX_RISK_BONUS_CONFIDENCE = 0.005; // +0.50% at max confidence
+        const BASE_RISK_PERCENT_BULL = 0.005;     // 0.50%
+        const BASE_RISK_PERCENT_BEAR = 0.0025;    // 0.25%
+        const MAX_RISK_BONUS_CONFIDENCE = 0.005;  // +0.50% maximum
 
-        const baseRiskPercent = trendBias === 'bearish' ? BASE_RISK_PERCENT_BEAR : BASE_RISK_PERCENT_BULL;
+        const baseRiskPercent =
+            trendBias === 'bearish'
+                ? BASE_RISK_PERCENT_BEAR
+                : BASE_RISK_PERCENT_BULL;
 
-        // Confidence bonus: scales risk upward for high-confidence setups
-        const confidenceFactor = Math.min((confidence - 50) / 30, 1); // 0-1 range
-        const bonusRiskPercent = confidenceFactor * MAX_RISK_BONUS_CONFIDENCE;
+        // Scale additional account risk with confidence.
+        const confidenceFactor = Math.max(
+            0,
+            Math.min((confidence - 50) / 30, 1)
+        );
 
-        const finalRiskPercent = baseRiskPercent + bonusRiskPercent;
-        const riskAmountUsd = accountBalance * finalRiskPercent;
+        const bonusRiskPercent =
+            confidenceFactor * MAX_RISK_BONUS_CONFIDENCE;
 
-        // ──────────────────────────────────────────────────────────────
-        // 2. Stop-loss distance (ATR-based with bounds) — UNCHANGED.
-        //    This is the "natural" risk: whatever volatility actually gives us.
-        //    We do NOT shrink this to force a ratio — see feasibility gate below.
-        // ──────────────────────────────────────────────────────────────
-        const clampedMultiplier = Math.min(Math.max(atrMultiplier, MIN_ATR_MULTIPLIER), MAX_ATR_MULTIPLIER);
-        const riskDistance = lastAtr * clampedMultiplier;
+        const finalRiskPercent =
+            baseRiskPercent + bonusRiskPercent;
 
-        // Absolute safety bound: reject absurd stops (>10% move) regardless of feasibility gate
-        if (riskDistance <= 0 || riskDistance / price > 0.10) {
-            logger.info(`Unrealistic risk distance calculated: ${riskDistance.toFixed(4)} (skipping trade)`);
-            return {
-                stopLoss: undefined,
-                takeProfit: undefined,
-                trailingStopDistance: undefined,
-                positionSizeUsd: 0,
-                positionSizeMultiplier: 0,
-                riskAmountUsd: 0,
-                takeProfitLevels: [],
-                feasible: false,
-                infeasibleReason: `Risk distance ${(riskDistance / price * 100).toFixed(2)}% exceeds 10% absolute cap`,
-
-            };
-        }
+        const riskAmountUsd =
+            accountBalance * finalRiskPercent;
 
         // ──────────────────────────────────────────────────────────────
-        // 2b. FIXED TAKE-PROFIT TARGET (the actual 0.3% goal — not derived from SL)
+        // 2. ATR-BASED STOP DISTANCE
+        //
+        // The stop remains based on actual market volatility.
+        // We do not shrink it to force a particular R:R.
         // ──────────────────────────────────────────────────────────────
-        const takeProfitDistance = price * (config.strategy.targetProfitPct / 100);
-        const takeProfit = signal === 'buy' ? price + riskDistance * riskRewardTarget : price - riskDistance * riskRewardTarget;
-        // ──────────────────────────────────────────────────────────────
-        // 2c. ATR FEASIBILITY GATE
-        //    Does the natural (ATR-derived) stop distance support an acceptable
-        //    R:R against the FIXED target? If not, skip the trade entirely —
-        //    never force-shrink the stop to manufacture a better ratio.
-        // ──────────────────────────────────────────────────────────────
-        const achievedRR = takeProfitDistance / riskDistance;
+        const clampedMultiplier = Math.min(
+            Math.max(
+                atrMultiplier,
+                MIN_ATR_MULTIPLIER
+            ),
+            MAX_ATR_MULTIPLIER
+        );
 
-        if (requireAtrFeasibility && achievedRR < config.strategy.minAcceptableRR) {
+        const riskDistance =
+            lastAtr * clampedMultiplier;
+
+        // Absolute sanity check.
+        //
+        // This is NOT an R:R feasibility check.
+        // It simply prevents obviously abnormal volatility from
+        // producing an excessively distant stop-loss.
+        const riskDistancePct =
+            riskDistance / price;
+
+        if (
+            riskDistance <= 0 ||
+            !Number.isFinite(riskDistance) ||
+            riskDistancePct > 0.10
+        ) {
             const reason =
-                `ATR-implied stop (${(riskDistance / price * 100).toFixed(3)}%) too wide for ` +
-                `${config.strategy.targetProfitPct}% target: achieved R:R ${achievedRR.toFixed(2)} ` +
-                `< min ${config.strategy.minAcceptableRR}`;
-            logger.info(`Feasibility gate rejected ${signal} signal: ${reason}`);
+                riskDistance <= 0 ||
+                    !Number.isFinite(riskDistance)
+                    ? `Invalid ATR-derived risk distance: ${riskDistance}`
+                    : `Risk distance ${(riskDistancePct * 100).toFixed(2)}% exceeds 10% absolute cap`;
+
+            logger.info(
+                `Risk parameter calculation rejected ${signal} signal: ${reason}`
+            );
+
             return {
                 stopLoss: undefined,
                 takeProfit: undefined,
@@ -1149,51 +1226,146 @@ export class Strategy {
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 3. Position size in USD (risk-based)
+        // 3. STOP LOSS + TRUE 3R TAKE PROFIT
+        //
+        // The bot's TP is ALWAYS derived from the configured
+        // riskRewardTarget.
+        //
+        // Example:
+        //   riskDistance = 0.2%
+        //   riskRewardTarget = 3
+        //
+        //   SL distance = 0.2%
+        //   TP distance = 0.6%
+        //
+        // Your personal/manual 0.3% profit-taking does NOT belong here.
+        // This method defines the strategy's signal and simulation levels.
         // ──────────────────────────────────────────────────────────────
-        const rawPositionSizeUsd = riskAmountUsd / (riskDistance / price);
+        const stopLoss =
+            signal === 'buy'
+                ? price - riskDistance
+                : price + riskDistance;
 
-        // Hard leverage cap – never exceed 5× notional
-        const maxAllowedNotional = accountBalance * 5.0;
-        const positionSizeUsd = Math.min(rawPositionSizeUsd, maxAllowedNotional);
+        const takeProfitDistance =
+            riskDistance * riskRewardTarget;
 
-        // ──────────────────────────────────────────────────────────────
-        // 4. Stop Loss level (TP already computed above as the fixed target)
-        // ──────────────────────────────────────────────────────────────
-        const stopLoss = signal === 'buy' ? price - riskDistance : price + riskDistance;
-
-        // Build partial TP levels from config. Filtered against the ACHIEVED R:R
-        // (not the old riskRewardTarget) since that's now the real ceiling — a
-        // partial level beyond achievedRR would sit past the fixed final target.
-        const takeProfitLevels: PartialTPLevel[] = config.simulation.partialTpLevels
-            .filter(lvl => lvl.rMultiple < achievedRR)
-            .map(lvl => ({
-                price: signal === 'buy'
-                    ? Number((price + riskDistance * lvl.rMultiple).toFixed(8))
-                    : Number((price - riskDistance * lvl.rMultiple).toFixed(8)),
-                weight: lvl.weight,
-            }));
-
-        // ──────────────────────────────────────────────────────────────
-        // 5. Trailing stop – 75% of initial risk (aggressive for scalping)
-        // ──────────────────────────────────────────────────────────────
-        const trailingStopDistance = riskDistance * 0.75;
+        const takeProfit =
+            signal === 'buy'
+                ? price + takeProfitDistance
+                : price - takeProfitDistance;
 
         // ──────────────────────────────────────────────────────────────
-        // 6. Legacy multiplier (for systems still using it)
+        // 4. REMOVE FIXED-TP ATR FEASIBILITY GATE
+        //
+        // Previously:
+        //
+        //   fixed 0.3% TP
+        //       ÷
+        //   ATR stop distance
+        //
+        // was used to reject signals when the resulting calculated R:R
+        // was below minAcceptableRR.
+        //
+        // That conflicts with the actual strategy because the bot's real
+        // TP is already:
+        //
+        //   riskDistance × riskRewardTarget
+        //
+        // Therefore the generated signal inherently uses the configured
+        // R:R (currently intended to be 3:1).
+        //
+        // Keep the parameter temporarily for API compatibility, but it no
+        // longer affects signal feasibility.
         // ──────────────────────────────────────────────────────────────
-        const positionSizeMultiplier = Math.min(positionSizeUsd / accountBalance * 5, 1.5);
+        void requireAtrFeasibility;
 
         // ──────────────────────────────────────────────────────────────
-        // Final structured return
+        // 5. POSITION SIZE IN USD
+        //
+        // Position size adjusts so the account risk remains approximately
+        // consistent regardless of ATR stop distance.
+        // ──────────────────────────────────────────────────────────────
+        const rawPositionSizeUsd =
+            riskAmountUsd / riskDistancePct;
+
+        // Hard leverage/notional cap.
+        const maxAllowedNotional =
+            accountBalance * 5.0;
+
+        const positionSizeUsd = Math.min(
+            rawPositionSizeUsd,
+            maxAllowedNotional
+        );
+
+        // ──────────────────────────────────────────────────────────────
+        // 6. PARTIAL TAKE-PROFIT LEVELS
+        //
+        // Filter against the configured final R multiple.
+        //
+        // Since the actual final TP is riskRewardTarget × riskDistance,
+        // no partial level should exist at or beyond the final target.
+        // ──────────────────────────────────────────────────────────────
+        const takeProfitLevels: PartialTPLevel[] =
+            config.simulation.partialTpLevels
+                .filter(
+                    level =>
+                        level.rMultiple < riskRewardTarget
+                )
+                .map(level => ({
+                    price:
+                        signal === 'buy'
+                            ? Number(
+                                (
+                                    price +
+                                    riskDistance * level.rMultiple
+                                ).toFixed(8)
+                            )
+                            : Number(
+                                (
+                                    price -
+                                    riskDistance * level.rMultiple
+                                ).toFixed(8)
+                            ),
+                    weight: level.weight,
+                }));
+
+        // ──────────────────────────────────────────────────────────────
+        // 7. TRAILING STOP
+        //
+        // Uses 75% of the original ATR-derived risk distance.
+        // ──────────────────────────────────────────────────────────────
+        const trailingStopDistance =
+            riskDistance * 0.75;
+
+        // ──────────────────────────────────────────────────────────────
+        // 8. LEGACY POSITION SIZE MULTIPLIER
+        //
+        // Retained for downstream systems that still consume it.
+        // ──────────────────────────────────────────────────────────────
+        const positionSizeMultiplier =
+            Math.min(
+                (positionSizeUsd / accountBalance) * 5,
+                1.5
+            );
+
+        // ──────────────────────────────────────────────────────────────
+        // FINAL RESULT
         // ──────────────────────────────────────────────────────────────
         return {
             stopLoss: Number(stopLoss.toFixed(8)),
             takeProfit: Number(takeProfit.toFixed(8)),
-            trailingStopDistance: Number(trailingStopDistance.toFixed(8)),
-            positionSizeUsd: Number(positionSizeUsd.toFixed(2)),
-            positionSizeMultiplier: Number(positionSizeMultiplier.toFixed(3)),
-            riskAmountUsd: Number(riskAmountUsd.toFixed(2)),
+            trailingStopDistance: Number(
+                trailingStopDistance.toFixed(8)
+            ),
+            positionSizeUsd: Number(
+                positionSizeUsd.toFixed(2)
+            ),
+            positionSizeMultiplier: Number(
+                positionSizeMultiplier.toFixed(3)
+            ),
+            riskAmountUsd: Number(
+                riskAmountUsd.toFixed(2)
+            ),
             takeProfitLevels,
             feasible: true,
         };

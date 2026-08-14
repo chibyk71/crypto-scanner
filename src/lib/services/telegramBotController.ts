@@ -2447,12 +2447,12 @@ export class TelegramBotController {
         // ML prediction block — only show when model made a prediction
         if (signal.mlConfidence !== undefined && signal.mlPredictedLabel !== undefined) {
             const labelStr = signal.mlPredictedLabel >= 0
-                ? `\\+${signal.mlPredictedLabel}`
+                ? `+${signal.mlPredictedLabel}`
                 : `${signal.mlPredictedLabel}`;
             const positivePct = esc((signal.mlConfidence * 100).toFixed(1));
-            const negativePct = esc(((1 - signal.mlConfidence) * 100).toFixed(1));
+            const negativePctRaw = ((1 - signal.mlConfidence) * 100).toFixed(1);
             const negativeWarning = (1 - signal.mlConfidence) >= 0.35
-                ? ` ⚠️ negative risk: ${negativePct}%`
+                ? ` ⚠️ negative risk: ${negativePctRaw}%`
                 : '';
             lines.push(`🤖 ML: predicted *${esc(labelStr)}* · positive: ${positivePct}%${esc(negativeWarning)}`);
         } else if (signal.mlConfidence !== undefined) {
@@ -2539,7 +2539,7 @@ export class TelegramBotController {
                         : '';
 
                     lines.push(
-                        `  ${idx === 0 ? '→' : '  '} ${outcomeEmoji(sim.outcome)} · ${esc(simAgeStr)}${mfeStr}${maeStr} \\(outcome ${sim.label >= 0 ? '\\+' : ''}${sim.label}${mlPredStr}\\)`
+                        `  ${idx === 0 ? '→' : '  '} ${outcomeEmoji(sim.outcome)} · ${esc(simAgeStr)}${mfeStr}${maeStr} \\(outcome ${sim.label >= 0 ? '\\+' : ''}${esc(sim.label)}${mlPredStr}\\)`
                     );
                 });
             }
@@ -2791,7 +2791,7 @@ export class TelegramBotController {
                 errorMessage: error.message,
                 errorCode: error.code,
                 response: error.response?.body,
-                messagePreview: message.length > 100 ? message.substring(0, 157) + '...' : message,
+                messagePreview: message,
             });
 
             // Re-throw to allow callers to handle gracefully (e.g., retry or fallback)
