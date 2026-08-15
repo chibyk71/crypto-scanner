@@ -111,10 +111,16 @@ export async function simulateTrade(
     let trailingExitTotalPnL: number | undefined;
 
     await dbService.createNewSimulation(
-        signalId, signal.symbol, signal.signal as 'buy' | 'sell',
-        entryPrice, startTime, features, signal.confidence ?? 0,
-        mlPredictedLabel,       // ← ADD
-        mlPredictedConfidence,  // ← ADD
+        signalId,
+        signal.symbol,
+        signal.signal as 'buy' | 'sell',
+        entryPrice,
+        startTime,
+        features,
+        signal.confidence ?? 0,
+        mlPredictedLabel,
+        mlPredictedConfidence,
+        signal.regime
     );
 
     // wait a moment before starting to poll to allow the first candle to complete

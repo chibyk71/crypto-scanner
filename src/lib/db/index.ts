@@ -43,6 +43,7 @@ import { config } from '../config/settings';
 import { createLogger } from '../logger';
 import type { SimulationHistoryEntry } from '../../types/signalHistory';
 import type { PartialTPLevel } from '../../types';
+import type { MarketRegime } from '../strategy/regime/types';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -860,6 +861,7 @@ class DatabaseService {
         confidence: number = 0,
         mlPredictedLabel?: number,
         mlPredictedConfidence?: number,
+        regime?: MarketRegime,
     ): Promise<string> {
         try {
             const [inserted] = await this.db
@@ -868,10 +870,12 @@ class DatabaseService {
                     signalId,
                     symbol,
                     side,
+                    regime: regime ?? null,
                     entryPrice,               // stored as raw float
                     openedAt,
                     wasTaken: false,
                     confidence,
+
                     // Default/starting values
                     pnl: 0,
                     rMultiple: 0,
@@ -880,6 +884,7 @@ class DatabaseService {
                     durationMs: 0,
                     timeToMFEMs: 0,
                     timeToMAEMs: 0,
+
                     // Nullable fields left undefined/null
                     stopLoss: null,
                     trailingDist: null,
@@ -887,30 +892,40 @@ class DatabaseService {
                     closedAt: null,
                     outcome: null,
                     label: null,
+
                     // Optional features
-                    features: features && features.length > 0 ? features : null,
+                    features: features && features.length > 0
+                        ? features
+                        : null,
+
                     mlPredictedLabel: mlPredictedLabel ?? null,
-                    mlPredictedConfidence: mlPredictedConfidence ?? null,
+                    mlPredictedConfidence:
+                        mlPredictedConfidence ?? null,
                 })
-                .$returningId()
+                .$returningId();
 
             logger.debug('Created new empty simulation row', {
                 signalId,
                 symbol,
                 side,
+                regime,
                 entryPrice,
                 openedAt: new Date(openedAt).toISOString(),
             });
 
-            return String(inserted.id); // Return the generated signalId for reference (not DB ID)
+            return String(inserted.id);
         } catch (error) {
             logger.error('Failed to create new simulation row', {
                 signalId,
                 symbol,
                 side,
+                regime,
                 entryPrice,
-                error: error instanceof Error ? error.message : String(error),
+                error: error instanceof Error
+                    ? error.message
+                    : String(error),
             });
+
             throw error;
         }
     }

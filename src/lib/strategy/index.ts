@@ -22,6 +22,10 @@ import {
 } from './market/trendVolumeAnalysis';
 
 import {
+    classifyRegime,
+} from './regime/classifyRegime';
+
+import {
     computeScores,
 } from './scoring/computeScores';
 
@@ -53,6 +57,7 @@ const logger = createLogger('Strategy');
  *   • ML integration
  *   • Adaptive risk management
  *   • Signal cooldown per symbol
+ *   • Read-only market regime instrumentation
  */
 export class Strategy {
     // External dependencies
@@ -60,7 +65,7 @@ export class Strategy {
     private exchangeService: ExchangeService;
 
     // State
-    public lastAtr: number = 0;                               // Latest ATR (exposed for debugging)
+    public lastAtr: number = 0; // Latest ATR (exposed for debugging)
 
     /**
      * Constructor
@@ -79,23 +84,9 @@ export class Strategy {
      * Main entry point for generating a technical trading signal.
      *
      * IMPORTANT:
-     * This method intentionally preserves the execution order from the
-     * original Strategy.generateSignal() implementation.
-     *
-     * The extracted helpers receive exactly the values that the former private
-     * methods received through `this`.
-     *
-     * Key pipeline:
-     *
-     *   1. Compute indicators
-     *   2. Analyze trend and volume
-     *   3. Reject flat markets
-     *   4. Compute technical + ML scores
-     *   5. Check risk eligibility
-     *   6. Determine final signal direction
-     *   7. Calculate base risk levels
-     *   8. Log the result
-     *   9. Build the final TradeSignal
+     * Market regime classification is instrumentation only.
+     * It must not influence scoring, signal selection, confidence,
+     * risk parameters, or trade eligibility.
      */
     public async generateSignal(
         input: StrategyInput
@@ -112,24 +103,32 @@ export class Strategy {
         } = input;
 
         try {
-            // === 1. Compute all centralized indicators (EMA, VWMA, MACD, RSI, etc.) ===
-            // This is the foundation for all scoring.
+            // === 1. Compute all centralized indicators ===
             const indicators = computeIndicators(
                 primaryData,
                 htfData
             );
 
-            this.lastAtr = indicators.last.atr; // Exposed for debugging/monitoring
+            this.lastAtr = indicators.last.atr;
 
             // === 2. Early trend + volume analysis ===
-            // If no clear trending market (ADX + DI dominance), we immediately hold.
-            // This prevents signals in choppy/range-bound conditions.
             const trendAndVolume = analyzeTrendAndVolume(
                 primaryData,
                 indicators,
                 price
             );
 
+            // === 2.5. Market regime classification (READ ONLY) ===
+            // This result is collected for analysis only.
+            // It must not influence any scoring or trading decision.
+            const regimeClassification = classifyRegime(
+                indicators,
+                price,
+                trendAndVolume.trendBias,
+                trendAndVolume.isTrending
+            );
+
+            // === 3. Reject non-trending markets ===
             if (!trendAndVolume.isTrending) {
                 reasons.push(
                     'No trending market (weak ADX/DI) – holding'
@@ -148,11 +147,11 @@ export class Strategy {
                     mlConfidence: this.mlService.isReady()
                         ? 0
                         : undefined,
+                    regime: regimeClassification.regime,
                 });
             }
 
-            // === 3. Flat market filter (Bollinger Bandwidth) ===
-            // Avoid signals in extremely low-volatility/squeezed markets.
+            // === 4. Flat market filter (Bollinger Bandwidth) ===
             if (
                 indicators.last.bbBandwidth <
                 MIN_BB_BANDWIDTH_PCT
@@ -174,11 +173,12 @@ export class Strategy {
                     mlConfidence: this.mlService.isReady()
                         ? 0
                         : undefined,
+                    regime: regimeClassification.regime,
                 });
             }
 
-            // === 4. Technical scoring + ML prediction ===
-            // This returns buy/sell scores, feature vector, and ML confidence bonus.
+            // === 5. Technical scoring + ML prediction ===
+            // Regime is intentionally NOT passed here.
             const scoringResult = await computeScores(
                 indicators,
                 trendAndVolume,
@@ -191,40 +191,33 @@ export class Strategy {
             const buyScore = scoringResult.buyScore;
             const sellScore = scoringResult.sellScore;
             const features = scoringResult.features;
-            const mlConfidence = scoringResult.mlConfidence; // 0-1 probability from ML model
+            const mlConfidence = scoringResult.mlConfidence;
 
-            // === 5. Risk eligibility check ===
-            // Ensures ATR/volatility is in a sane range for scalping (not too quiet or explosive).
+            // === 6. Risk eligibility check ===
             const riskEligible = isRiskEligible(
                 price,
                 indicators.last.atr
             );
 
-            // === 6. Final signal decision (pure technical + ML) ===
-            // Uses the scored points, trend bias, and risk eligibility.
-            // No excursion influence here — this is the raw signal.
+            // === 7. Final signal decision ===
+            // Regime is intentionally NOT used here.
             const decision = determineSignal(
                 buyScore,
                 sellScore,
                 trendAndVolume.trendBias,
                 riskEligible,
-                reasons // reasons may be appended here (e.g., counter-trend penalty)
+                reasons
             );
 
-            let finalSignal = decision.signal; // 'buy' | 'sell' | 'hold' — may be demoted below
-            const finalConfidence = decision.confidence; // Normalized 0-100%
+            let finalSignal = decision.signal;
+            const finalConfidence = decision.confidence;
 
-            // Add a clear reason summarizing the raw score direction
             reasons.push(
                 `Raw technical direction: ${finalSignal.toUpperCase()} ` +
                 `(buy score ${buyScore.toFixed(0)}, sell score ${sellScore.toFixed(0)})`
             );
 
-            // === 7. Compute BASE risk parameters (unadjusted SL/TP) ===
-            // We ONLY compute these if we have a valid buy/sell signal.
-            // These base levels will be used for:
-            //   • Simulation (always realistic exits)
-            //   • AutoTradeService (starting point for any regime-based adjustments)
+            // === 8. Compute BASE risk parameters ===
             let stopLoss: number | undefined = undefined;
             let takeProfit: number | undefined = undefined;
             let trailingStopDistance: number | undefined = undefined;
@@ -245,9 +238,6 @@ export class Strategy {
                 );
 
                 if (!baseRiskParams.feasible) {
-                    // Demote to hold — a signal with no valid risk levels must not
-                    // be forwarded as buy/sell (previously this silently zeroed
-                    // SL/TP while keeping the signal direction — a latent bug).
                     finalSignal = 'hold';
 
                     reasons.push(
@@ -271,16 +261,27 @@ export class Strategy {
                 }
             }
 
-            // === 8. Logging (technical-only for clarity) ===
+            // === 9. Logging ===
             logger.info(
                 `Signal: ${finalSignal.toUpperCase()} ${symbol} @ ${price.toFixed(8)}`,
                 {
                     confidence: finalConfidence.toFixed(2),
                     buyScore: buyScore.toFixed(1),
                     sellScore: sellScore.toFixed(1),
+
+                    // Read-only regime instrumentation
+                    regime: regimeClassification.regime,
+                    regimeAdx:
+                        regimeClassification.adx.toFixed(2),
+                    regimeBbBandwidth:
+                        regimeClassification.bbBandwidth.toFixed(4),
+                    regimeAtrPct:
+                        regimeClassification.atrPct.toFixed(4),
+
                     mlConfidence: this.mlService.isReady()
                         ? mlConfidence.toFixed(3)
                         : 'N/A',
+
                     willTradeOrAlert:
                         finalSignal !== 'hold'
                             ? 'forwarded to AutoTradeService'
@@ -288,8 +289,7 @@ export class Strategy {
                 }
             );
 
-            // === 9. Return the pure technical TradeSignal ===
-            // SL/TP are base (unadjusted) — AutoTradeService may modify them later.
+            // === 10. Return the final TradeSignal ===
             return buildFinalSignal({
                 symbol,
                 signal: finalSignal,
@@ -306,6 +306,9 @@ export class Strategy {
                 mlPredictedLabel:
                     scoringResult.mlPredictedLabel,
                 tplevels,
+
+                // Attached for instrumentation only.
+                regime: regimeClassification.regime,
             });
         } catch (error) {
             logger.error(
@@ -325,6 +328,8 @@ export class Strategy {
                 }`
             );
 
+            // No regime is attached here because an error may have occurred
+            // before indicators/trend analysis/regime classification completed.
             return buildFinalSignal({
                 symbol,
                 signal: 'hold',

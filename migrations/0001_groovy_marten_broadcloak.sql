@@ -1,0 +1,1 @@
+ALTER TABLE `simulated_trades` ADD `regime` varchar(32);

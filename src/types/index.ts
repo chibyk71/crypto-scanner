@@ -5,6 +5,8 @@
 // Any change here cascades – keep it clean, stable, and heavily documented.
 // =============================================================================
 
+import type { MarketRegime } from "../lib/strategy/regime/types";
+
 /**
  * OHLCV data structure – represents historical candle data for a symbol
  * All arrays must be exactly the same length. Used by:
@@ -195,6 +197,14 @@ export interface TradeSignal {
 
     /** Max Adverse Excursion – worst unrealized drawdown */
     mae?: number;
+
+    /**
+     * Market regime classification at signal generation time.
+     *
+     * Instrumentation only — this does not influence scoring, confidence,
+     * signal selection, risk, or trade eligibility.
+     */
+    regime?: MarketRegime;
 }
 
 /**

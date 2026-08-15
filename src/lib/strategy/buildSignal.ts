@@ -5,6 +5,7 @@ import type {
     SignalLabel,
     TradeSignal,
 } from '../../types';
+import type { MarketRegime } from './regime/types';
 
 /**
  * Helper to build the final TradeSignal object consistently
@@ -17,6 +18,7 @@ import type {
  *     for use in simulation and as a starting point for AutoTradeService adjustments.
  *   • For 'hold' signals: all risk levels are undefined (no simulation or trade possible).
  *   • reasons array is preserved (technical explanations – very useful for final alert in AutoTradeService).
+ *   • regime is attached as read-only instrumentation and must not affect signal generation.
  */
 export function buildFinalSignal(params: {
     symbol: string;
@@ -31,6 +33,7 @@ export function buildFinalSignal(params: {
     mlConfidence?: number;
     tplevels?: PartialTPLevel[];
     mlPredictedLabel?: SignalLabel;
+    regime?: MarketRegime;
 }): TradeSignal {
     const {
         symbol,
@@ -42,7 +45,8 @@ export function buildFinalSignal(params: {
         takeProfit,
         trailingStopDistance,
         positionSizeMultiplier,
-        mlConfidence
+        mlConfidence,
+        regime,
     } = params;
 
     // Only attach risk levels if we have a valid buy/sell signal
@@ -52,6 +56,7 @@ export function buildFinalSignal(params: {
         symbol,
         signal,
         confidence,
+        regime,                       // Read-only instrumentation – must not affect scoring or trade eligibility
         reason: reasons,              // Array of technical reasons (will be shown in final alert)
         features,
         // Base (unadjusted) levels – AutoTradeService may modify them based on excursion regime

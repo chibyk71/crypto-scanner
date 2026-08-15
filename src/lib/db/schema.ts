@@ -1,6 +1,7 @@
 // src/lib/db/schema.ts
 import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, decimal, uniqueIndex } from 'drizzle-orm/mysql-core';
 import type { Condition } from '../../types';
+import type { MarketRegime } from '../strategy/regime/types';
 
 /**
  * =============================================================================
@@ -230,6 +231,14 @@ export const simulatedTrades = mysqlTable(
         /** Trade direction */
         side: varchar('side', { length: 10 }).$type<'buy' | 'sell'>().notNull(),
 
+        /**
+         * Market regime at signal/simulation entry.
+         *
+         * Nullable so existing rows and any non-classified simulations remain
+         * valid. Written once when the simulation is created.
+         */
+        regime: varchar('regime', { length: 32 }).$type<MarketRegime | null>(),
+
         /** Entry price ×1e8 (high precision) */
         entryPrice: float('entry_price').notNull(),
 
@@ -301,26 +310,22 @@ export const simulatedTrades = mysqlTable(
         wasTaken: boolean('was_taken').$default(() => false),
 
         /** ML model's predicted label at signal generation time (-2 to +2) */
-        mlPredictedLabel: int('ml_predicted_label'),  // ← ADD
+        mlPredictedLabel: int('ml_predicted_label'),
 
         /** ML model's combined positive confidence at signal time (0-1) */
-        mlPredictedConfidence: float('ml_predicted_confidence'),  // ← ADD
+        mlPredictedConfidence: float('ml_predicted_confidence'),
 
         // ─────────────────────────────────────────────────────────────
         // COUNTERFACTUAL TRAILING STOP TRACKING
-        // These fields record what the live/manual trailing stop WOULD
-        // have done during this simulation — they never affect the
-        // official outcome/label/pnl above. Used to compare, once enough
-        // data accumulates, whether trailing exits help or hurt vs
-        // holding to the full ATR-based TP/SL.
         // ─────────────────────────────────────────────────────────────
+
         /** Whether the trailing stop would have triggered during this sim */
         trailingTriggered: boolean('trailing_triggered').default(false),
 
         /** Price at which the trailing stop would have exited (if triggered) */
         trailingExitPrice: float('trailing_exit_price'),
 
-        /** PnL if exited via trailing stop, ×1e8 (same precision as `pnl`) */
+        /** PnL if exited via trailing stop, ×1e8 */
         trailingExitPnl: bigint('trailing_exit_pnl', { mode: 'number' }),
 
         /** Time from entry to the trailing-stop exit point (ms), if triggered */
@@ -330,13 +335,13 @@ export const simulatedTrades = mysqlTable(
         /** Fast lookup by signal UUID */
         signalIdIdx: index('idx_sim_signal_id').on(table.signalId),
 
-        /** Per-symbol queries (recent trades, regime stats) */
+        /** Per-symbol queries */
         symbolIdx: index('idx_sim_symbol').on(table.symbol),
 
-        /** Time-based filtering (recent simulations) */
+        /** Time-based filtering */
         openedAtIdx: index('idx_sim_opened').on(table.openedAt),
 
-        /** Outcome filtering (e.g. only timeouts or SLs) */
+        /** Outcome filtering */
         outcomeIdx: index('idx_sim_outcome').on(table.outcome),
 
         /** ML training filter + per-symbol label stats */
