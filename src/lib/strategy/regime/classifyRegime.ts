@@ -41,13 +41,8 @@ export function classifyRegime(
         ? (indicators.last.atr / price) * 100
         : 0;
 
-    // BB bandwidth is measured relative to the middle band, matching the
-    // percentage-based comparison used by MIN_BB_BANDWIDTH_PCT.
-    const bbMiddle = indicators.last.bbMiddle;
 
-    const bbBandwidth = bbMiddle > 0
-        ? ((indicators.last.bbUpper - indicators.last.bbLower) / bbMiddle) * 100
-        : 0;
+    const bbBandwidth = indicators.last.bbBandwidth;
 
     let regime: RegimeClassification['regime'];
 
