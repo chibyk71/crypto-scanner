@@ -75,4 +75,17 @@ export interface ScoresAndML {
     // Optional: the raw label predicted by the ML model at signal generation
     // time. This is retained for later comparison with the actual trade outcome.
     mlPredictedLabel?: SignalLabel;
+
+    /**
+     * Optional instrumentation: pre-ML technical evidence broken down by
+     * evidence category. Populated by computeScores; nothing downstream
+     * currently reads this field. Used to prepare for future regime-based
+     * weighting without changing current behaviour.
+     */
+    bucketBreakdown?: {
+        trend: { buy: number; sell: number };
+        momentum: { buy: number; sell: number };
+        volume: { buy: number; sell: number };
+        entry: { buy: number; sell: number };
+    };
 }

@@ -70,6 +70,9 @@ const logger = createLogger('Strategy');
  *   • Every point addition includes a clear reason string
  *   • Integrates ML prediction as final bonus
  *   • Safe numeric handling for potentially undefined indicator values
+ *   • Evidence is accumulated into four named buckets (trend / momentum /
+ *     volume / entry) then summed once before ML. This is instrumentation
+ *     only — no regime weighting is applied here.
  *
  * @param indicators - Centralized indicator results
  * @param trendAndVolume - Market regime from analyzeTrendAndVolume
@@ -85,34 +88,45 @@ export async function computeScores(
     mlService: MLService,
     exchangeService: ExchangeService
 ): Promise<ScoresAndML> {
-    let buyScore = 0;
-    let sellScore = 0;
+    // Evidence buckets — all technical points land here first.
+    // buyScore / sellScore are materialised from these immediately before ML.
+    let trendBuy = 0;
+    let trendSell = 0;
+    let momentumBuy = 0;
+    let momentumSell = 0;
+    let volumeBuy = 0;
+    let volumeSell = 0;
+    let entryBuy = 0;
+    let entrySell = 0;
 
     // -------------------- EMA ALIGNMENT --------------------
+    // bucket: trend
     if (
         input.price > indicators.last.emaShort &&
         indicators.last.emaShort > indicators.last.htfEmaMid
     ) {
-        buyScore += EMA_ALIGNMENT_POINTS;
+        trendBuy += EMA_ALIGNMENT_POINTS;
         reasons.push('Bullish EMA alignment: Price > EMA20 > HTF EMA50');
     } else if (
         input.price < indicators.last.emaShort &&
         indicators.last.emaShort < indicators.last.htfEmaMid
     ) {
-        sellScore += EMA_ALIGNMENT_POINTS;
+        trendSell += EMA_ALIGNMENT_POINTS;
         reasons.push('Bearish EMA alignment: Price < EMA20 < HTF EMA50');
     }
 
     // -------------------- VWMA vs VWAP --------------------
+    // bucket: trend
     if (indicators.last.vwma > indicators.last.vwap) {
-        buyScore += VWMA_VWAP_POINTS;
+        trendBuy += VWMA_VWAP_POINTS;
         reasons.push('Bullish VWMA > VWAP');
     } else if (indicators.last.vwma < indicators.last.vwap) {
-        sellScore += VWMA_VWAP_POINTS;
+        trendSell += VWMA_VWAP_POINTS;
         reasons.push('Bearish VWMA < VWAP');
     }
 
     // -------------------- MACD (tiered scoring) --------------------
+    // bucket: trend
     // Safe conversion – some indicator libs may return undefined
     const macdVal = Number(indicators.last.macdLine ?? 0);
     const macdSignalVal = Number(indicators.last.macdSignal ?? 0);
@@ -123,10 +137,10 @@ export async function computeScores(
         const histPositive = macdHistVal > 0;
 
         if (macdCrossUp && histPositive) {
-            buyScore += MACD_POINTS;
+            trendBuy += MACD_POINTS;
             reasons.push('Strong Bullish MACD: Crossover + Positive Histogram');
         } else if (macdCrossUp) {
-            buyScore += MACD_POINTS / 2;
+            trendBuy += MACD_POINTS / 2;
             reasons.push('Weak Bullish MACD: Crossover but Histogram not positive');
         }
 
@@ -134,47 +148,51 @@ export async function computeScores(
         const histNegative = macdHistVal < 0;
 
         if (macdCrossDown && histNegative) {
-            sellScore += MACD_POINTS;
+            trendSell += MACD_POINTS;
             reasons.push('Strong Bearish MACD: Crossover + Negative Histogram');
         } else if (macdCrossDown) {
-            sellScore += MACD_POINTS / 2;
+            trendSell += MACD_POINTS / 2;
             reasons.push('Weak Bearish MACD: Crossover but Histogram not negative');
         }
     }
 
     // -------------------- MACD ZERO-LINE TREND STRENGTH --------------------
+    // bucket: trend
     if (macdVal > 0) {
-        buyScore += MACD_ZERO_POINTS;
+        trendBuy += MACD_ZERO_POINTS;
         reasons.push('Bullish MACD above zero line');
     } else if (macdVal < 0) {
-        sellScore += MACD_ZERO_POINTS;
+        trendSell += MACD_ZERO_POINTS;
         reasons.push('Bearish MACD below zero line');
     }
 
     // -------------------- RSI --------------------
+    // bucket: momentum
     const rsi = indicators.last.rsi;
 
     if (rsi < 30) {
-        buyScore += RSI_POINTS;
+        momentumBuy += RSI_POINTS;
         reasons.push(`RSI oversold: ${rsi.toFixed(1)}`);
     } else if (rsi > 70) {
-        sellScore += RSI_POINTS;
+        momentumSell += RSI_POINTS;
         reasons.push(`RSI overbought: ${rsi.toFixed(1)}`);
     }
 
     // -------------------- STOCHASTIC --------------------
+    // bucket: momentum
     const stochK = indicators.last.stochasticK;
     const stochD = indicators.last.stochasticD;
 
     if (stochK < 20 && stochK > stochD) {
-        buyScore += STOCH_POINTS;
+        momentumBuy += STOCH_POINTS;
         reasons.push('Bullish Stochastic reversal from oversold');
     } else if (stochK > 80 && stochK < stochD) {
-        sellScore += STOCH_POINTS;
+        momentumSell += STOCH_POINTS;
         reasons.push('Bearish Stochastic reversal from overbought');
     }
 
     // -------------------- OBV + VWMA MOMENTUM --------------------
+    // bucket: momentum
     const obvRising =
         indicators.last.obv >
         (
@@ -183,28 +201,30 @@ export async function computeScores(
         );
 
     if (obvRising && input.price > indicators.last.vwma) {
-        buyScore += OBV_VWMA_POINTS;
+        momentumBuy += OBV_VWMA_POINTS;
         reasons.push('Bullish OBV rising with price above VWMA (momentum)');
     } else if (!obvRising && input.price < indicators.last.vwma) {
-        sellScore += OBV_VWMA_POINTS;
+        momentumSell += OBV_VWMA_POINTS;
         reasons.push('Bearish OBV falling with price below VWMA (momentum)');
     }
 
     // -------------------- LIQUIDITY SWEEP --------------------
+    // bucket: entry
     const lastLiquiditySweep =
         trendAndVolume.liquiditySweep[
         trendAndVolume.liquiditySweep.length - 1
         ];
 
     if (lastLiquiditySweep === 'bullish') {
-        buyScore += LIQUIDITY_SWEEP_POINTS;
+        entryBuy += LIQUIDITY_SWEEP_POINTS;
         reasons.push('Bullish liquidity sweep: swept low then reclaimed');
     } else if (lastLiquiditySweep === 'bearish') {
-        sellScore += LIQUIDITY_SWEEP_POINTS;
+        entrySell += LIQUIDITY_SWEEP_POINTS;
         reasons.push('Bearish liquidity sweep: swept high then rejected');
     }
 
     // -------------------- VWAP MEAN-REVERSION --------------------
+    // bucket: momentum
     // Additive to the vwma>vwap trend-following logic above, not a replacement.
     // When price has stretched far from VWAP (in ATR terms) AND momentum/OBV
     // isn't confirming continuation in that direction, bet on reversion back to VWAP.
@@ -222,7 +242,7 @@ export async function computeScores(
                 momentum > 0 && obvRising;
 
             if (!continuationConfirmed) {
-                sellScore += VWAP_REVERSION_POINTS;
+                momentumSell += VWAP_REVERSION_POINTS;
 
                 reasons.push(
                     `VWAP mean-reversion: price ${vwapDeviationAtr.toFixed(2)}x ATR above VWAP, ` +
@@ -239,7 +259,7 @@ export async function computeScores(
                 momentum < 0 && !obvRising;
 
             if (!continuationConfirmed) {
-                buyScore += VWAP_REVERSION_POINTS;
+                momentumBuy += VWAP_REVERSION_POINTS;
 
                 reasons.push(
                     `VWAP mean-reversion: price ${Math.abs(vwapDeviationAtr).toFixed(2)}x ATR below VWAP, ` +
@@ -250,6 +270,7 @@ export async function computeScores(
     }
 
     // -------------------- ATR VOLATILITY RANGE --------------------
+    // Not assigned to a bucket — does not add to any score (reasons only).
     const atrPct =
         (indicators.last.atr / input.price) * 100;
 
@@ -277,20 +298,22 @@ export async function computeScores(
     }
 
     // -------------------- VWMA SLOPE --------------------
+    // bucket: trend
     if (!trendAndVolume.vwmaFalling) {
-        buyScore += VWMA_SLOPE_POINTS;
+        trendBuy += VWMA_SLOPE_POINTS;
         reasons.push('Bullish VWMA slope');
     } else {
-        sellScore += VWMA_SLOPE_POINTS;
+        trendSell += VWMA_SLOPE_POINTS;
         reasons.push('Bearish VWMA slope');
     }
 
     // -------------------- ADX TREND STRENGTH --------------------
+    // bucket: trend
     if (trendAndVolume.isTrending) {
         if (trendAndVolume.trendBias === 'bullish') {
-            buyScore += ADX_POINTS;
+            trendBuy += ADX_POINTS;
         } else if (trendAndVolume.trendBias === 'bearish') {
-            sellScore += ADX_POINTS;
+            trendSell += ADX_POINTS;
         }
 
         reasons.unshift(
@@ -299,6 +322,7 @@ export async function computeScores(
     }
 
     // -------------------- ENGULFING PATTERN --------------------
+    // bucket: entry
     // Recency-gated: full points only if the volume-confirmed engulfing candle
     // "just ignited" (within MOMENTUM_IGNITION_LOOKBACK candles). Decays with age
     // so a pattern that already moved 1-2 candles ago doesn't get treated the
@@ -329,13 +353,13 @@ export async function computeScores(
                 : `${ignitionTrigger.offset} candle${ignitionTrigger.offset === 1 ? '' : 's'} ago`;
 
         if (ignitionTrigger.type === 'bullish') {
-            buyScore += pts;
+            entryBuy += pts;
 
             reasons.push(
                 `Bullish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
             );
         } else {
-            sellScore += pts;
+            entrySell += pts;
 
             reasons.push(
                 `Bearish Engulfing + volume surge ignited ${ageLabel} → ${pts.toFixed(1)}pts (${(decay * 100).toFixed(0)}%)`
@@ -344,21 +368,22 @@ export async function computeScores(
     }
 
     // -------------------- PERCENT_B POSITION --------------------
+    // bucket: entry
     const percentB =
         indicators.last.percentB ?? 0.5;
 
     if (percentB < 0.4) {
         // Price in lower third of BB — good entry zone for buys
-        buyScore += PERCENT_B_POINTS;
-        sellScore -= PERCENT_B_POINTS;  // penalty: selling at a low is risky
+        entryBuy += PERCENT_B_POINTS;
+        entrySell -= PERCENT_B_POINTS;  // penalty: selling at a low is risky
 
         reasons.push(
             `Bullish BB position: percent_b=${percentB.toFixed(3)} (lower zone)`
         );
     } else if (percentB > 0.7) {
         // Price in upper third of BB — good entry zone for sells
-        sellScore += PERCENT_B_POINTS;
-        buyScore -= PERCENT_B_POINTS;  // penalty: buying near the top is risky
+        entrySell += PERCENT_B_POINTS;
+        entryBuy -= PERCENT_B_POINTS;  // penalty: buying near the top is risky
 
         reasons.push(
             `Bearish BB position: percent_b=${percentB.toFixed(3)} (upper zone)`
@@ -367,13 +392,14 @@ export async function computeScores(
     // percent_b 0.4–0.7 is neutral — no points awarded either way
 
     // -------------------- PERCENT_B + ENGULFING COMBO BONUS --------------------
+    // bucket: entry
     // 22% of good trades had both percent_b < 0.5 AND an engulfing signal
     // vs only 14% of bad trades — a meaningful combination worth a small bonus.
     if (
         lastPattern === 'bullish' &&
         percentB < 0.5
     ) {
-        buyScore += PERCENT_B_COMBO_POINTS;
+        entryBuy += PERCENT_B_COMBO_POINTS;
         reasons.push(
             `BB+Engulfing combo: bullish engulfing in lower BB half`
         );
@@ -381,13 +407,14 @@ export async function computeScores(
         lastPattern === 'bearish' &&
         percentB > 0.5
     ) {
-        sellScore += PERCENT_B_COMBO_POINTS;
+        entrySell += PERCENT_B_COMBO_POINTS;
         reasons.push(
             `BB+Engulfing combo: bearish engulfing in upper BB half`
         );
     }
 
     // -------------------- BB SQUEEZE → BREAKOUT --------------------
+    // bucket: entry
     const squeezeBreakout =
         detectBbSqueezeBreakout(
             indicators,
@@ -395,13 +422,13 @@ export async function computeScores(
         );
 
     if (squeezeBreakout === 'bullish') {
-        buyScore += BB_SQUEEZE_BREAKOUT_POINTS;
+        entryBuy += BB_SQUEEZE_BREAKOUT_POINTS;
 
         reasons.push(
             `Bullish BB squeeze breakout: bandwidth expanded from squeeze, close broke above prior upper band`
         );
     } else if (squeezeBreakout === 'bearish') {
-        sellScore += BB_SQUEEZE_BREAKOUT_POINTS;
+        entrySell += BB_SQUEEZE_BREAKOUT_POINTS;
 
         reasons.push(
             `Bearish BB squeeze breakout: bandwidth expanded from squeeze, close broke below prior lower band`
@@ -409,12 +436,20 @@ export async function computeScores(
     }
 
     // -------------------- ORDER BOOK IMBALANCE (gated, lazy fetch) --------------------
+    // bucket: volume
     // Only fetch the order book when the leading side is already close to
     // CONFIDENCE_THRESHOLD — avoids a REST call for symbols nowhere near a signal.
     // Cached with a short TTL in ExchangeService so repeated calls within the same
     // scan cycle (e.g. AutoTradeService re-checking) don't refetch.
+    //
+    // Gate uses the sum of all buckets accumulated so far (volume is still 0 here),
+    // matching the pre-bucket behaviour of Math.max(buyScore, sellScore).
+    const buyScoreSoFar =
+        trendBuy + momentumBuy + volumeBuy + entryBuy;
+    const sellScoreSoFar =
+        trendSell + momentumSell + volumeSell + entrySell;
     const leadingScore =
-        Math.max(buyScore, sellScore);
+        Math.max(buyScoreSoFar, sellScoreSoFar);
 
     if (
         leadingScore >=
@@ -446,13 +481,13 @@ export async function computeScores(
                     );
 
                 if (book.imbalance > 0) {
-                    buyScore += scaledPts;
+                    volumeBuy += scaledPts;
 
                     reasons.push(
                         `Order book bid-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
                     );
                 } else {
-                    sellScore += scaledPts;
+                    volumeSell += scaledPts;
 
                     reasons.push(
                         `Order book ask-heavy: imbalance ${book.imbalance.toFixed(3)} → +${scaledPts.toFixed(1)}pts`
@@ -477,6 +512,25 @@ export async function computeScores(
             // Fail-open: no points, no crash — order book is a bonus signal, not a gate
         }
     }
+
+    // =========================================================================
+    // MATERIALISE TOTALS FROM BUCKETS (pre-ML)
+    // =========================================================================
+    // Sum buckets into buyScore / sellScore exactly as the unbucketed code would
+    // have accumulated them. Everything from the ML block onward is unchanged.
+    let buyScore =
+        trendBuy + momentumBuy + volumeBuy + entryBuy;
+    let sellScore =
+        trendSell + momentumSell + volumeSell + entrySell;
+
+    // Snapshot of pure technical evidence (before ML bonus/penalty or tie-break).
+    // Instrumentation only — nothing downstream currently reads this field.
+    const bucketBreakdown = {
+        trend: { buy: trendBuy, sell: trendSell },
+        momentum: { buy: momentumBuy, sell: momentumSell },
+        volume: { buy: volumeBuy, sell: volumeSell },
+        entry: { buy: entryBuy, sell: entrySell },
+    };
 
     // -------------------- ML PREDICTION INTEGRATION --------------------
     const features =
@@ -724,5 +778,6 @@ export async function computeScores(
             mlService.isReady()
                 ? predictedLabel
                 : undefined,
+        bucketBreakdown,
     };
 }
