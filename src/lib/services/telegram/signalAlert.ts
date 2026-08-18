@@ -6,11 +6,10 @@ import type { TradeSignal } from '../../../types';
 import { createLogger } from '../../logger';
 import { excursionCache } from '../excursionHistoryCache';
 import type { TelegramContext } from './context';
-import { escape, formatPercent, formatR } from './utils/markdown';
 
 const logger = createLogger('TelegramBot');
 
-export async function sendSignalAlert(ctx: TelegramContext, 
+export async function sendSignalAlert(ctx: TelegramContext,
     symbol: string,
     signal: TradeSignal,
     price: number,

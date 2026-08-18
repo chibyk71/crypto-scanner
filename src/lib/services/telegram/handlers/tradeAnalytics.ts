@@ -13,7 +13,7 @@ const logger = createLogger('TelegramBot');
 
 export async function handleTakenStats(ctx: TelegramContext, msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
     // Early authorization check
-    if (msg.chat.id.toString() !== this.authorizedChatId) {
+    if (msg.chat.id.toString() !== ctx.authorizedChatId) {
         return;
     }
 
@@ -95,12 +95,12 @@ export async function handleTakenStats(ctx: TelegramContext, msg: TelegramBot.Me
  * Reloads the ONNX model from disk without restarting the bot.
  * Use after uploading a new model.onnx to the server.
  */
-export async function handleTakenSymbols(ctx: TelegramContext, 
+export async function handleTakenSymbols(ctx: TelegramContext,
     msg: TelegramBot.Message,
     match: RegExpExecArray | null
 ): Promise<void> {
     // Security: only respond to authorized user
-    if (msg.chat.id.toString() !== this.authorizedChatId) {
+    if (msg.chat.id.toString() !== ctx.authorizedChatId) {
         return;
     }
 
@@ -192,7 +192,7 @@ export async function handleTakenSymbols(ctx: TelegramContext,
  */
 export async function handleTakenVsAll(ctx: TelegramContext, msg: TelegramBot.Message): Promise<void> {
     // Early exit if not authorized user
-    if (msg.chat.id.toString() !== this.authorizedChatId) {
+    if (msg.chat.id.toString() !== ctx.authorizedChatId) {
         return;
     }
 

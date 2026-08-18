@@ -8,7 +8,6 @@ import { dbService } from '../../../db';
 import { createLogger } from '../../../logger';
 import type { Condition } from '../../../../types';
 import type { TelegramContext } from '../context';
-import type { AlertState } from '../types';
 import {
     sendSymbolSelection,
     sendTimeframeSelection,
@@ -64,6 +63,7 @@ export async function handleMessage(ctx: TelegramContext, msg: TelegramBot.Messa
             ctx.updateUserState(chatId, state);
 
             await sendOperatorSelection(
+                ctx,
                 chatId,
                 state.temp?.indicator as Condition['indicator']
             );
@@ -116,7 +116,7 @@ export async function handleMessage(ctx: TelegramContext, msg: TelegramBot.Messa
             state.step = 'conditions_menu';
             ctx.updateUserState(chatId, state);
 
-            await sendConditionsMenu(chatId, state.data);
+            await sendConditionsMenu(ctx, chatId, state.data);
             return;
         }
 
@@ -184,20 +184,20 @@ export async function handleCallbackQuery(ctx: TelegramContext, query: TelegramB
         if (data.startsWith('alert_select_symbol:')) {
             state.data.symbol = data.split(':')[1];
             state.step = 'select_timeframe';
-            await sendTimeframeSelection(chatId);
+            await sendTimeframeSelection(ctx, chatId);
 
         } else if (data.startsWith('alert_next_symbols:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendSymbolSelection(chatId, state.page);
+            await sendSymbolSelection(ctx, chatId, state.page);
 
         } else if (data.startsWith('alert_select_timeframe:')) {
             state.data.timeframe = data.split(':')[1];
             state.step = 'conditions_menu';
-            await sendConditionsMenu(chatId, state.data);
+            await sendConditionsMenu(ctx, chatId, state.data);
 
         } else if (data === 'alert_add_condition') {
             state.step = 'select_indicator';
-            await sendIndicatorSelection(chatId);
+            await sendIndicatorSelection(ctx, chatId);
 
         } else if (data.startsWith('alert_select_indicator:')) {
             const indicator = data.split(':')[1] as Condition['indicator'];
@@ -213,7 +213,7 @@ export async function handleCallbackQuery(ctx: TelegramContext, query: TelegramB
                     { parse_mode: 'Markdown' }
                 );
             } else {
-                await sendOperatorSelection(chatId, indicator);
+                await sendOperatorSelection(ctx, chatId, indicator);
             }
 
         } else if (data.startsWith('alert_select_operator:')) {
@@ -238,7 +238,7 @@ export async function handleCallbackQuery(ctx: TelegramContext, query: TelegramB
             if (state.data.conditions.length > 0) {
                 state.data.conditions.pop();
             }
-            await sendConditionsMenu(chatId, state.data);
+            await sendConditionsMenu(ctx, chatId, state.data);
 
         } else if (data === 'alert_save') {
             if (!state.data.symbol || !state.data.timeframe || state.data.conditions.length === 0) {
@@ -286,7 +286,7 @@ export async function handleCallbackQuery(ctx: TelegramContext, query: TelegramB
                 conditions: alert.conditions,
             };
             state.step = 'conditions_menu';
-            await sendConditionsMenu(chatId, state.data);
+            await sendConditionsMenu(ctx, chatId, state.data);
 
         } else if (data.startsWith('alert_delete_confirm:')) {
             const alertId = data.split(':')[1];
@@ -310,23 +310,23 @@ export async function handleCallbackQuery(ctx: TelegramContext, query: TelegramB
             // =================================================================
         } else if (data.startsWith('alerts_page:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendAlertsList(chatId, state.page);
+            await sendAlertsList(ctx, chatId, state.page);
 
         } else if (data.startsWith('edit_alerts_page:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendEditAlertSelection(chatId, state.page);
+            await sendEditAlertSelection(ctx, chatId, state.page);
 
         } else if (data.startsWith('delete_alerts_page:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendDeleteAlertSelection(chatId, state.page);
+            await sendDeleteAlertSelection(ctx, chatId, state.page);
 
         } else if (data.startsWith('positions_page:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendPositionsList(chatId, state.page);
+            await sendPositionsList(ctx, chatId, state.page);
 
         } else if (data.startsWith('trades_page:')) {
             state.page = parseInt(data.split(':')[1], 10);
-            await sendTradesList(chatId, state.page);
+            await sendTradesList(ctx, chatId, state.page);
         }
 
         // Always acknowledge the callback

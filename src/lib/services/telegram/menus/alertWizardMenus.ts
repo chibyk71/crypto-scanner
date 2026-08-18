@@ -5,7 +5,7 @@
 import type TelegramBot from 'node-telegram-bot-api';
 import type { Condition } from '../../../../types';
 import type { TelegramContext } from '../context';
-import { PAGE_SIZE } from '../types';
+import { PAGE_SIZE, type AlertState } from '../types';
 import { createLogger } from '../../../logger';
 
 const logger = createLogger('TelegramBot');

@@ -6,7 +6,6 @@ import type TelegramBot from 'node-telegram-bot-api';
 import { dbService } from '../../../db';
 import { createLogger } from '../../../logger';
 import type { TelegramContext } from '../context';
-import { escape, formatPercent, formatR } from '../utils/markdown';
 
 const logger = createLogger('TelegramBot');
 
