@@ -111,7 +111,7 @@ export interface ExcursionScore {
 // CONSTANTS
 // =============================================================================
 const MAX_SIMS = 10; // Maximum number of recent sims to consider
-const MIN_SIDE_SAMPLES = 3; // Minimum samples required before trusting either side
+const MIN_SIDE_SAMPLES = 2; // Minimum samples required before trusting either side
 
 /**
  * Analyze recent regime and return actionable advice + adjustments

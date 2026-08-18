@@ -154,7 +154,7 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Confidence & Filters
     // ──────────────────────────────────────────────────────────────
-    CONFIDENCE_THRESHOLD: z.coerce.number().min(20).max(100).default(23), // Minimum confidence score to consider a signal valid
+    CONFIDENCE_THRESHOLD: z.coerce.number().min(20).max(100).default(35), // Minimum confidence score to consider a signal valid
     MIN_ADX_TREND: z.coerce.number().default(20),
     MIN_DI_DIFF_TREND: z.coerce.number().default(15),
     MIN_ATR_PCT: z.coerce.number().default(0.12),

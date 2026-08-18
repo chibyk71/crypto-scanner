@@ -22,7 +22,6 @@
 
 import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
-import { and, eq, gte, isNull, not, sql, count, desc, isNotNull } from 'drizzle-orm';
 
 // Import all table definitions and TypeScript types from schema
 import {
@@ -41,45 +40,23 @@ import {
 
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
-import type { SimulationHistoryEntry } from '../../types/signalHistory';
 import type { PartialTPLevel } from '../../types';
 import type { MarketRegime } from '../strategy/regime/types';
 
+// Re-export types for consumers
+export type { EnrichedSymbolHistory } from './types';
+
+// Domain repositories (extracted from the former god file)
+import * as alertsRepo from './repositories/alerts';
+import * as tradesRepo from './repositories/trades';
+import * as locksRepo from './repositories/locks';
+import * as cooldownRepo from './repositories/cooldown';
+import * as simWrite from './repositories/simulations/writePath';
+import * as simRead from './repositories/simulations/readPath';
+import * as simAnalytics from './repositories/simulations/analytics';
+
 // Dedicated logger for database operations
 const logger = createLogger('db');
-
-// ===========================================================================
-// ENRICHED SYMBOL HISTORY TYPE
-// ===========================================================================
-// Replace the old EnrichedSymbolHistory with this
-export interface EnrichedSymbolHistory {
-    symbol: string;
-    historyJson: SimulationHistoryEntry[];
-
-    // Recent-only aggregates (last ~3 hours)
-    recentAvgR: number;
-    recentWinRate: number;
-    recentReverseCount: number;
-    recentMae: number;           // negative or zero
-    recentMfe: number;           // positive
-    recentExcursionRatio: number;
-    recentSampleCount: number;
-
-    // Recent directional
-    recentMfeLong: number;
-    recentMaeLong: number;
-    recentWinRateLong: number;
-    recentReverseCountLong: number;
-    recentSampleCountLong: number;
-
-    recentMfeShort: number;
-    recentMaeShort: number;
-    recentWinRateShort: number;
-    recentReverseCountShort: number;
-    recentSampleCountShort: number;
-
-    updatedAt: Date;
-}
 
 // ===========================================================================
 // FATAL CONFIG VALIDATION – Fail fast if DB URL is missing
@@ -251,606 +228,88 @@ class DatabaseService {
     }
 
     // =========================================================================
-    // ALERT MANAGEMENT: Fetch active user-defined alerts
+    // ALERT MANAGEMENT (delegated to repositories/alerts.ts)
     // =========================================================================
-    /**
-     * Retrieves all currently active custom alerts from the database.
-     *
-     * Used by:
-     *   • MarketScanner – to evaluate user-defined conditions every scan cycle
-     *   • TelegramBot – to list alerts via /alerts command
-     *
-     * Important detail:
-     *   • JSON conditions are stored as strings in MySQL → must be parsed back to objects
-     *   • Drizzle returns raw rows, so we normalize the `conditions` field here
-     *
-     * @returns Array of Alert objects with properly parsed conditions
-     */
     public async getActiveAlerts(): Promise<Alert[]> {
-        // Query only alerts with status = 'active'
-        const rows = await this.db
-            .select()
-            .from(alert)
-            .where(eq(alert.status, 'active'))
-            .execute();
-
-        // Normalize: parse JSON string back into object if needed
-        return rows.map(a => ({
-            ...a,
-            conditions: typeof a.conditions === 'string' ? JSON.parse(a.conditions) : a.conditions,
-        }));
+        return alertsRepo.getActiveAlerts(this.db);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Create a new custom alert
-    // =========================================================================
-    /**
-     * Inserts a new user-defined alert into the database.
-     *
-     * Called from:
-     *   • TelegramBotController – when user completes /create_alert flow
-     *
-     * Behavior:
-     *   • Inserts full alert data (symbol, timeframe, conditions, status)
-     *   • Returns the auto-generated alert ID for confirmation
-     *   • Logs creation for debugging/audit
-     *
-     * @param alertData - Full alert data (symbol, timeframe, conditions array)
-     * @returns Inserted alert's database ID
-     */
     public async createAlert(alertData: NewAlert): Promise<number> {
-        // Drizzle insert returns result with insertId
-        const [result] = await this.db.insert(alert).values(alertData).execute();
-
-        // Log for traceability (who created what)
-        logger.debug('Created new alert', { id: result.insertId, symbol: alertData.symbol });
-
-        // Return ID so caller can confirm success
-        return result.insertId;
+        return alertsRepo.createAlert(this.db, alertData);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Fetch active alerts for a specific symbol
-    // =========================================================================
-    /**
-     * Gets all active alerts for a given trading symbol.
-     *
-     * Used by:
-     *   • AlertEvaluatorService – to check only relevant alerts per symbol
-     *   • TelegramBot – for symbol-specific alert listing
-     *
-     * Filters:
-     *   • status = 'active'
-     *   • matches exact symbol
-     *
-     * Same JSON parsing normalization as getActiveAlerts()
-     *
-     * @param symbol - Trading pair (e.g., 'BTC/USDT')
-     * @returns Array of matching active alerts
-     */
     public async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
-        // Query with combined conditions: symbol match AND active status
-        const alerts = await this.db
-            .select()
-            .from(alert)
-            .where(and(eq(alert.symbol, symbol), eq(alert.status, 'active')))
-            .execute();
-
-        // Parse stored JSON conditions back to objects
-        return alerts.map(a => ({
-            ...a,
-            conditions: typeof a.conditions === 'string' ? JSON.parse(a.conditions) : a.conditions,
-        }));
+        return alertsRepo.getAlertsBySymbol(this.db, symbol);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Fetch a single alert by its database ID
-    // =========================================================================
-    /**
-     * Retrieves a specific alert by its primary key (ID).
-     *
-     * Used by:
-     *   • TelegramBotController – when editing or deleting an alert
-     *   • AlertEvaluatorService – potentially for detailed logging
-     *
-     * Behavior:
-     *   • Returns the full Alert object if found
-     *   • Returns undefined if no alert with that ID exists
-     *   • Normalizes the `conditions` field (parses JSON string if needed)
-     *
-     * @param id - Database primary key of the alert
-     * @returns Alert object or undefined
-     */
     public async getAlertsById(id: number): Promise<Alert | undefined> {
-        // Query single row by ID
-        const result = await this.db.select().from(alert).where(eq(alert.id, id)).execute();
-
-        // No matching alert found
-        if (result.length === 0) return undefined;
-
-        // Extract the first (and only) row
-        const a = result[0];
-
-        // Parse stored JSON conditions back to object (MySQL stores JSON as string)
-        return {
-            ...a,
-            conditions: typeof a.conditions === 'string' ? JSON.parse(a.conditions) : a.conditions,
-        };
+        return alertsRepo.getAlertsById(this.db, id);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Update an existing alert (partial update)
-    // =========================================================================
-    /**
-     * Updates one or more fields of an existing alert.
-     *
-     * Called from:
-     *   • TelegramBotController – during /edit_alert flow
-     *
-     * Key details:
-     *   • Uses Partial<NewAlert> → only provided fields are updated
-     *   • Special handling for `conditions`: if provided, it's serialized to JSON by Drizzle
-     *   • If conditions are omitted, we explicitly set undefined to avoid overwriting with null
-     *   • Returns true if any row was affected (success), false otherwise
-     *
-     * @param id - Alert ID to update
-     * @param alertData - Fields to update (symbol, timeframe, conditions, etc.)
-     * @returns true if update affected a row
-     */
     public async updateAlert(id: number, alertData: Partial<NewAlert>): Promise<boolean> {
-        // Build update set – explicitly exclude conditions from spread if not provided
-        // This prevents accidentally wiping conditions when only updating symbol/timeframe
-        const result = await this.db
-            .update(alert)
-            .set({
-                ...alertData,
-                conditions: alertData.conditions ? alertData.conditions : undefined
-            })
-            .where(eq(alert.id, id))
-            .execute();
-
-        // affectedRows > 0 means the alert existed and was updated
-        return result[0].affectedRows > 0;
+        return alertsRepo.updateAlert(this.db, id, alertData);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Change alert status (triggered / canceled)
-    // =========================================================================
-    /**
-     * Updates only the status field of an alert.
-     *
-     * Used by:
-     *   • AlertEvaluatorService – when an alert fires (set to 'triggered')
-     *   • TelegramBot – for manual cancellation
-     *
-     * Why separate method?
-     *   • More efficient than full update
-     *   • Clear intent in code and logs
-     *
-     * @param id - Alert ID
-     * @param status - New status: 'triggered' or 'canceled'
-     * @returns true if update succeeded
-     */
     public async updateAlertStatus(id: number, status: 'triggered' | 'canceled'): Promise<boolean> {
-        const result = await this.db
-            .update(alert)
-            .set({ status })
-            .where(eq(alert.id, id))
-            .execute();
-
-        return result[0].affectedRows > 0;
+        return alertsRepo.updateAlertStatus(this.db, id, status);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Record when an alert last triggered
-    // =========================================================================
-    /**
-     * Updates the `lastAlertAt` timestamp for cooldown/throttling.
-     *
-     * Purpose:
-     *   • Prevents spam when same condition triggers repeatedly
-     *   • Used in MarketScanner.checkCustomAlerts() to enforce minimum delay
-     *
-     * Called after:
-     *   • Successful alert trigger and Telegram notification
-     *
-     * @param id - Alert ID
-     * @param timestamp - Unix millisecond timestamp of trigger
-     */
     public async setLastAlertTime(id: number, timestamp: number): Promise<void> {
-        // Simple update – no return value needed (void)
-        await this.db
-            .update(alert)
-            .set({ lastAlertAt: timestamp })
-            .where(eq(alert.id, id))
-            .execute();
+        return alertsRepo.setLastAlertTime(this.db, id, timestamp);
     }
 
-    // =========================================================================
-    // ALERT MANAGEMENT: Permanently delete an alert
-    // =========================================================================
-    /**
-     * Deletes a custom alert from the database by its ID.
-     *
-     * Used by:
-     *   • TelegramBotController – when user confirms /delete_alert
-     *
-     * Behavior:
-     *   • Performs a hard delete (removes row completely)
-     *   • Returns true if a row was actually deleted (success)
-     *   • Returns false if no alert with that ID existed
-     *
-     * Note:
-     *   • No soft-delete (status = 'deleted') – keeps DB clean
-     *   • Caller should confirm with user before calling this
-     *
-     * @param id - Database ID of the alert to delete
-     * @returns true if deletion succeeded (row existed)
-     */
     public async deleteAlert(id: number): Promise<boolean> {
-        // Execute DELETE query – Drizzle returns affected row info
-        const result = await this.db.delete(alert).where(eq(alert.id, id)).execute();
-
-        // affectedRows > 0 means the alert existed and was removed
-        return result[0].affectedRows > 0;
+        return alertsRepo.deleteAlert(this.db, id);
     }
 
     // =========================================================================
-    // TRADE LOGGING: Record executed live/paper trades
+    // TRADE LOGGING (delegated to repositories/trades.ts)
     // =========================================================================
-    /**
-     * Logs a completed trade (live or paper) to the database.
-     *
-     * Called from:
-     *   • MarketScanner (paper trades via simulation)
-     *   • AutoTradeService (real live trades)
-     *
-     * Purpose:
-     *   • Permanent audit trail
-     *   • Performance analytics (/ml_performance)
-     *   • Future backtesting or tax reporting
-     *
-     * Stored with high precision (amount & price ×1e8)
-     *
-     * @param tradeData - Full trade details (symbol, side, amount, price, timestamp, mode, orderId)
-     * @returns Database ID of the inserted trade row
-     */
     public async logTrade(tradeData: NewTrade): Promise<number> {
-        // Insert single row and get result
-        const [inserted] = await this.db.insert(trades).values(tradeData).execute();
-
-        // Log for debugging and audit trail
-        logger.debug(`Logged trade for ${tradeData.symbol}`, { id: inserted.insertId });
-
-        // Return ID for potential future reference (e.g., linking to alerts)
-        return inserted.insertId;
+        return tradesRepo.logTrade(this.db, tradeData);
     }
 
     // =========================================================================
-    // WORKER LOCKING: Check if another bot instance is running
+    // WORKER LOCKING & HEARTBEAT (delegated to repositories/locks.ts)
     // =========================================================================
-    /**
-     * Checks whether the singleton lock row indicates the bot is currently running.
-     *
-     * Used by:
-     *   • Worker startup – to prevent duplicate instances
-     *   • /status command – to show lock state
-     *
-     * Design:
-     *   • Single row table with fixed id=1
-     *   • isLocked = true → another instance holds the lock
-     *   • Returns false if row doesn't exist yet (first run)
-     *
-     * @returns true if locked (bot running), false if free
-     */
     public async getLock(): Promise<boolean> {
-        // Query the singleton lock row
-        const [row] = await this.db
-            .select({ isLocked: locks.isLocked })
-            .from(locks)
-            .where(eq(locks.id, 1))
-            .execute();
-
-        // If no row exists yet → treat as unlocked
-        // Otherwise return the actual flag
-        return row?.isLocked ?? false;
+        return locksRepo.getLock(this.db);
     }
 
-    // =========================================================================
-    // WORKER LOCKING: Acquire or release the singleton lock
-    // =========================================================================
-    /**
-     * Sets the global bot lock state (acquire or release).
-     *
-     * Used by:
-     *   • Worker startup – set to true
-     *   • Graceful shutdown (/stopbot) – set to false
-     *
-     * Implementation:
-     *   • UPSERT pattern via onDuplicateKeyUpdate
-     *   • Ensures only one row (id=1) ever exists
-     *   • Atomic – safe even if multiple instances race
-     *
-     * @param isLocked - true to acquire lock, false to release
-     */
     public async setLock(isLocked: boolean): Promise<void> {
-        // Insert or update the singleton row
-        // onDuplicateKeyUpdate handles both cases atomically
-        await this.db
-            .insert(locks)
-            .values({ id: 1, isLocked })
-            .onDuplicateKeyUpdate({ set: { isLocked } })
-            .execute();
+        return locksRepo.setLock(this.db, isLocked);
     }
 
-    // =========================================================================
-    // HEARTBEAT: Get current scan cycle count
-    // =========================================================================
-    /**
-     * Retrieves the current heartbeat cycle count from the singleton heartbeat row.
-     *
-     * Purpose:
-     *   • Tracks how many scan cycles the bot has completed
-     *   • Used for Telegram heartbeat messages (every N cycles)
-     *   • Provides monitoring insight (/status command)
-     *
-     * Behavior:
-     *   • Singleton table with fixed id=1
-     *   • If row doesn't exist (first run), creates it with count=0
-     *   • Returns the current count (0 if new)
-     *
-     * @returns Current cycle count
-     */
     public async getHeartbeatCount(): Promise<number> {
-        // Query the singleton heartbeat row
-        const result = await this.db.select().from(heartbeat).where(eq(heartbeat.id, 1)).execute();
-
-        // First-time setup: row doesn't exist yet
-        if (result.length === 0) {
-            // Create initial row with zeros using UPSERT pattern
-            await this.db
-                .insert(heartbeat)
-                .values({ id: 1, cycleCount: 0, lastHeartbeatAt: 0 })
-                .onDuplicateKeyUpdate({ set: { cycleCount: 0, lastHeartbeatAt: 0 } })
-                .execute();
-            return 0;
-        }
-
-        // Return existing count
-        return result[0].cycleCount;
+        return locksRepo.getHeartbeatCount(this.db);
     }
 
-    // =========================================================================
-    // HEARTBEAT: Increment cycle count and update timestamp
-    // =========================================================================
-    /**
-     * Increments the global scan cycle counter and updates last heartbeat time.
-     *
-     * Called by:
-     *   • MarketScanner at the start of every full scan cycle
-     *
-     * Why this design?
-     *   • Atomic increment via UPSERT → safe even if multiple workers race
-     *   • Stores both count and timestamp for monitoring
-     *   • Enables heartbeat messages and uptime calculation
-     *
-     * @returns The new (incremented) cycle count
-     */
     public async incrementHeartbeatCount(): Promise<number> {
-        // Read current value (if any)
-        const [current] = await this.db
-            .select({ cycleCount: heartbeat.cycleCount })
-            .from(heartbeat)
-            .where(eq(heartbeat.id, 1))
-            .execute();
-
-        // Calculate next count (start from 0 if no row)
-        const nextCount = (current?.cycleCount ?? 0) + 1;
-
-        // UPSERT: insert new row or update existing with new count + current timestamp
-        await this.db
-            .insert(heartbeat)
-            .values({
-                id: 1,
-                cycleCount: nextCount,
-                lastHeartbeatAt: Date.now(),  // Fresh timestamp for monitoring
-            })
-            .onDuplicateKeyUpdate({
-                set: { cycleCount: nextCount, lastHeartbeatAt: Date.now() },
-            })
-            .execute();
-
-        // Return the updated count for logging/use
-        return nextCount;
+        return locksRepo.incrementHeartbeatCount(this.db);
     }
 
-    // =========================================================================
-    // HEARTBEAT: Reset cycle counter (for testing or manual reset)
-    // =========================================================================
-    /**
-     * Resets the heartbeat counter and timestamp to zero.
-     *
-     * Used by:
-     *   • Testing scripts
-     *   • Manual reset via admin command (if added later)
-     *
-     * Simple UPSERT to ensure row exists and is zeroed
-     */
     public async resetHeartbeatCount(): Promise<void> {
-        await this.db
-            .insert(heartbeat)
-            .values({ id: 1, cycleCount: 0, lastHeartbeatAt: 0 })
-            .onDuplicateKeyUpdate({ set: { cycleCount: 0, lastHeartbeatAt: 0 } })
-            .execute();
+        return locksRepo.resetHeartbeatCount(this.db);
     }
 
     // =========================================================================
-    // COOLDOWN MANAGEMENT: Get last trade/alert time for a symbol
+    // COOLDOWN MANAGEMENT (delegated to repositories/cooldown.ts)
     // =========================================================================
-    /**
-     * Retrieves the cooldown record for a specific symbol.
-     *
-     * Used by:
-     *   • MarketScanner.handleTradeSignal() – to prevent signal spam
-     *   • Custom alert evaluation – to throttle notifications
-     *
-     * Table design:
-     *   • One row per symbol (unique constraint on symbol)
-     *   • Stores lastTradeAt timestamp
-     *
-     * @param symbol - Trading pair (e.g., 'BTC/USDT')
-     * @returns Cooldown row (or undefined if never traded/alerted)
-     */
     public async getCoolDown(symbol: string): Promise<{
         id: number;
         symbol: string | null;
         lastTradeAt: number;
     }> {
-        // Query by symbol (unique index)
-        const rows = await this.db.select().from(coolDownTable).where(eq(coolDownTable.symbol, symbol)).execute();
-
-        // Return first row (should be only one) or undefined if none
-        return rows[0];
+        return cooldownRepo.getCoolDown(this.db, symbol);
     }
 
-    // =========================================================================
-    // COOLDOWN MANAGEMENT: Upsert last trade/alert timestamp for a symbol
-    // =========================================================================
-    /**
-     * Updates or inserts the cooldown record for a specific symbol.
-     *
-     * Purpose:
-     *   • Prevents signal/alert spam on the same symbol
-     *   • Enforces minimum delay between trades or notifications
-     *   • Called after successful trade execution or alert trigger
-     *
-     * Implementation:
-     *   • Uses MySQL UPSERT via onDuplicateKeyUpdate
-     *   • Unique constraint on `symbol` column ensures one row per symbol
-     *   • Only updates lastTradeAt – efficient and atomic
-     *
-     * @param symbol - Trading pair (e.g., 'BTC/USDT')
-     * @param lastTradeAt - Unix millisecond timestamp of last action
-     */
-    /**
- * Upserts (insert or update) a cooldown entry for a given symbol.
- *
- * This method is the single source of truth for updating the `lastTradeAt`
- * timestamp in the cooldown table. It uses MySQL's `ON DUPLICATE KEY UPDATE`
- * syntax to handle both insert and update cases in one atomic operation.
- *
- * Key guarantees:
- *   - Atomic & race-condition safe (no double-insert or lost updates)
- *   - Works correctly even if the row doesn't exist yet
- *   - Uses current timestamp if none provided (most common usage)
- *   - Logs on error but does not throw (fail-open for cooldown)
- *
- * @param symbol     - Trading pair (e.g. 'BTC/USDT') – should already be normalized
- * @param lastTradeAt - Unix timestamp (ms) when the last trade/alert occurred
- *                     If omitted, uses Date.now()
- */
     public async upsertCoolDown(symbol: string, lastTradeAt: number = Date.now()): Promise<void> {
-        try {
-            // Safety: ensure we have a valid positive timestamp
-            if (!Number.isFinite(lastTradeAt) || lastTradeAt <= 0) {
-                logger.warn('Invalid lastTradeAt provided to upsertCoolDown – using current time', {
-                    symbol,
-                    received: lastTradeAt,
-                    fallback: Date.now(),
-                });
-                lastTradeAt = Date.now();
-            }
-
-            await this.db
-                .insert(coolDownTable)
-                .values({
-                    symbol,
-                    lastTradeAt,
-                })
-                .onDuplicateKeyUpdate({
-                    set: {
-                        lastTradeAt,
-                    },
-                })
-                .execute();
-
-            logger.debug('Cooldown upserted successfully', {
-                symbol,
-                lastTradeAt: new Date(lastTradeAt).toISOString(),
-            });
-        } catch (err) {
-            // Fail-open: log but do NOT throw
-            // If DB write fails, we prefer to allow the alert/trade than block everything
-            logger.error('Failed to upsert cooldown entry', {
-                symbol,
-                lastTradeAt: new Date(lastTradeAt).toISOString(),
-                error: err instanceof Error ? err.message : String(err),
-                stack: err instanceof Error ? err.stack : undefined,
-            });
-        }
+        return cooldownRepo.upsertCoolDown(this.db, symbol, lastTradeAt);
     }
 
     // =========================================================================
-    // LABELED SIMULATIONS: Fetch all rows usable for ML training (newest first)
+    // SIMULATION WRITE PATH (delegated to repositories/simulations/writePath.ts)
     // =========================================================================
-    /**
-     * Retrieves all simulated trades that have a computed label (i.e., ready for ML training),
-     * ordered by closed time descending (most recent first).
-     *
-     * New reality (after removing training_samples table):
-     *   - Single source of truth = simulatedTrades table
-     *   - Training data = rows WHERE label IS NOT NULL
-     *   - No duplication — features, label, mfe/mae, duration etc. live in one place
-     *
-     * Used by:
-     *   • MLService.retrain() – to load full dataset for training
-     *   • Debugging, analytics, or reporting commands
-     *
-     * Important notes:
-     *   - Only closed simulations with label are returned
-     *   - Features are stored as JSON → safely parsed to number[]
-     *   - If features somehow stored as string (DB quirk), it's handled
-     *   - Returns SimulatedTrade type (with all excursion/duration fields)
-     *
-     * @returns Array of SimulatedTrade objects with parsed features
-     */
-    public async getTrainingSamples(): Promise<SimulatedTrade[]> {
-        // Query only labeled (completed + labeled) simulations, newest first
-        const rows = await this.db
-            .select()
-            .from(simulatedTrades)
-            .where(isNotNull(simulatedTrades.label))
-            .orderBy(desc(simulatedTrades.closedAt))
-            .execute();
-
-        // Normalize features: ensure it's always number[] (handle DB string edge case)
-        return rows.map(row => ({
-            ...row,
-            features: row.features
-                ? (typeof row.features === 'string'
-                    ? JSON.parse(row.features)
-                    : Array.isArray(row.features)
-                        ? row.features
-                        : [])
-                : [],  // fallback to empty array if missing/null
-        }));
-    }
-
-    /**
-     * Creates a new empty simulation row with the provided signalId.
-     * Seeds default/starting values for a fresh simulation.
-     * Used to reserve a row early (e.g. before async polling begins),
-     * so we can reference it immediately via signalId.
-     *
-     * @param signalId Unique UUID of the signal (must be pre-generated)
-     * @param symbol Trading pair (e.g. 'BTC/USDT')
-     * @param side 'buy' or 'sell'
-     * @param entryPrice Entry price (raw number, will be stored as-is)
-     * @param openedAt Unix ms timestamp when simulation was started (defaults to now)
-     * @param features Optional initial feature vector
-     * @param confidence Confidence score from strategy (1 to 100)
-     * @returns The created row (with defaults applied)
-     */
     public async createNewSimulation(
         signalId: string,
         symbol: string,
@@ -863,273 +322,79 @@ class DatabaseService {
         mlPredictedConfidence?: number,
         regime?: MarketRegime,
     ): Promise<string> {
-        try {
-            const [inserted] = await this.db
-                .insert(simulatedTrades)
-                .values({
-                    signalId,
-                    symbol,
-                    side,
-                    regime: regime ?? null,
-                    entryPrice,               // stored as raw float
-                    openedAt,
-                    wasTaken: false,
-                    confidence,
-
-                    // Default/starting values
-                    pnl: 0,
-                    rMultiple: 0,
-                    maxFavorableExcursion: 0,
-                    maxAdverseExcursion: 0,
-                    durationMs: 0,
-                    timeToMFEMs: 0,
-                    timeToMAEMs: 0,
-
-                    // Nullable fields left undefined/null
-                    stopLoss: null,
-                    trailingDist: null,
-                    tpLevels: null,
-                    closedAt: null,
-                    outcome: null,
-                    label: null,
-
-                    // Optional features
-                    features: features && features.length > 0
-                        ? features
-                        : null,
-
-                    mlPredictedLabel: mlPredictedLabel ?? null,
-                    mlPredictedConfidence:
-                        mlPredictedConfidence ?? null,
-                })
-                .$returningId();
-
-            logger.debug('Created new empty simulation row', {
-                signalId,
-                symbol,
-                side,
-                regime,
-                entryPrice,
-                openedAt: new Date(openedAt).toISOString(),
-            });
-
-            return String(inserted.id);
-        } catch (error) {
-            logger.error('Failed to create new simulation row', {
-                signalId,
-                symbol,
-                side,
-                regime,
-                entryPrice,
-                error: error instanceof Error
-                    ? error.message
-                    : String(error),
-            });
-
-            throw error;
-        }
+        return simWrite.createNewSimulation(this.db, signalId, symbol, side, entryPrice, openedAt, features, confidence, mlPredictedLabel, mlPredictedConfidence, regime);
     }
 
-    // =========================================================================
-    // SIMULATED TRADES: Store a completed simulation (single atomic insert)
-    // =========================================================================
-    /**
-     * Updates an existing simulation row with the final outcome and metrics.
-     *
-     * This method is called at the end of a simulation (after polling/timeout)
-     * to fill in the results into a row that was pre-created with signalId.
-     *
-     * It performs a targeted UPDATE instead of INSERT, ensuring we don't duplicate rows.
-     * Only updates fields that are now known (outcome, pnl, excursions, etc.).
-     * Leaves early fields (symbol, side, entryPrice, openedAt, wasTaken, etc.) unchanged.
-     *
-     * @param signalId The unique UUID of the simulation to update
-     * @param data The final simulation results to apply
-     * @returns true if the row was updated (affected rows > 0), false if no matching row found
-     */
     public async updateCompletedSimulation(
         signalId: string,
         data: {
             stoploss?: number;
             trailingDist?: number;
             tpLevels?: PartialTPLevel[];
-            closedAt: number;                   // Unix ms
+            closedAt: number;
             outcome: 'tp' | 'partial_tp' | 'sl' | 'timeout';
-            pnl: number;                        // decimal (e.g. 0.023 = +2.3%)
+            pnl: number;
             rMultiple: number;
             label: -2 | -1 | 0 | 1 | 2;
-            maxFavorableExcursion: number;      // positive % (e.g. 0.015 = 1.5%)
-            maxAdverseExcursion: number;        // negative % (e.g. -0.008 = -0.8%)
+            maxFavorableExcursion: number;
+            maxAdverseExcursion: number;
             durationMs: number;
             timeToMFEMs: number;
             timeToMAEMs: number;
-            features?: number[];                // optional – can overwrite if needed
-            trailingTriggered?: boolean;         // did the counterfactual trailing stop fire during this sim?
-            trailingExitPrice?: number;          // price it would have exited at, if triggered
-            trailingExitPnl?: number;            // decimal PnL if exited via trailing (same scale as `pnl`)
-            trailingExitAtMs?: number;           // ms from entry to the trailing exit point
+            features?: number[];
+            trailingTriggered?: boolean;
+            trailingExitPrice?: number;
+            trailingExitPnl?: number;
+            trailingExitAtMs?: number;
         }
     ): Promise<boolean> {
-        try {
-            // Defensive guard: ensure openedAt ≤ closedAt (though openedAt is already set)
-            if (data.closedAt <= 0) {
-                throw new Error('Invalid closedAt timestamp');
-            }
-
-            const result = await this.db
-                .update(simulatedTrades)
-                .set({
-                    closedAt: data.closedAt,
-                    trailingDist: data.trailingDist,
-                    stopLoss: data.stoploss,
-                    tpLevels: data.tpLevels,
-                    outcome: data.outcome,
-                    pnl: Math.round(data.pnl * 1e8),                              // ×1e8
-                    rMultiple: Math.round(data.rMultiple * 1e4),                  // ×1e4
-                    label: data.label,
-                    maxFavorableExcursion: Math.round(data.maxFavorableExcursion * 1e4), // ×1e4
-                    maxAdverseExcursion: Math.round(data.maxAdverseExcursion * 1e4),     // ×1e4
-                    durationMs: data.durationMs,
-                    timeToMFEMs: data.timeToMFEMs,
-                    timeToMAEMs: data.timeToMAEMs,
-                    features: data.features !== undefined ? data.features : null, // overwrite only if provided
-                    trailingTriggered: data.trailingTriggered ?? false,
-                    trailingExitPrice: data.trailingExitPrice,
-                    trailingExitPnl: data.trailingExitPnl !== undefined
-                        ? Math.round(data.trailingExitPnl * 1e8)                  // same ×1e8 scale as `pnl`
-                        : undefined,
-                    trailingExitAtMs: data.trailingExitAtMs,
-                })
-                .where(eq(simulatedTrades.signalId, signalId))
-                .execute();
-
-            const affectedRows = result[0].affectedRows ?? 0;
-
-            if (affectedRows === 0) {
-                logger.warn('No simulation row found to update', { signalId });
-                return false;
-            }
-
-            logger.info('Updated completed simulation', {
-                signalId,
-                outcome: data.outcome,
-                label: data.label,
-                rMultiple: data.rMultiple.toFixed(3),
-                pnlPercent: (data.pnl * 100).toFixed(2) + '%',
-                durationMin: (data.durationMs / 60000).toFixed(1),
-                mfe: data.maxFavorableExcursion.toFixed(4) + '%',
-                mae: data.maxAdverseExcursion.toFixed(4) + '%',
-                affectedRows,
-                trailingTriggered: data.trailingTriggered ?? false,
-                trailingExitPnlPercent: data.trailingExitPnl !== undefined ? (data.trailingExitPnl * 100).toFixed(2) + '%'
-                    : 'n/a',
-            });
-
-            return true;
-        } catch (error) {
-            logger.error('Failed to update completed simulation', {
-                signalId,
-                outcome: data.outcome,
-                error: error instanceof Error ? error.message : String(error),
-            });
-            throw error; // Let caller handle retry or fallback
-        }
+        return simWrite.updateCompletedSimulation(this.db, signalId, data);
     }
 
-    // =========================================================================
-    // SIMULATION QUERY HELPERS: Get recent closed simulations
-    // =========================================================================
-    /**
-     * Fetches the most recently closed simulated trades.
-     *
-     * Used for:
-     *   • Debugging simulation outcomes
-     *   • Performance analysis
-     *   • Telegram commands showing recent results
-     *
-     * @param limit - Maximum number of trades to return (default 500)
-     * @returns Array of closed SimulatedTrade objects, newest first
-     */
-    public async getClosedSimulatedTrades(limit = 500): Promise<SimulatedTrade[]> {
-        return await this.db
-            .select()
-            .from(simulatedTrades)
-            .where(not(isNull(simulatedTrades.closedAt)))     // Only completed trades
-            .orderBy(desc(simulatedTrades.closedAt))         // Most recent first
-            .limit(limit)
-            .execute();
-    }
-
-    /**
- * Marks a specific simulation as "taken" (i.e., the trade was approved by excursion logic
- * and either executed live or would have been executed if auto-trade was enabled).
- *
- * This allows accurate performance tracking of only the filtered/traded signals,
- * separate from all raw simulations used for regime building and ML training.
- *
- * @param signalId - The unique UUID of the simulation row
- * @param taken - Whether to mark as taken (true) or untaken (false). Defaults to true.
- * @returns Promise<void> - Resolves when update is complete
- * @throws Error if update fails (logged internally)
- */
     public async setSimulationTaken(
         signalId: string,
         taken: boolean = true,
         maxRetries: number = 5,
         retryDelayMs: number = 2000
     ): Promise<void> {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                const result = await this.db
-                    .update(simulatedTrades)
-                    .set({ wasTaken: taken })
-                    .where(eq(simulatedTrades.signalId, signalId))
-                    .execute();
-
-                if (result[0].affectedRows > 0) {
-                    logger.debug(`Updated simulation was_taken status`, {
-                        signalId, wasTaken: taken, attempt
-                    });
-                    return; // success
-                }
-
-                // Row doesn't exist yet — sim hasn't been created yet
-                if (attempt < maxRetries) {
-                    logger.debug(`setSimulationTaken: row not found yet, retrying in ${retryDelayMs}ms`, {
-                        signalId, attempt, maxRetries
-                    });
-                    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-                } else {
-                    logger.warn(`setSimulationTaken: row never appeared after ${maxRetries} attempts`, {
-                        signalId, taken
-                    });
-                }
-            } catch (error) {
-                logger.error(`Failed to update was_taken for simulation`, {
-                    signalId, taken, attempt,
-                    error: error instanceof Error ? error.message : String(error),
-                });
-                throw error;
-            }
-        }
+        return simWrite.setSimulationTaken(this.db, signalId, taken, maxRetries, retryDelayMs);
     }
 
-    /**
-     * Fetches performance statistics only for simulations marked as taken.
-     * Useful for evaluating how well the excursion filtering / regime logic performs
-     * on trades that were actually approved.
-     *
-     * @param options Optional filters
-     * @returns Object with key metrics
-     */
+    // =========================================================================
+    // SIMULATION READ PATH (delegated to repositories/simulations/readPath.ts)
+    // =========================================================================
+    public async getTrainingSamples(): Promise<SimulatedTrade[]> {
+        return simRead.getTrainingSamples(this.db);
+    }
+
+    public async getClosedSimulatedTrades(limit = 500): Promise<SimulatedTrade[]> {
+        return simRead.getClosedSimulatedTrades(this.db, limit);
+    }
+
+    public async getLabeledSimulations(options: {
+        limit?: number;
+        offset?: number;
+        symbol?: string;
+        side?: 'buy' | 'sell';
+    } = {}): Promise<SimulatedTrade[]> {
+        return simRead.getLabeledSimulations(this.db, options);
+    }
+
+    public async getRecentLabeledSimulations(cutoffTime: number): Promise<SimulatedTrade[]> {
+        return simRead.getRecentLabeledSimulations(this.db, cutoffTime);
+    }
+
+    // =========================================================================
+    // SIMULATION ANALYTICS (delegated to repositories/simulations/analytics.ts)
+    // =========================================================================
     public async getTakenSimulationStats(options: {
         symbol?: string;
-        since?: number;           // Unix ms cutoff
-        minRMultiple?: number;    // optional filter
+        since?: number;
+        minRMultiple?: number;
     } = {}): Promise<{
         totalTaken: number;
         wins: number;
-        winRate: number;          // percentage
+        winRate: number;
         avgPnL: number;
         avgRMultiple: number;
         totalPnL: number;
@@ -1140,470 +405,49 @@ class DatabaseService {
             timeout: number;
         };
     }> {
-        try {
-            const conditions = [
-                eq(simulatedTrades.wasTaken, true),
-                isNotNull(simulatedTrades.closedAt),
-                isNotNull(simulatedTrades.label),
-            ];
-
-            if (options.symbol) {
-                conditions.push(eq(simulatedTrades.symbol, options.symbol));
-            }
-            if (options.since) {
-                conditions.push(gte(simulatedTrades.closedAt, options.since));
-            }
-
-            const whereClause = and(...conditions);
-
-            // Aggregate query
-            const [stats] = await this.db
-                .select({
-                    totalTaken: count().as('totalTaken'),
-                    wins: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} IN ('tp', 'partial_tp') THEN 1 ELSE 0 END)`.mapWith(Number),
-                    totalPnL: sql<number>`SUM(${simulatedTrades.pnl} / 1e8)`.mapWith(Number),
-                    avgPnL: sql<number>`AVG(${simulatedTrades.pnl} / 1e8)`.mapWith(Number),
-                    avgRMultiple: sql<number>`AVG(${simulatedTrades.rMultiple} / 1e4)`.mapWith(Number),
-                    tp: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'tp' THEN 1 ELSE 0 END)`.mapWith(Number),
-                    partial_tp: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'partial_tp' THEN 1 ELSE 0 END)`.mapWith(Number),
-                    sl: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'sl' THEN 1 ELSE 0 END)`.mapWith(Number),
-                    timeout: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} = 'timeout' THEN 1 ELSE 0 END)`.mapWith(Number),
-                })
-                .from(simulatedTrades)
-                .where(whereClause)
-                .execute();
-
-            const total = stats.totalTaken || 0;
-            const wins = stats.wins || 0;
-            const winRate = total > 0 ? (wins / total) * 100 : 0;
-
-            return {
-                totalTaken: total,
-                wins,
-                winRate,
-                avgPnL: stats.avgPnL || 0,
-                avgRMultiple: stats.avgRMultiple || 0,
-                totalPnL: stats.totalPnL || 0,
-                outcomes: {
-                    tp: stats.tp || 0,
-                    partial_tp: stats.partial_tp || 0,
-                    sl: stats.sl || 0,
-                    timeout: stats.timeout || 0,
-                },
-            };
-        } catch (err) {
-            logger.error('Failed to fetch taken simulation stats', { error: err });
-            return {
-                totalTaken: 0,
-                wins: 0,
-                winRate: 0,
-                avgPnL: 0,
-                avgRMultiple: 0,
-                totalPnL: 0,
-                outcomes: { tp: 0, partial_tp: 0, sl: 0, timeout: 0 },
-            };
-        }
+        return simAnalytics.getTakenSimulationStats(this.db, options);
     }
 
-
-    // =========================================================================
-    // TRAINING DATA EXPORT: Fetch all labeled simulations for CSV export
-    // =========================================================================
-    /**
-     * Fetches all labeled simulations formatted for CSV export.
-     * Called by TelegramBotController /export_training_data command.
-     *
-     * Returns only the columns Python needs:
-     *   • features  — JSON array string (parsed by ml/utils.py)
-     *   • label     — integer -2..+2
-     *   • symbol    — for debugging/filtering in Python
-     *   • side      — 'buy' | 'sell' (useful for per-side analysis)
-     *   • outcome   — 'tp' | 'sl' | 'timeout' etc
-     *   • closed_at — timestamp (useful for time-based filtering)
-     *
-     * Deliberately excludes heavy columns (pnl raw bytes, tpLevels JSON etc)
-     * to keep the CSV file small and fast to send via Telegram.
-     */
     public async getExportableSimulations(side?: 'buy' | 'sell'): Promise<Array<{
         symbol: string;
         side: string;
         label: number;
         outcome: string | null;
         closedAt: number | null;
-        features: string;  // JSON string — Python parses this
+        features: string;
     }>> {
-        try {
-            const conditions = [
-                isNotNull(simulatedTrades.label),
-                isNotNull(simulatedTrades.features),
-                isNotNull(simulatedTrades.closedAt),
-            ];
-            if (side) conditions.push(eq(simulatedTrades.side, side));
-
-            const rows = await this.db
-                .select({
-                    symbol: simulatedTrades.symbol,
-                    side: simulatedTrades.side,
-                    label: simulatedTrades.label,
-                    outcome: simulatedTrades.outcome,
-                    closedAt: simulatedTrades.closedAt,
-                    features: simulatedTrades.features,
-                })
-                .from(simulatedTrades)
-                .where(and(...conditions))
-                .orderBy(desc(simulatedTrades.closedAt))
-                .execute();
-
-            // Serialize features to JSON string so CSV stays flat
-            // Python's pandas reads this as a string then json.loads() each cell
-            return rows.map(row => ({
-                symbol: row.symbol,
-                side: row.side,
-                label: row.label!,
-                outcome: row.outcome,
-                closedAt: row.closedAt,
-                // features may already be an object if Drizzle parsed it —
-                // always stringify so the CSV cell is a clean JSON string
-                features: typeof row.features === 'string'
-                    ? row.features
-                    : JSON.stringify(row.features),
-            }));
-
-        } catch (err) {
-            logger.error('Failed to fetch exportable simulations', {
-                error: err instanceof Error ? err.message : String(err),
-            });
-            return [];
-        }
+        return simAnalytics.getExportableSimulations(this.db, side);
     }
 
-    /**
- * Retrieves a quick comparison between:
- * - Total number of closed (completed) simulations
- * - Number of simulations marked as taken (was_taken = true)
- * - The percentage of simulations that passed the excursion/regime filter
- *
- * Used primarily by the Telegram bot command /takenvsall to show
- * how selective the current filtering logic is.
- *
- * @returns Promise with counts and calculated percentage
- */
     public async getTakenVsTotalCount(): Promise<{
         totalSims: number;
         takenSims: number;
         takenPercentage: number;
     }> {
-        try {
-            // ── 1. Count all closed simulations ─────────────────────────────────────
-            const [totalResult] = await this.db
-                .select({
-                    count: count().as('total'),
-                })
-                .from(simulatedTrades)
-                .where(and(
-                    isNotNull(simulatedTrades.closedAt),
-                    // Optional: only count simulations that have an outcome/label
-                    // (remove if you want to include pending/incomplete ones)
-                    isNotNull(simulatedTrades.outcome)
-                ))
-                .execute();
-
-            const totalSims = Number(totalResult?.count ?? 0);
-
-            // ── 2. Count only taken (filtered/executed) simulations ─────────────────
-            const [takenResult] = await this.db
-                .select({
-                    count: count(),
-                })
-                .from(simulatedTrades)
-                .where(and(
-                    eq(simulatedTrades.wasTaken, true),
-                    isNotNull(simulatedTrades.closedAt),
-                    isNotNull(simulatedTrades.outcome)
-                ))
-                .execute();
-
-            const takenSims = Number(takenResult?.count ?? 0);
-
-            // ── 3. Calculate percentage (safe handling for division by zero) ────────
-            const takenPercentage = totalSims > 0
-                ? (takenSims / totalSims) * 100
-                : 0;
-
-            return {
-                totalSims,
-                takenSims,
-                takenPercentage,
-            };
-        } catch (error) {
-            logger.error('Failed to compute taken vs total simulation counts', {
-                error: error instanceof Error ? error.message : String(error),
-                stack: error instanceof Error ? error.stack : undefined,
-            });
-
-            // Graceful fallback — better to return zeros than crash the command
-            return {
-                totalSims: 0,
-                takenSims: 0,
-                takenPercentage: 0,
-            };
-        }
+        return simAnalytics.getTakenVsTotalCount(this.db);
     }
 
-    /**
- * Retrieves performance statistics for taken simulations, grouped by symbol.
- * Only includes completed simulations where `was_taken = true`.
- *
- * Results are sorted by total taken trades (descending) and limited to the requested count.
- *
- * @param limit Maximum number of symbols to return (default: 20)
- * @param since Optional Unix timestamp (ms) — only include simulations closed after this time
- * @returns Array of symbol stats, sorted by totalTaken descending
- */
     public async getTakenStatsBySymbol(
         limit: number = 20,
         since?: number
     ): Promise<Array<{
         symbol: string;
         totalTaken: number;
-        winRate: number;     // percentage (0–100)
-        avgR: number;        // average R-multiple
-        totalPnL: number;    // cumulative realized PnL
+        winRate: number;
+        avgR: number;
+        totalPnL: number;
     }>> {
-        // Enforce reasonable limit range to prevent abuse or performance issues
-        const safeLimit = Math.max(1, Math.min(50, limit));
-
-        try {
-            const conditions = [
-                eq(simulatedTrades.wasTaken, true),
-                isNotNull(simulatedTrades.closedAt),
-                // Only count simulations with a meaningful outcome
-                isNotNull(simulatedTrades.outcome),
-            ];
-
-            if (since !== undefined) {
-                conditions.push(gte(simulatedTrades.closedAt, since));
-            }
-
-            const whereClause = and(...conditions);
-
-            const rows = await this.db
-                .select({
-                    symbol: simulatedTrades.symbol,
-                    totalTaken: count().as('totalTaken'),
-                    wins: sql<number>`SUM(CASE WHEN ${simulatedTrades.outcome} IN ('tp', 'partial_tp') THEN 1 ELSE 0 END)`.mapWith(Number),
-                    totalPnL: sql<number>`COALESCE(SUM(${simulatedTrades.pnl} / 1e8), 0)`.mapWith(Number),
-                    avgR: sql<number>`COALESCE(AVG(${simulatedTrades.rMultiple} / 1e4), 0)`.mapWith(Number),
-                })
-                .from(simulatedTrades)
-                .where(whereClause)
-                .groupBy(simulatedTrades.symbol)
-                .orderBy(desc(sql`totalTaken`))
-                .limit(safeLimit)
-                .execute();
-
-            // Transform raw DB rows into clean result objects
-            return rows.map(row => {
-                const total = Number(row.totalTaken) || 0;
-                const wins = Number(row.wins) || 0;
-
-                return {
-                    symbol: row.symbol,
-                    totalTaken: total,
-                    winRate: total > 0 ? (wins / total) * 100 : 0,
-                    avgR: Number(row.avgR) || 0,
-                    totalPnL: Number(row.totalPnL) || 0,
-                };
-            });
-        } catch (error) {
-            logger.error('Failed to fetch taken stats by symbol', {
-                limit: safeLimit,
-                since: since ? new Date(since).toISOString() : undefined,
-                error: error instanceof Error ? error.message : String(error),
-            });
-
-            // Return empty array on failure — safe fallback for UI/Telegram
-            return [];
-        }
+        return simAnalytics.getTakenStatsBySymbol(this.db, limit, since);
     }
 
-    /**
- * Fetches all simulations that have a computed label (i.e., ready for ML training).
- *
- * This is the primary method used by MLService.retrain() to load training data.
- *
- * Key features:
- *   - Filters WHERE label IS NOT NULL (only completed + labeled rows)
- *   - Orders by closedAt DESC (most recent first)
- *   - Safely parses features JSON → number[]
- *   - Optional: limit, symbol filter, offset for pagination/large datasets
- *   - Returns empty array on error (fail-safe for retrain)
- *
- * @param options Optional filters and limits
- * @returns Array of fully typed SimulatedTrade objects with parsed features
- */
-    public async getLabeledSimulations(options: {
-        limit?: number;          // max rows to return (default: all)
-        offset?: number;         // skip first N rows (for pagination)
-        symbol?: string;         // filter to one symbol only
-        side?: 'buy' | 'sell';   //
-    } = {}): Promise<SimulatedTrade[]> {
-        const { limit, offset = 0, symbol, side } = options;
-
-        try {
-            const conditions = [isNotNull(simulatedTrades.label)];
-            if (symbol) conditions.push(eq(simulatedTrades.symbol, symbol.trim().toUpperCase()));
-            if (side) conditions.push(eq(simulatedTrades.side, side));
-
-            let query = this.db
-                .select()
-                .from(simulatedTrades)
-                .where(and(...conditions))
-                .orderBy(desc(simulatedTrades.closedAt))
-                .offset(offset)
-                .$dynamic();
-
-            if (limit !== undefined) {
-                query = query.limit(limit);
-            }
-
-            const rows = await query.execute();
-
-            // Safely parse features (handle string JSON from DB or already-parsed array)
-            const parsedRows = rows.map(row => ({
-                ...row,
-                features: row.features
-                    ? (typeof row.features === 'string'
-                        ? JSON.parse(row.features)
-                        : Array.isArray(row.features)
-                            ? row.features
-                            : [])
-                    : [],  // fallback empty array if missing/null
-            }));
-
-            logger.debug('Fetched labeled simulations', {
-                count: parsedRows.length,
-                limit: limit ?? 'all',
-                symbol: symbol ?? 'all',
-                offset,
-                sampleFeaturesLength: parsedRows[0]?.features?.length ?? 'none',
-            });
-
-            return parsedRows;
-
-        } catch (err) {
-            logger.error('Failed to fetch labeled simulations', {
-                error: err instanceof Error ? err.message : String(err),
-                symbol: options.symbol,
-                limit: options.limit,
-            });
-            return []; // fail-safe: empty array so retrain can continue gracefully
-        }
-    }
-
-    /**
-     * Returns the count of labeled simulations for each possible label (-2 to +2).
-     *
-     * Returns a complete distribution (all labels present, even if count = 0).
-     * Used for:
-     *   • MLService status reporting (/ml_status)
-     *   • Monitoring class balance (critical for model health)
-     *   • Telegram /ml_performance command
-     *
-     * @returns Array of { label: number; count: number } with all labels -2 to +2
-     */
     public async getLabelDistribution(): Promise<{ label: number; count: number }[]> {
-        try {
-            // Raw count per existing label
-            const result = await this.db
-                .select({
-                    label: simulatedTrades.label,
-                    count: count().as('count'),
-                })
-                .from(simulatedTrades)
-                .where(isNotNull(simulatedTrades.label))
-                .groupBy(simulatedTrades.label)
-                .orderBy(simulatedTrades.label)
-                .execute();
-
-            // Initialize full distribution map with 0s for all labels
-            const distributionMap = new Map<number, number>();
-            for (let label = -2; label <= 2; label++) {
-                distributionMap.set(label, 0);
-            }
-
-            // Fill in actual counts
-            for (const row of result) {
-                if (row.label !== null) {
-                    distributionMap.set(row.label, Number(row.count));
-                }
-            }
-
-            // Convert to sorted array
-            return Array.from(distributionMap.entries())
-                .map(([label, count]) => ({ label, count }))
-                .sort((a, b) => a.label - b.label);
-
-        } catch (err) {
-            logger.error('Failed to compute label distribution', {
-                error: err instanceof Error ? err.message : String(err),
-            });
-
-            // Fail-safe: return empty distribution with zeros
-            return [
-                { label: -2, count: 0 },
-                { label: -1, count: 0 },
-                { label: 0, count: 0 },
-                { label: 1, count: 0 },
-                { label: 2, count: 0 },
-            ];
-        }
+        return simAnalytics.getLabelDistribution(this.db);
     }
 
-    /**
- * Returns the total number of labeled simulations ready for ML training.
- *
- * Counts rows in simulatedTrades where label IS NOT NULL.
- * Used by:
- *   • MLService.retrain() – to check if enough samples exist
- *   • MLService.getStatus() – for Telegram status reporting
- *   • Monitoring / debugging (e.g. "are we collecting enough data?")
- *
- * @returns Number of simulations with a valid label (-2 to +2)
- */
     public async getSampleCount(side?: 'buy' | 'sell'): Promise<number> {
-        try {
-            const conditions = [isNotNull(simulatedTrades.label)];
-            if (side) conditions.push(eq(simulatedTrades.side, side));
-
-            const result = await this.db
-                .select({ count: count() })
-                .from(simulatedTrades)
-                .where(and(...conditions))
-                .execute();
-
-            const num = result[0]?.count ?? 0;
-            logger.debug('Fetched labeled sample count', { num, side: side ?? 'all' });
-            return num;
-        } catch (err) {
-            logger.error('Failed to get sample count', {
-                error: err instanceof Error ? err.message : String(err),
-                side,
-            });
-            return 0; // fail-safe: return 0 so retrain can gracefully skip
-        }
+        return simAnalytics.getSampleCount(this.db, side);
     }
 
-    /**
- * Aggregated summary of labeled simulations per symbol.
- *
- * Used by MLService.getSampleSummary() for Telegram reporting.
- *
- * Returns:
- *   - total: number of labeled sims
- *   - buys/sells: count by side
- *   - wins: count where label >= 1
- */
     public async getSimulationSummaryBySymbol(): Promise<Array<{
         symbol: string;
         total: number;
@@ -1611,135 +455,11 @@ class DatabaseService {
         sells: number;
         wins: number;
     }>> {
-        try {
-            const rows = await this.db
-                .select({
-                    symbol: simulatedTrades.symbol,
-                    total: count(),
-                    buys: sql<number>`SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END)`,
-                    sells: sql<number>`SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END)`,
-                    wins: sql<number>`SUM(CASE WHEN label >= 1 THEN 1 ELSE 0 END)`,
-                })
-                .from(simulatedTrades)
-                .where(isNotNull(simulatedTrades.label))
-                .groupBy(simulatedTrades.symbol)
-                .orderBy(desc(sql`total`)) // optional: most active symbols first
-                .execute();
-
-            logger.debug('Fetched simulation summary by symbol', { rowCount: rows.length });
-
-            return rows;
-        } catch (err) {
-            logger.error('Failed to get simulation summary by symbol', {
-                error: err instanceof Error ? err.message : String(err),
-            });
-            return [];
-        }
+        return simAnalytics.getSimulationSummaryBySymbol(this.db);
     }
 
-    /**
- * Fetches recent labeled & closed simulations for cache warm-up on startup.
- *
- * This is the main DB query used by `excursionCache.warmUpFromDb()`.
- *
- * Filters:
- *   - label IS NOT NULL          → only simulations ready for ML/training
- *   - closedAt IS NOT NULL       → only completed simulations
- *   - closedAt >= cutoffTime     → respects recency window (default 3 hours)
- *
- * Returns newest first (DESC closedAt)
- * Safety limit: max 2000 rows (prevents loading millions of old rows on startup)
- */
-    public async getRecentLabeledSimulations(cutoffTime: number): Promise<SimulatedTrade[]> {
-        try {
-            const MAX_ROWS = 2000; // safety limit — prevents huge queries on first run
-
-            const rows = await this.db
-                .select()
-                .from(simulatedTrades)
-                .where(and(
-                    isNotNull(simulatedTrades.label),
-                    isNotNull(simulatedTrades.closedAt),
-                    gte(simulatedTrades.closedAt, cutoffTime)
-                ))
-                .orderBy(desc(simulatedTrades.closedAt))
-                .limit(MAX_ROWS)
-                .execute();
-
-            // Safely parse features (DB may return string or already-parsed array)
-            const parsed = rows.map(row => ({
-                ...row,
-                features: row.features
-                    ? (typeof row.features === 'string'
-                        ? JSON.parse(row.features)
-                        : Array.isArray(row.features)
-                            ? row.features
-                            : [])
-                    : [], // fallback: empty array
-            }));
-
-            logger.info(`Fetched recent labeled simulations for cache warm-up`, {
-                count: parsed.length,
-                cutoffTime: new Date(cutoffTime).toISOString(),
-                maxRowsApplied: parsed.length === MAX_ROWS,
-            });
-
-            return parsed;
-
-        } catch (err) {
-            logger.error('Failed to fetch recent labeled simulations for warm-up', {
-                cutoffTime: new Date(cutoffTime).toISOString(),
-                error: err instanceof Error ? err.message : String(err),
-            });
-
-            // Fail-safe: return empty array so warm-up continues gracefully
-            return [];
-        }
-    }
-
-    // =========================================================================
-    // SIMULATION ANALYTICS: Top performing symbols by average R-multiple
-    // =========================================================================
-    /**
-     * Retrieves the best-performing symbols based on simulation results.
-     *
-     * Used for:
-     *   • Identifying which symbols the strategy works best on
-     *   • Monitoring and reporting (e.g., Telegram commands or dashboard)
-     *   • Potential future symbol filtering or weighting
-     *
-     * Filters:
-     *   • Only closed simulations
-     *   • Only profitable outcomes (label >= 1)
-     *
-     * Returns:
-     *   • symbol
-     *   • trades: total number of winning simulations
-     *   • avgR: average R-multiple (higher = better risk-adjusted return)
-     *   • strongWins: number of "monster wins" (label = 2)
-     *
-     * Sorted by avgR descending, limited to top N (default 20)
-     *
-     * @param limit - Maximum number of symbols to return (default 20)
-     * @returns Array of top performing symbols
-     */
     public async getTopPerformingSymbols(limit = 20) {
-        return await this.db
-            .select({
-                symbol: simulatedTrades.symbol,
-                trades: count(),  // Total winning trades per symbol
-                avgR: sql<number>`ROUND(AVG(${simulatedTrades.rMultiple} / 1e4), 3)`.mapWith(Number), // Convert ×1e4 back to actual R
-                strongWins: sql<number>`SUM(CASE WHEN ${simulatedTrades.label} = 2 THEN 1 ELSE 0 END)`.mapWith(Number) // Count of label +2
-            })
-            .from(simulatedTrades)
-            .where(and(
-                not(isNull(simulatedTrades.closedAt)),     // Only completed simulations
-                gte(simulatedTrades.label, 1)              // Only profitable ones (label 1 or 2)
-            ))
-            .groupBy(simulatedTrades.symbol)
-            .orderBy(sql`avgR DESC`)                        // Best average R first
-            .limit(limit)
-            .execute();
+        return simAnalytics.getTopPerformingSymbols(this.db, limit);
     }
 
 }
