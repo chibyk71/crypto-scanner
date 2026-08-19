@@ -3,7 +3,7 @@
 
 import type TelegramBot from 'node-telegram-bot-api';
 import { createLogger } from '../../../logger';
-import { type AlertState, STATE_TIMEOUT_MS } from '../types';
+import { STATE_TIMEOUT_MS, type AlertState } from '../types';
 
 const logger = createLogger('TelegramBot:state');
 
@@ -26,14 +26,11 @@ export class UserStateManager {
     updateUserState(chatId: number, newState: Partial<AlertState>): void {
         // Retrieve existing state or initialize with clean defaults
         const currentState: AlertState = this.userStates.get(chatId) || {
-            mode: 'create',                    // Default workflow mode
+            mode: 'positions',                    // Default workflow mode
             step: '',
             data: {
                 symbol: '',
-                timeframe: '',
-                conditions: [],
             },
-            temp: undefined,
             alertId: undefined,
             page: 0,
             lastActivity: Date.now(),
@@ -59,7 +56,6 @@ export class UserStateManager {
             mode: updatedState.mode,
             step: updatedState.step,
             symbol: updatedState.data.symbol,
-            conditionsCount: updatedState.data.conditions.length,
         });
     }
 
