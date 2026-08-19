@@ -98,6 +98,13 @@ export async function handleStatus(ctx: TelegramContext, msg: TelegramBot.Messag
     }
 }
 
+/**
+ * Handles the /stopbot command.
+ *
+ * Sends a confirmation message first, then runs graceful cleanup
+ * (scanner stop, telegram stop, lock release, process.exit).
+ * The reply must come before cleanup — cleanup ends the process.
+ */
 export async function handleStopBot(ctx: TelegramContext, msg: TelegramBot.Message): Promise<void> {
     const chatId = msg.chat.id;
     if (!ctx.isAuthorized(chatId)) return;
@@ -105,21 +112,32 @@ export async function handleStopBot(ctx: TelegramContext, msg: TelegramBot.Messa
     logger.warn('Stopbot command received', { user: msg.from?.username || msg.from?.id });
 
     try {
-        // 1. Stop polling immediately
-        // closeAndCleanUp is a Promise that resolves to the actual cleanup function; await it first, then call it.
+        // Reply BEFORE cleanup — cleanup stops Telegram polling and process.exit(0)
+        await ctx.bot.sendMessage(
+            chatId,
+            '🛑 Shutting down\\.\n\nScanner stopped, lock released, process exiting\\.',
+            { parse_mode: 'MarkdownV2' }
+        );
+
+        const clearedCount = ctx.userStates.size;
+        ctx.userStates.clear();
+        logger.info(`Cleared ${clearedCount} user states from memory`);
+
+        // closeAndCleanUp is a Promise that resolves to the actual cleanup function
         const cleanupFn = await closeAndCleanUp;
         if (typeof cleanupFn === 'function') {
             await cleanupFn();
         } else {
             logger.warn('closeAndCleanUp did not return a callable cleanup function');
+            await ctx.bot.sendMessage(chatId, 'Cleanup function unavailable. Check logs.');
         }
-
-        // 3. Clear all user states from memory
-        const clearedCount = ctx.userStates.size;
-        ctx.userStates.clear();
-        logger.info(`Cleared ${clearedCount} user states from memory`);
     } catch (error) {
         logger.error('Unexpected error in /stopbot handler', { error });
-        await ctx.bot.sendMessage(chatId, 'Error during shutdown. Check logs.');
+        try {
+            await ctx.bot.sendMessage(chatId, 'Error during shutdown. Check logs.');
+        } catch {
+            // Bot may already be stopped
+        }
     }
 }
+

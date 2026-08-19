@@ -49,7 +49,7 @@ export async function checkAndNotify(
         ``,
         `*Symbol:* \`${escape(symbol)}\``,
         `*Trend bias:* ${escape(trendAndVolume.trendBias)}`,
-        `*ADX:* ${escape(lastSnap.htfAdx.toFixed(2))}  \\(+DI ${escape(lastSnap.htfPdi.toFixed(2))} / \\-DI ${escape(lastSnap.htfMdi.toFixed(2))}\\)`,
+        `*ADX:* ${escape(lastSnap.htfAdx.toFixed(2))}  \\(\\+DI ${escape(lastSnap.htfPdi.toFixed(2))} / \\-DI ${escape(lastSnap.htfMdi.toFixed(2))}\\)`,
         `*Price:* ${escape(price.toFixed(6))}`,
         `*ATR:* ${escape(atr.toFixed(6))} \\(${formatPercent(atrPct)}\\)`,
         ``,
