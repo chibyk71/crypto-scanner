@@ -5,15 +5,8 @@
     {
       "idx": 0,
       "version": "5",
-      "when": 1785783104108,
-      "tag": "0000_bouncy_centennial",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "5",
-      "when": 1786789015844,
-      "tag": "0001_groovy_marten_broadcloak",
+      "when": 1787113838944,
+      "tag": "0000_easy_unus",
       "breakpoints": true
     }
   ]

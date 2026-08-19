@@ -1,15 +1,3 @@
-CREATE TABLE `alert` (
-	`id` int AUTO_INCREMENT NOT NULL,
-	`symbol` varchar(50) NOT NULL,
-	`conditions` json NOT NULL,
-	`timeframe` varchar(10) NOT NULL DEFAULT '1h',
-	`status` varchar(20) NOT NULL DEFAULT 'active',
-	`created_at` timestamp DEFAULT (now()),
-	`note` varchar(255),
-	`last_alert_at` bigint DEFAULT 0,
-	CONSTRAINT `alert_id` PRIMARY KEY(`id`)
-);
---> statement-breakpoint
 CREATE TABLE `cool_down` (
 	`id` int AUTO_INCREMENT NOT NULL,
 	`symbol` varchar(15),
@@ -57,6 +45,7 @@ CREATE TABLE `simulated_trades` (
 	`signal_id` varchar(36) NOT NULL,
 	`symbol` varchar(50) NOT NULL,
 	`side` varchar(10) NOT NULL,
+	`regime` varchar(32),
 	`entry_price` float NOT NULL,
 	`stop_loss` float,
 	`trailing_dist` float,
@@ -97,6 +86,14 @@ CREATE TABLE `trades` (
 	CONSTRAINT `trades_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
+CREATE TABLE `trending_notifications` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`symbol` varchar(50) NOT NULL,
+	`last_notified_at` bigint NOT NULL,
+	CONSTRAINT `trending_notifications_id` PRIMARY KEY(`id`),
+	CONSTRAINT `trending_notifications_symbol_unique` UNIQUE(`symbol`)
+);
+--> statement-breakpoint
 CREATE TABLE `user` (
 	`id` varchar(255) NOT NULL,
 	`age` int,
@@ -104,6 +101,23 @@ CREATE TABLE `user` (
 	`password_hash` varchar(255) NOT NULL,
 	CONSTRAINT `user_id` PRIMARY KEY(`id`),
 	CONSTRAINT `user_username_unique` UNIQUE(`username`)
+);
+--> statement-breakpoint
+CREATE TABLE `watch_alerts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`symbol` varchar(50) NOT NULL,
+	`thesis` varchar(500) NOT NULL,
+	`confidence` varchar(10) NOT NULL,
+	`status` varchar(20) NOT NULL DEFAULT 'active',
+	`entry_conditions` json NOT NULL,
+	`invalidate_conditions` json,
+	`trade_plan` json NOT NULL,
+	`created_at` bigint NOT NULL,
+	`expires_at` bigint NOT NULL,
+	`resolved_at` bigint,
+	`resolved_reason` varchar(20),
+	`triggered_price` float,
+	CONSTRAINT `watch_alerts_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
 ALTER TABLE `session` ADD CONSTRAINT `session_user_id_user_id_fk` FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
@@ -116,4 +130,7 @@ CREATE INDEX `idx_sim_label` ON `simulated_trades` (`symbol`,`label`);--> statem
 CREATE INDEX `idx_sim_closed` ON `simulated_trades` (`closed_at`);--> statement-breakpoint
 CREATE INDEX `idx_sim_duration` ON `simulated_trades` (`duration_ms`);--> statement-breakpoint
 CREATE INDEX `idx_trades_symbol` ON `trades` (`symbol`);--> statement-breakpoint
-CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);
+CREATE INDEX `idx_trades_timestamp` ON `trades` (`timestamp`);--> statement-breakpoint
+CREATE INDEX `idx_watch_alerts_status` ON `watch_alerts` (`status`);--> statement-breakpoint
+CREATE INDEX `idx_watch_alerts_symbol` ON `watch_alerts` (`symbol`);--> statement-breakpoint
+CREATE INDEX `idx_watch_alerts_expires` ON `watch_alerts` (`expires_at`);

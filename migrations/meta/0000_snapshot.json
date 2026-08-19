@@ -1,86 +1,9 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "2d47b773-af83-409c-b1c0-c82831c0f968",
+  "id": "1ffa79e5-d36a-41b8-a462-23e118ff74ef",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
-    "alert": {
-      "name": "alert",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "int",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": true
-        },
-        "symbol": {
-          "name": "symbol",
-          "type": "varchar(50)",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "conditions": {
-          "name": "conditions",
-          "type": "json",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "timeframe": {
-          "name": "timeframe",
-          "type": "varchar(10)",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'1h'"
-        },
-        "status": {
-          "name": "status",
-          "type": "varchar(20)",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'active'"
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false,
-          "default": "(now())"
-        },
-        "note": {
-          "name": "note",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "last_alert_at": {
-          "name": "last_alert_at",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false,
-          "default": 0
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "alert_id": {
-          "name": "alert_id",
-          "columns": [
-            "id"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraint": {}
-    },
     "cool_down": {
       "name": "cool_down",
       "columns": {
@@ -378,6 +301,13 @@
           "type": "varchar(10)",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "regime": {
+          "name": "regime",
+          "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "entry_price": {
@@ -715,6 +645,51 @@
       "uniqueConstraints": {},
       "checkConstraint": {}
     },
+    "trending_notifications": {
+      "name": "trending_notifications",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "last_notified_at": {
+          "name": "last_notified_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "trending_notifications_id": {
+          "name": "trending_notifications_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "trending_notifications_symbol_unique": {
+          "name": "trending_notifications_symbol_unique",
+          "columns": [
+            "symbol"
+          ]
+        }
+      },
+      "checkConstraint": {}
+    },
     "user": {
       "name": "user",
       "columns": {
@@ -765,6 +740,137 @@
           ]
         }
       },
+      "checkConstraint": {}
+    },
+    "watch_alerts": {
+      "name": "watch_alerts",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "int",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "thesis": {
+          "name": "thesis",
+          "type": "varchar(500)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "varchar(10)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "varchar(20)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'active'"
+        },
+        "entry_conditions": {
+          "name": "entry_conditions",
+          "type": "json",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "invalidate_conditions": {
+          "name": "invalidate_conditions",
+          "type": "json",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "trade_plan": {
+          "name": "trade_plan",
+          "type": "json",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "resolved_at": {
+          "name": "resolved_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "resolved_reason": {
+          "name": "resolved_reason",
+          "type": "varchar(20)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "triggered_price": {
+          "name": "triggered_price",
+          "type": "float",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_watch_alerts_status": {
+          "name": "idx_watch_alerts_status",
+          "columns": [
+            "status"
+          ],
+          "isUnique": false
+        },
+        "idx_watch_alerts_symbol": {
+          "name": "idx_watch_alerts_symbol",
+          "columns": [
+            "symbol"
+          ],
+          "isUnique": false
+        },
+        "idx_watch_alerts_expires": {
+          "name": "idx_watch_alerts_expires",
+          "columns": [
+            "expires_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "watch_alerts_id": {
+          "name": "watch_alerts_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
       "checkConstraint": {}
     }
   },
