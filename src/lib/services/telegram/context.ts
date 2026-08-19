@@ -4,6 +4,7 @@
 import type TelegramBot from 'node-telegram-bot-api';
 import type { ExchangeService } from '../exchange';
 import type { MLService } from '../mlService';
+import type { WatchAlertService } from '../watchAlerts';
 import type { AlertState } from './types';
 
 /**
@@ -18,6 +19,8 @@ export interface TelegramContext {
     mlService: MLService;
     authorizedChatId: string;
     userStates: Map<number, AlertState>;
+    /** Optional — present when Watch Alerts feature is wired */
+    watchAlertService?: WatchAlertService;
     isAuthorized(chatId: number): boolean;
     sendMessage(message: string, options?: TelegramBot.SendMessageOptions): Promise<void>;
     updateUserState(chatId: number, newState: Partial<AlertState>): void;

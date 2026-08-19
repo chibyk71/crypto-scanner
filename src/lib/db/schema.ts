@@ -377,6 +377,87 @@ export const coolDownTable = mysqlTable('cool_down', {
     lastTradeAt: bigint('last_trade_at', { mode: 'number' }).notNull(),
 });
 
+
+/**
+ * =============================================================================
+ * WATCH ALERTS – LLM-PASTED RULE SETS (parallel to classic `alert` table)
+ * =============================================================================
+ *
+ * User pastes a JSON rule-set (entry + optional invalidate trees + trade plan).
+ * Bot evaluates every scan cycle; fire-once on entry or invalidate; hard expiry.
+ *
+ * Used by:
+ *   • WatchAlertService – create / evaluate / list
+ *   • MarketScanner.checkWatchAlerts()
+ *   • Telegram /watchlist + paste handlers
+ */
+export const watchAlerts = mysqlTable(
+    'watch_alerts',
+    {
+        id: int('id').primaryKey().autoincrement(),
+
+        /** Trading pair (e.g. 'BTC/USDT') */
+        symbol: varchar('symbol', { length: 50 }).notNull(),
+
+        /** Short thesis text from the LLM / user (max ~300 chars at validation) */
+        thesis: varchar('thesis', { length: 500 }).notNull(),
+
+        /** low | medium | high */
+        confidence: varchar('confidence', { length: 10 }).notNull(),
+
+        /** active | triggered | invalidated | expired */
+        status: varchar('status', { length: 20 }).notNull().default('active'),
+
+        /** Entry ConditionNode tree (JSON) */
+        entryConditions: json('entry_conditions').notNull(),
+
+        /** Optional invalidate ConditionNode tree (JSON) */
+        invalidateConditions: json('invalidate_conditions'),
+
+        /** Declarative TradePlanSpec (JSON) */
+        tradePlan: json('trade_plan').notNull(),
+
+        /** Unix ms when the alert was created */
+        createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+
+        /** Unix ms hard-expiry deadline */
+        expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+
+        /** Unix ms when status left active (nullable while active) */
+        resolvedAt: bigint('resolved_at', { mode: 'number' }),
+
+        /** entry_hit | invalidated | expired */
+        resolvedReason: varchar('resolved_reason', { length: 20 }),
+
+        /** Price at entry trigger (nullable until triggered) */
+        triggeredPrice: float('triggered_price'),
+    },
+    (table) => ({
+        statusIdx: index('idx_watch_alerts_status').on(table.status),
+        symbolIdx: index('idx_watch_alerts_symbol').on(table.symbol),
+        expiresIdx: index('idx_watch_alerts_expires').on(table.expiresAt),
+    })
+);
+
+/**
+ * =============================================================================
+ * TRENDING NOTIFICATIONS – PER-SYMBOL 12h COOLDOWN
+ * =============================================================================
+ *
+ * Tracks last time we notified the user that a symbol passed isTrending.
+ * One row per symbol (unique).
+ */
+export const trendingNotifications = mysqlTable('trending_notifications', {
+    id: int('id').primaryKey().autoincrement(),
+
+    /** Trading pair – unique so upsert is simple */
+    symbol: varchar('symbol', { length: 50 }).notNull().unique(),
+
+    /** Unix ms of last trending notification */
+    lastNotifiedAt: bigint('last_notified_at', { mode: 'number' }).notNull(),
+});
+
+
 /**
  * =============================================================================
  * TYPE INFERENCE (TypeScript magic)
@@ -417,3 +498,9 @@ export type SimulatedTrade = typeof simulatedTrades.$inferSelect;
 export type NewSimulatedTrade = Omit<
     typeof simulatedTrades.$inferInsert,
     'signalId' | 'openedAt' | 'closedAt' | 'outcome' | 'pnl' | 'rMultiple' | 'label' | 'maxFavorableExcursion' | 'maxAdverseExcursion' | 'trailingTriggered' | 'trailingExitPrice' | 'trailingExitPnl' | 'trailingExitAtMs'>;
+
+export type WatchAlertRow = typeof watchAlerts.$inferSelect;
+export type NewWatchAlertRow = typeof watchAlerts.$inferInsert;
+export type TrendingNotificationRow = typeof trendingNotifications.$inferSelect;
+export type NewTrendingNotificationRow = typeof trendingNotifications.$inferInsert;
+

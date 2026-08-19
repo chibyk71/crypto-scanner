@@ -54,6 +54,8 @@ import * as cooldownRepo from './repositories/cooldown';
 import * as simWrite from './repositories/simulations/writePath';
 import * as simRead from './repositories/simulations/readPath';
 import * as simAnalytics from './repositories/simulations/analytics';
+import * as watchAlertsWrite from './repositories/watchAlerts/writePath';
+import * as watchAlertsRead from './repositories/watchAlerts/readPath';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');
@@ -261,6 +263,46 @@ class DatabaseService {
     public async deleteAlert(id: number): Promise<boolean> {
         return alertsRepo.deleteAlert(this.db, id);
     }
+
+    // =========================================================================
+    // WATCH ALERTS
+    // =========================================================================
+    public async createWatchAlert(row: import('./schema').NewWatchAlertRow): Promise<number> {
+        return watchAlertsWrite.createWatchAlert(this.db, row);
+    }
+
+    public async updateWatchAlertStatus(
+        id: number,
+        status: import('../services/watchAlerts/types').WatchAlertStatus,
+        opts: {
+            resolvedAt: number;
+            resolvedReason: import('../services/watchAlerts/types').ResolvedReason;
+            triggeredPrice?: number | null;
+        }
+    ): Promise<boolean> {
+        return watchAlertsWrite.updateWatchAlertStatus(this.db, id, status, opts);
+    }
+
+    public async recordTrendingNotification(symbol: string, lastNotifiedAt: number): Promise<void> {
+        return watchAlertsWrite.recordTrendingNotification(this.db, symbol, lastNotifiedAt);
+    }
+
+    public async getActiveWatchAlerts(): Promise<import('../services/watchAlerts/types').WatchAlert[]> {
+        return watchAlertsRead.getActiveWatchAlerts(this.db);
+    }
+
+    public async countActiveWatchAlerts(): Promise<number> {
+        return watchAlertsRead.countActiveWatchAlerts(this.db);
+    }
+
+    public async getWatchAlertById(id: number): Promise<import('../services/watchAlerts/types').WatchAlert | undefined> {
+        return watchAlertsRead.getWatchAlertById(this.db, id);
+    }
+
+    public async getLastTrendingNotification(symbol: string): Promise<number | null> {
+        return watchAlertsRead.getLastTrendingNotification(this.db, symbol);
+    }
+
 
     // =========================================================================
     // TRADE LOGGING (delegated to repositories/trades.ts)

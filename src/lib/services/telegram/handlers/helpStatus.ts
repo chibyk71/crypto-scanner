@@ -18,6 +18,8 @@ export async function handleHelp(ctx: TelegramContext, msg: TelegramBot.Message)
         '',
         '*🔧 Alert Management*',
         '• `/alerts` — List all active custom alerts (paginated)',
+        '• `/watchlist` — Active watch alerts + condition progress',
+        '• `/watch` — How to paste an LLM watch-alert rule set',
         '• `/create_alert` — Step-by-step wizard to create a new alert',
         '• `/edit_alert` — Modify an existing alert',
         '• `/delete_alert` — Delete an alert (with confirmation)',

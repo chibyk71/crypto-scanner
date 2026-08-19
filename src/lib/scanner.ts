@@ -31,6 +31,12 @@ import { simulateTrade } from './services/simulateTrade';
 import { cooldownService } from './services/cooldownService';
 import type { MLService } from './services/mlService';
 import type { Strategy } from './strategy/';
+import { WatchAlertService } from './services/watchAlerts';
+import { checkAndNotify as checkTrendingNotify } from './services/watchAlerts/trending/trendingNotifier';
+import { computeIndicators } from './utils/indicatorUtils';
+import { analyzeTrendAndVolume } from './strategy/market/trendVolumeAnalysis';
+import { escape, formatR } from './services/telegram/utils/markdown';
+
 
 const logger = createLogger('MarketScanner');
 
@@ -82,6 +88,9 @@ export class MarketScanner {
     // Evaluates custom user-defined alerts
     private alertEvaluator = new AlertEvaluatorService();
 
+    /** Evaluates LLM-pasted watch-alert rule sets */
+    private watchAlertService: WatchAlertService | null = null;
+
     // Final resolved configuration with defaults applied
     private readonly opts: Required<ScannerOptions>;
 
@@ -120,6 +129,7 @@ export class MarketScanner {
 
         // ← Initialize AutoTradeService with exchange and db
         this.autoTradeService = new AutoTradeService(this.exchangeService, this.mlService, telegramService);
+        this.watchAlertService = new WatchAlertService(this.exchangeService);
 
         logger.info(`MarketScanner initialized for ${symbols.length} symbols`, {
             mode: this.opts.mode,
@@ -245,6 +255,9 @@ export class MarketScanner {
             // Evaluate user-defined custom alerts with fresh data
             await this.checkCustomAlerts();
 
+            // Evaluate LLM-pasted watch alerts (fire-once entry / invalidate / expiry)
+            await this.checkWatchAlerts();
+
             // Periodic heartbeat for monitoring (every N cycles)
             if (cycle % this.opts.heartbeatCycles === 0) {
                 const duration = Date.now() - start;
@@ -348,6 +361,23 @@ export class MarketScanner {
             }
 
             const currentPrice = primaryData.closes.at(-1)!;
+
+            // 3.5 Trending notifier — independent of Strategy signal
+            try {
+                const indicators = computeIndicators(primaryData, htfData);
+                const trendAndVolume = analyzeTrendAndVolume(primaryData, indicators, currentPrice);
+                await checkTrendingNotify(
+                    symbol,
+                    trendAndVolume,
+                    indicators,
+                    this.telegramService
+                );
+            } catch (trendErr) {
+                logger.debug(`[${correlationId}] Trending notifier skipped`, {
+                    symbol,
+                    error: trendErr instanceof Error ? trendErr.message : String(trendErr),
+                });
+            }
 
             // 4. Generate raw technical signal (base SL/TP, no regime filtering)
             const signal = await this.strategy.generateSignal({
@@ -562,6 +592,66 @@ export class MarketScanner {
             }
         }
     }
+
+    // =========================================================================
+    // WATCH ALERTS: Evaluate LLM-pasted rule sets (fire-once)
+    // =========================================================================
+    /**
+     * Checks all active watch alerts against live market data.
+     * Called from scanAllSymbols() alongside checkCustomAlerts().
+     */
+    private async checkWatchAlerts(): Promise<void> {
+        if (!this.watchAlertService) return;
+
+        try {
+            const events = await this.watchAlertService.evaluateActiveAlerts();
+            for (const ev of events) {
+                try {
+                    if (ev.event === 'triggered' && ev.resolvedPlan) {
+                        const p = ev.resolvedPlan;
+                        const a = ev.alert;
+                        const reasons = (ev.reasons ?? []).map(r => `• ${escape(r)}`).join('\n');
+                        const msg = [
+                            `*Watch Alert Triggered*`,
+                            `*Symbol:* \`${escape(a.symbol)}\``,
+                            `*Thesis:* ${escape(a.thesis)}`,
+                            `*Direction:* ${escape(p.direction)}`,
+                            `*Entry:* ${escape(p.entryPrice)}`,
+                            `*SL:* ${escape(p.stopLoss)}  *TP:* ${escape(p.takeProfit)}`,
+                            `*RR:* ${formatR(p.riskReward)}`,
+                            p.trailingActivePrice != null
+                                ? `*Trail arm:* ${escape(p.trailingActivePrice)}  giveback ${escape(p.trailingStop)}`
+                                : '',
+                            reasons ? `*Conditions:*\n${reasons}` : '',
+                        ].filter(Boolean).join('\n');
+                        await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
+                    } else if (ev.event === 'invalidated') {
+                        const a = ev.alert;
+                        const msg = [
+                            `*Watch setup invalidated*`,
+                            `\`${escape(a.symbol)}\` — ${escape(a.thesis.slice(0, 80))}`,
+                        ].join('\n');
+                        await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
+                    } else if (ev.event === 'expired') {
+                        const a = ev.alert;
+                        const msg = [
+                            `*Watch alert expired*`,
+                            `\`${escape(a.symbol)}\` \#${escape(a.id)}`,
+                        ].join('\n');
+                        await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
+                    }
+                } catch (sendErr) {
+                    logger.error('Failed to send watch-alert message', {
+                        id: ev.alert.id,
+                        error: sendErr,
+                    });
+                }
+            }
+        } catch (err) {
+            logger.error('checkWatchAlerts failed', { error: err });
+        }
+    }
+
 
     // ===========================================================================
     // UTILITY: Retry wrapper

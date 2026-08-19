@@ -6,9 +6,9 @@ import type TelegramBot from 'node-telegram-bot-api';
 import type { Condition } from '../../../../types';
 import type { TelegramContext } from '../context';
 import { PAGE_SIZE, type AlertState } from '../types';
-import { createLogger } from '../../../logger';
+// import { createLogger } from '../../../logger';
 
-const logger = createLogger('TelegramBot');
+// const logger = createLogger('TelegramBot');
 
 export async function sendSymbolSelection(ctx: TelegramContext, chatId: number, page: number = 0): Promise<void> {
     let symbols = Array.from(ctx.exchange.getSupportedSymbols());

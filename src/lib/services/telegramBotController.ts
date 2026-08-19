@@ -23,6 +23,14 @@ import {
 } from './telegram/handlers/tradeAnalytics';
 import { handlePositions, handleTrades } from './telegram/handlers/positionsTrades';
 import { sendSignalAlert as sendSignalAlertImpl } from './telegram/signalAlert';
+import {
+    handleWatchlistCommand,
+    handleWatchHelp,
+    handleWatchAlertPaste,
+    handleWatchAlertCallback,
+} from './telegram/handlers/watchAlerts';
+import { WatchAlertService } from './watchAlerts';
+
 
 const logger = createLogger('TelegramBot');
 
@@ -39,6 +47,7 @@ export class TelegramBotController {
     private bot: TelegramBot;
     private readonly authorizedChatId: string;
     private readonly stateManager: UserStateManager;
+    private watchAlertService: WatchAlertService | undefined;
 
     /**
  * Initializes the Telegram bot in polling mode.
@@ -69,6 +78,7 @@ export class TelegramBotController {
         // === 2. Store dependencies and config ===
         this.authorizedChatId = config.telegram.chatId;
         this.stateManager = new UserStateManager();
+        this.watchAlertService = new WatchAlertService(this.exchange);
 
         // === 3. Initialize the TelegramBot client ===
         this.bot = new TelegramBot(config.telegram.token, {
@@ -119,6 +129,7 @@ export class TelegramBotController {
             mlService: this.mlService,
             authorizedChatId: this.authorizedChatId,
             userStates: this.stateManager.map,
+            watchAlertService: this.watchAlertService,
             isAuthorized: (chatId: number) => this.isAuthorized(chatId),
             sendMessage: (message, options) => this.sendMessage(message, options),
             updateUserState: (chatId, newState) => this.stateManager.updateUserState(chatId, newState),
@@ -191,14 +202,27 @@ export class TelegramBotController {
         // 7. Excursion & Regime Diagnostics
         this.bot.onText(/\/excursions(?:\s+(.+))?/, (msg, match) => handleExcursions(this.getContext(), msg, match));
 
+        // 8. Watch Alerts (LLM-pasted rule sets)
+        this.bot.onText(/\/watchlist/, (msg) => handleWatchlistCommand(this.getContext(), msg));
+        this.bot.onText(/\/watch$/, (msg) => handleWatchHelp(this.getContext(), msg));
+
         // =================================================================
-        // 8. Global Event Listeners (non-command input)
+        // 9. Global Event Listeners (non-command input)
         // =================================================================
-        // Handles free-text input during multi-step workflows (e.g., entering period/target)
-        this.bot.on('message', (msg) => handleMessage(this.getContext(), msg));
+        // Watch-alert JSON paste takes priority when the message looks like a rule-set
+        this.bot.on('message', async (msg) => {
+            const handled = await handleWatchAlertPaste(this.getContext(), msg);
+            if (handled) return;
+            await handleMessage(this.getContext(), msg);
+        });
 
         // Handles all inline keyboard interactions (selections, pagination, actions)
-        this.bot.on('callback_query', (query) => handleCallbackQuery(this.getContext(), query));
+        // Watch confirm/cancel callbacks are routed first
+        this.bot.on('callback_query', async (query) => {
+            const handled = await handleWatchAlertCallback(this.getContext(), query);
+            if (handled) return;
+            await handleCallbackQuery(this.getContext(), query);
+        });
 
         logger.info('All Telegram command and event listeners registered successfully');
     }
