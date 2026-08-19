@@ -11,8 +11,6 @@ import type { TelegramContext } from './telegram/context';
 import { UserStateManager } from './telegram/state/userStateManager';
 
 import { handleHelp, handleStatus, handleStopBot } from './telegram/handlers/helpStatus';
-import { handleAlerts, handleCreateAlertStart, handleEditAlertStart, handleDeleteAlertStart } from './telegram/handlers/alertCrud';
-import { handleMessage, handleCallbackQuery } from './telegram/handlers/alertWorkflow';
 import {
     handleMLStatus, handleMLReload, handleExportTrainingData,
     handleMLPause, handleMLResume, handleMLForceTrain,
@@ -174,12 +172,6 @@ export class TelegramBotController {
         this.bot.onText(/\/status/, (msg) => handleStatus(this.getContext(), msg));
         this.bot.onText(/\/stopbot/, (msg) => handleStopBot(this.getContext(), msg));
 
-        // 3. Custom Alert Management
-        this.bot.onText(/\/alerts/, (msg) => handleAlerts(this.getContext(), msg));
-        this.bot.onText(/\/create_alert/, (msg) => handleCreateAlertStart(this.getContext(), msg));
-        this.bot.onText(/\/edit_alert/, (msg) => handleEditAlertStart(this.getContext(), msg));
-        this.bot.onText(/\/delete_alert/, (msg) => handleDeleteAlertStart(this.getContext(), msg));
-
         // 4. ML Model Control & Monitoring
         this.bot.onText(/\/ml_status/, (msg) => handleMLStatus(this.getContext(), msg));
         this.bot.onText(/\/ml_pause/, (msg) => handleMLPause(this.getContext(), msg));
@@ -210,19 +202,11 @@ export class TelegramBotController {
         // 9. Global Event Listeners (non-command input)
         // =================================================================
         // Watch-alert JSON paste takes priority when the message looks like a rule-set
-        this.bot.on('message', async (msg) => {
-            const handled = await handleWatchAlertPaste(this.getContext(), msg);
-            if (handled) return;
-            await handleMessage(this.getContext(), msg);
-        });
+        this.bot.on('message', async (msg) => handleWatchAlertPaste(this.getContext(), msg));
 
         // Handles all inline keyboard interactions (selections, pagination, actions)
         // Watch confirm/cancel callbacks are routed first
-        this.bot.on('callback_query', async (query) => {
-            const handled = await handleWatchAlertCallback(this.getContext(), query);
-            if (handled) return;
-            await handleCallbackQuery(this.getContext(), query);
-        });
+        this.bot.on('callback_query', async (query) => handleWatchAlertCallback(this.getContext(), query));
 
         logger.info('All Telegram command and event listeners registered successfully');
     }

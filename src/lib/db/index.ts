@@ -25,17 +25,15 @@ import mysql from 'mysql2/promise';
 
 // Import all table definitions and TypeScript types from schema
 import {
-    alert,
     locks,
     heartbeat,
     trades,
     simulatedTrades,
-    type Alert,
-    type NewAlert,
     type NewTrade,
     type SimulatedTrade,
     coolDownTable,
     ohlcvHistory,
+    watchAlerts,
 } from './schema';
 
 import { config } from '../config/settings';
@@ -47,7 +45,6 @@ import type { MarketRegime } from '../strategy/regime/types';
 export type { EnrichedSymbolHistory } from './types';
 
 // Domain repositories (extracted from the former god file)
-import * as alertsRepo from './repositories/alerts';
 import * as tradesRepo from './repositories/trades';
 import * as locksRepo from './repositories/locks';
 import * as cooldownRepo from './repositories/cooldown';
@@ -137,7 +134,7 @@ class DatabaseService {
                 // logger: true only in dev → enables query logging for debugging
                 this.drizzleDb = drizzle(this.pool, {
                     schema: {
-                        alert,
+                        watchAlerts,
                         locks,
                         heartbeat,
                         trades,
@@ -227,41 +224,6 @@ class DatabaseService {
             this.pool = null;
             this.drizzleDb = null;
         }
-    }
-
-    // =========================================================================
-    // ALERT MANAGEMENT (delegated to repositories/alerts.ts)
-    // =========================================================================
-    public async getActiveAlerts(): Promise<Alert[]> {
-        return alertsRepo.getActiveAlerts(this.db);
-    }
-
-    public async createAlert(alertData: NewAlert): Promise<number> {
-        return alertsRepo.createAlert(this.db, alertData);
-    }
-
-    public async getAlertsBySymbol(symbol: string): Promise<Alert[]> {
-        return alertsRepo.getAlertsBySymbol(this.db, symbol);
-    }
-
-    public async getAlertsById(id: number): Promise<Alert | undefined> {
-        return alertsRepo.getAlertsById(this.db, id);
-    }
-
-    public async updateAlert(id: number, alertData: Partial<NewAlert>): Promise<boolean> {
-        return alertsRepo.updateAlert(this.db, id, alertData);
-    }
-
-    public async updateAlertStatus(id: number, status: 'triggered' | 'canceled'): Promise<boolean> {
-        return alertsRepo.updateAlertStatus(this.db, id, status);
-    }
-
-    public async setLastAlertTime(id: number, timestamp: number): Promise<void> {
-        return alertsRepo.setLastAlertTime(this.db, id, timestamp);
-    }
-
-    public async deleteAlert(id: number): Promise<boolean> {
-        return alertsRepo.deleteAlert(this.db, id);
     }
 
     // =========================================================================

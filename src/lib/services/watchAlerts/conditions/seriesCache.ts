@@ -118,7 +118,7 @@ export class SeriesCache {
                 timeframe,
                 undefined,
                 undefined,
-                true
+                false
             );
 
             if (!data || data.closes.length < config.historyLength) {

@@ -6,7 +6,6 @@ import type TelegramBot from 'node-telegram-bot-api';
 import { createLogger } from '../../../logger';
 import type { TelegramContext } from '../context';
 import { escape, formatR } from '../utils/markdown';
-import type { WatchAlertService } from '../../watchAlerts';
 import type { PendingWatchAlert } from '../../watchAlerts';
 import { clampExpiryHours } from '../../watchAlerts/schema';
 

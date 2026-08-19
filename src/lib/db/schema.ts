@@ -1,6 +1,5 @@
 // src/lib/db/schema.ts
 import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, decimal, uniqueIndex } from 'drizzle-orm/mysql-core';
-import type { Condition } from '../../types';
 import type { MarketRegime } from '../strategy/regime/types';
 
 /**
@@ -24,51 +23,6 @@ export const session = mysqlTable('session', {
         .notNull()
         .references(() => user.id, { onDelete: 'cascade' }),
     expiresAt: timestamp('expires_at').notNull(),
-});
-
-/**
- * =============================================================================
- * ALERT SYSTEM
- * =============================================================================
- *
- * Custom user-defined alerts allow traders to be notified when specific market
- * conditions are met on a chosen symbol and timeframe.
- *
- * Features:
- *   • Flexible JSON conditions (multiple AND logic)
- *   • Cooldown via lastAlertAt to prevent spam
- *   • Status tracking (active/triggered/canceled)
- *   • Optional note for user reference
- *
- * Used by:
- *   • TelegramBotController – create/edit/delete via commands
- *   • MarketScanner – evaluates conditions every cycle
- *   • AlertEvaluatorService – actual condition checking
- */
-export const alert = mysqlTable('alert', {
-    /** Auto-incrementing primary key */
-    id: int('id').primaryKey().autoincrement(),
-
-    /** Trading pair (e.g., 'BTC/USDT') – required */
-    symbol: varchar('symbol', { length: 50 }).notNull(),
-
-    /** Array of conditions in JSON format – parsed to Condition[] in TypeScript */
-    conditions: json('conditions').$type<Condition[]>().notNull(),
-
-    /** Timeframe for evaluation (e.g., '1h', '15m') – defaults to 1h */
-    timeframe: varchar('timeframe', { length: 10 }).notNull().default('1h'),
-
-    /** Current status – 'active' = monitored, 'triggered'/'canceled' = inactive */
-    status: varchar('status', { length: 20 }).notNull().default('active'),
-
-    /** When the alert was created */
-    createdAt: timestamp('created_at').defaultNow(),
-
-    /** Optional free-text note from the user (e.g., "Watch for breakout") */
-    note: varchar('note', { length: 255 }),
-
-    /** Unix millisecond timestamp of last trigger – used for cooldown/throttling */
-    lastAlertAt: bigint('last_alert_at', { mode: 'number' }).default(0),
 });
 
 /**
@@ -476,9 +430,6 @@ export const trendingNotifications = mysqlTable('trending_notifications', {
  */
 export type Session = typeof session.$inferSelect;
 export type User = typeof user.$inferSelect;
-
-export type Alert = typeof alert.$inferSelect;
-export type NewAlert = typeof alert.$inferInsert;
 
 export type Lock = typeof locks.$inferSelect;
 export type Heartbeat = typeof heartbeat.$inferSelect;

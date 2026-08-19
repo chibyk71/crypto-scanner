@@ -25,7 +25,6 @@ import { AutoTradeService } from './services/autoTradeService';        // ← Ha
 import { createLogger } from './logger';
 import { config } from './config/settings';
 import type { OhlcvData } from '../types';
-import { AlertEvaluatorService } from './services/alertEvaluator';
 import type { TelegramBotController } from './services/telegramBotController';
 import { simulateTrade } from './services/simulateTrade';
 import { cooldownService } from './services/cooldownService';
@@ -84,9 +83,6 @@ export class MarketScanner {
 
     // Higher-timeframe cache – reduces API load dramatically
     private htfCache: Record<string, CachedHtf> = {};
-
-    // Evaluates custom user-defined alerts
-    private alertEvaluator = new AlertEvaluatorService();
 
     /** Evaluates LLM-pasted watch-alert rule sets */
     private watchAlertService: WatchAlertService | null = null;
@@ -251,9 +247,6 @@ export class MarketScanner {
                 () => this.processWorker(queue)
             );
             await Promise.all(workers);
-
-            // Evaluate user-defined custom alerts with fresh data
-            await this.checkCustomAlerts();
 
             // Evaluate LLM-pasted watch alerts (fire-once entry / invalidate / expiry)
             await this.checkWatchAlerts();
@@ -538,59 +531,6 @@ export class MarketScanner {
 
         // Return cached data (fast path)
         return cached.data;
-    }
-
-    // =========================================================================
-    // CUSTOM ALERTS: Evaluate user-defined conditions
-    // =========================================================================
-    /**
-     * Checks all active custom alerts against current market data.
-     *
-     * Called from:
-     *   • scanAllSymbols() – after processing all symbols
-     *
-     * Behavior:
-     *   • Respects per-alert cooldown
-     *   • Fetches fresh data for each alert's symbol/timeframe
-     *   • Evaluates conditions via AlertEvaluatorService
-     *   • Sends Telegram notification on trigger
-     *   • Updates lastAlertAt for throttling
-     */
-    private async checkCustomAlerts(): Promise<void> {
-        const alerts = await dbService.getActiveAlerts();
-        const now = Date.now();
-
-        // Process each alert independently
-        for (const alert of alerts) {
-            try {
-                // Fetch data for alert's specific symbol and timeframe
-                const data = await this.exchangeService.getOHLCV(alert.symbol, alert.timeframe || '1h');
-                if (!data || data.closes.length < config.historyLength) continue;
-
-                // Evaluate user-defined conditions
-                const { conditionsMet, reasons } = this.alertEvaluator.evaluate(data, alert.conditions);
-
-                if (conditionsMet) {
-                    // Build and send trigger message
-                    const msg = [
-                        `**Custom Alert Triggered**`,
-                        `**Symbol:** ${alert.symbol} (${alert.timeframe})`,
-                        `**Conditions:**`,
-                        ...reasons.map(r => `• ${r}`),
-                    ].join('\n');
-
-                    await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
-
-                    // Update cooldown timestamp
-                    await dbService.setLastAlertTime(alert.id, now);
-
-                    logger.info(`Custom alert ${alert.id} triggered`, { symbol: alert.symbol });
-                }
-            } catch (err) {
-                // Individual alert failure – log but continue with others
-                logger.error(`Alert ${alert.id} failed`, { error: err });
-            }
-        }
     }
 
     // =========================================================================

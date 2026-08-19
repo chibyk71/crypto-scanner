@@ -47,7 +47,7 @@ export function resolveTradePlan(
     const stopLoss = isLong ? price - slDistance : price + slDistance;
     const takeProfit = isLong ? price + tpDistance : price - tpDistance;
 
-    let trailingStop: number | null = null;
+    let trailingStop: number | undefined;
     let trailingActivePrice: number | null = null;
     let trailingStopPct: number | null = null;
 

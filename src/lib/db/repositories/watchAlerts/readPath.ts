@@ -9,7 +9,7 @@ import type {
     TradePlanSpec,
     WatchAlert,
     WatchAlertStatus,
-} from '../../../../../watch-alerts-export/src/lib/watchAlerts/types';
+} from '../../../services/watchAlerts/types';
 
 type Db = MySql2Database<any>;
 
