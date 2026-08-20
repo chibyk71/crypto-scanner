@@ -32,7 +32,6 @@ import {
 import {
     BULL_MARKET_LIQUIDITY_MULTIPLIER,
     LIQUIDITY_SWEEP_LOOKBACK,
-    MIN_ADX,
     MIN_AVG_VOLUME_USD_PER_HOUR,
     MIN_DI_DIFF,
     RELATIVE_VOLUME_MULTIPLIER,
@@ -161,8 +160,13 @@ export function analyzeTrendAndVolume(
         `ADX Analysis for ${primaryData.symbol}: ADX=${adx.toFixed(2)}, +DI=${pdi.toFixed(2)}, -DI=${mdi.toFixed(2)}, DI Diff=${diDiff.toFixed(2)}`
     );
 
+    // Trend-eligibility gate is now DI-separation only (no ADX floor).
+    // ADX is a smoothed average of directional movement, so requiring
+    // it to clear MIN_ADX means requiring several periods of already-
+    // sustained movement before a signal is even eligible — too slow
+    // for a scalping bot trying to catch moves early. DI separation
+    // reacts faster since it isn't smoothed the same way.
     const isTrending =
-        adx > MIN_ADX &&
         diDiff > MIN_DI_DIFF;
 
     const trendBias = isTrending

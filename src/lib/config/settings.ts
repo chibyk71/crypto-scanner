@@ -57,7 +57,7 @@ const ConfigSchema = z.object({
     SYMBOLS: z.string().default('BTC/USDT,ETH/USDT').transform(str => str.split(',').map(s => s.trim())),
     TIMEFRAME: z.string().default('3m'),
     TIMEFRAME_SIMULATION: z.string().default('1m'),  // only for backtesting / simulation / excursion calc
-    HTF_TIMEFRAME: z.string().default('1h'),
+    HTF_TIMEFRAME: z.string().default('15m'), // higher timeframe for trend filter
 
     // ──────────────────────────────────────────────────────────────
     // Scanner Behavior

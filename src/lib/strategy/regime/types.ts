@@ -52,10 +52,11 @@ export interface RegimeClassification {
     diDiff: number;
 
     /**
-     * Existing trend classification from analyzeTrendAndVolume().
-     *
-     * This is retained so ranging/choppy labels can be audited against the
-     * exact existing definition of "trending" without duplicating that logic.
+     * Regime's own ADX+DI trending determination — computed independently
+     * inside classifyRegime.ts, decoupled from the trade-eligibility gate
+     * in trendVolumeAnalysis.ts (which uses DI-separation only, no ADX
+     * floor). This keeps regime labels internally consistent even as gate
+     * logic evolves.
      */
     isTrending: boolean;
 }

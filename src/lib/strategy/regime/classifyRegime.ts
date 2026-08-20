@@ -28,14 +28,20 @@ import type { RegimeClassification } from './types';
 export function classifyRegime(
     indicators: IndicatorMap,
     price: number,
-    trendBias: TrendAndVolume['trendBias'],
-    isTrending: boolean
+    trendBias: TrendAndVolume['trendBias']
 ): RegimeClassification {
     const adx = indicators.last.htfAdx;
     const pdi = indicators.last.htfPdi;
     const mdi = indicators.last.htfMdi;
 
     const diDiff = Math.abs(pdi - mdi);
+
+    // Regime's own trending determination — intentionally decoupled from
+    // the trade-eligibility gate in trendVolumeAnalysis.ts (which no
+    // longer requires ADX). This keeps regime labels comparable over
+    // time even as gate logic evolves. Uses the original ADX+DI
+    // definition unchanged.
+    const regimeIsTrending = adx > MIN_ADX && diDiff > MIN_DI_DIFF;
 
     const atrPct = price > 0
         ? (indicators.last.atr / price) * 100
@@ -58,7 +64,7 @@ export function classifyRegime(
     ) {
         regime = 'weak_trend';
     } else if (
-        !isTrending &&
+        !regimeIsTrending &&
         bbBandwidth >= MIN_BB_BANDWIDTH_PCT
     ) {
         regime = 'ranging';
@@ -84,6 +90,6 @@ export function classifyRegime(
         pdi,
         mdi,
         diDiff,
-        isTrending,
+        isTrending: regimeIsTrending,
     };
 }

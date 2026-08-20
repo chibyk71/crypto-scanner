@@ -124,8 +124,7 @@ export class Strategy {
             const regimeClassification = classifyRegime(
                 indicators,
                 price,
-                trendAndVolume.trendBias,
-                trendAndVolume.isTrending
+                trendAndVolume.trendBias
             );
 
             // === 3. Reject non-trending markets ===
