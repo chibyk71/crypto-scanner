@@ -31,7 +31,7 @@ from utils import (
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_PATH   = Path('data/training_export.csv')
+DATA_PATH   = Path('data/simulated_trades.csv')
 OUTPUT_PATH = Path('models/model.onnx')
 
 # ── XGBoost hyperparameters ───────────────────────────────────────────────────

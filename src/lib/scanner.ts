@@ -576,7 +576,7 @@ export class MarketScanner {
                         const a = ev.alert;
                         const msg = [
                             `*Watch alert expired*`,
-                            `\`${escape(a.symbol)}\` \#${escape(a.id)}`,
+                            `\`${escape(a.symbol)}\` \\#${escape(a.id)}`,
                         ].join('\n');
                         await this.telegramService?.sendMessage(msg, { parse_mode: 'MarkdownV2' });
                     }

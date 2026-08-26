@@ -33,7 +33,7 @@ from utils import (
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_PATH   = Path('data/training_export.csv')
+DATA_PATH   = Path('data/simulated_trades.csv')
 MODEL_PATH  = Path('models/model.onnx')
 
 # Minimum acceptable per-class accuracy to pass validation

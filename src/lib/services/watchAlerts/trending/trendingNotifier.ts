@@ -61,7 +61,6 @@ export async function checkAndNotify(
         `• Stoch K/D: ${escape(lastSnap.stochasticK.toFixed(2))} / ${escape(lastSnap.stochasticD.toFixed(2))}`,
         `• Momentum: ${escape(lastSnap.momentum.toFixed(4))}  VWMA: ${escape(lastSnap.vwma.toFixed(6))}  VWAP: ${escape(lastSnap.vwap.toFixed(6))}`,
         ``,
-        `_Paste this block to an LLM as market context for a watch\\-alert rule set\\._`,
     ];
 
     try {

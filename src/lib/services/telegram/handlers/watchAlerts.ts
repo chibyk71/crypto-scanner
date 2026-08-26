@@ -47,7 +47,7 @@ export async function handleWatchlistCommand(
                 `*\\#${escape(a.id)}* \`${escape(a.symbol)}\` \\(${escape(a.confidence)}\\)`,
                 escape(a.thesis.slice(0, 120)),
                 `Progress: ${escape(item.metCount)}/${escape(item.totalCount)} conditions`,
-                `Expires in ~${escape(expiresInH.toFixed(1))}h`,
+                `Expires in \\~${escape(expiresInH.toFixed(1))}h`,
                 ''
             );
             for (const leaf of item.leaves.slice(0, 6)) {

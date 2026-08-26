@@ -38,12 +38,12 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     // Exchange & Trading Mode
     // ──────────────────────────────────────────────────────────────
-    AUTO_TRADE_ENABLED: z.coerce.boolean().default(false),
-    FIXED_TRADE_USD: z.coerce.number().default(20).optional(), // If set, overrides position sizing to fixed USD amount
+    AUTO_TRADE_ENABLED: z.coerce.boolean().default(true),
+    FIXED_TRADE_USD: z.coerce.number().default(100).optional(), // If set, overrides position sizing to fixed USD amount
     EXCHANGE: z.enum(Object.values(exchanges) as unknown as string[]).default('bybit'),
     EXCHANGE_API_KEY: z.string().optional(),
     EXCHANGE_API_SECRET: z.string().optional(),
-    EXCHANGE_TESTNET: z.coerce.boolean().default(true),
+    EXCHANGE_TESTNET: z.coerce.boolean().default(false),
 
     // ──────────────────────────────────────────────────────────────
     // Telegram Notifications
@@ -74,7 +74,7 @@ const ConfigSchema = z.object({
     /** % favorable move required before the trailing stop arms */
     TRAIL_ACTIVATION_PCT: z.coerce.number().default(0.2),
     /** Giveback distance (%) maintained behind peak once armed */
-    TRAIL_GIVEBACK_PCT: z.coerce.number().default(0.15),
+    TRAIL_GIVEBACK_PCT: z.coerce.number().default(0.10),
     POSITION_SIZE_PERCENT: z.coerce.number().min(0.1).max(10).default(1.0),
     LEVERAGE: z.coerce.number().default(5),
 
