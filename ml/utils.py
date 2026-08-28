@@ -41,6 +41,9 @@ TECHNICAL_FEATURE_INDICES = list(range(0, 27))
 HISTORY_FEATURE_INDICES = list(range(27, 33))
 FULL_FEATURE_INDICES = list(range(0, EXPECTED_FEATURES))
 
+# Unix ms timestamps before this are treated as invalid (pre-2015 / epoch pollution)
+MIN_VALID_CLOSED_AT_MS = 1_420_070_400_000  # 2015-01-01 UTC
+
 
 @dataclass
 class TrainingFrame:
@@ -52,6 +55,8 @@ class TrainingFrame:
     symbols: Optional[np.ndarray]
     sides: Optional[np.ndarray]
     sorted_chronologically: bool
+    n_dropped_invalid_timestamp: int = 0
+    n_raw_rows: int = 0
 
 
 def _parse_features_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
@@ -73,12 +78,26 @@ def _parse_features_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     return df, failures
 
 
-def _resolve_closed_at(df: pd.DataFrame) -> np.ndarray:
+def _extract_closed_at_series(df: pd.DataFrame) -> Tuple[Optional[pd.Series], Optional[str]]:
+    """Extract closed_at as numeric series without substituting defaults.
+    Invalid values remain NaN — never coerced to 0.
+    """
     for candidate in ("closed_at", "closedAt", "closed_at_ms"):
         if candidate in df.columns:
             series = pd.to_numeric(df[candidate], errors="coerce")
-            return series.fillna(0).astype(np.int64).values
-    return np.zeros(len(df), dtype=np.int64)
+            return series, candidate
+    return None, None
+
+
+def is_valid_closed_at(value) -> bool:
+    """True if value is a finite integer ms timestamp in a plausible range."""
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return False
+        v = int(value)
+        return v >= MIN_VALID_CLOSED_AT_MS
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def load_training_frame(
@@ -87,7 +106,20 @@ def load_training_frame(
     sort_chronologically: bool = True,
     min_samples: int = 50,
     verbose: bool = True,
+    require_valid_timestamps: bool = True,
 ) -> TrainingFrame:
+    """Load training CSV into a TrainingFrame.
+
+    When sort_chronologically=True (evaluation path):
+      - Missing/invalid closed_at rows are DROPPED (not coerced to 0).
+      - Count of dropped rows is reported on the frame and in verbose output.
+      - If require_valid_timestamps and zero valid timestamps remain after drop,
+        raises ValueError (chronological integrity cannot be established).
+
+    When sort_chronologically=False (train.py production path compatibility):
+      - Timestamp column is optional; invalid values marked as -1.
+      - Does NOT invent chronological order from zero timestamps.
+    """
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(
@@ -135,9 +167,44 @@ def load_training_frame(
     X = X[~bad]
     df = df.loc[~bad].copy()
 
+    ts_series, ts_col = _extract_closed_at_series(df)
+    n_dropped_ts = 0
+
+    if sort_chronologically:
+        if ts_series is None:
+            raise ValueError(
+                "Chronological evaluation requires a closed_at / closedAt / "
+                "closed_at_ms column. None found — cannot establish temporal order."
+            )
+        valid_mask = ts_series.apply(is_valid_closed_at).to_numpy()
+        n_dropped_ts = int((~valid_mask).sum())
+        if n_dropped_ts and verbose:
+            print(
+                f"  Dropped {n_dropped_ts} rows with missing/invalid {ts_col} "
+                f"(not coerced to 0; min valid ms={MIN_VALID_CLOSED_AT_MS})"
+            )
+        if not valid_mask.any():
+            if require_valid_timestamps:
+                raise ValueError(
+                    f"All {len(df)} rows have missing/invalid {ts_col}. "
+                    "Chronological integrity cannot be established. "
+                    "Refusing to invent timestamps."
+                )
+        X = X[valid_mask]
+        df = df.loc[valid_mask].copy()
+        closed_at = ts_series.loc[valid_mask].astype(np.int64).to_numpy()
+    else:
+        if ts_series is not None:
+            closed_at = np.where(
+                ts_series.apply(is_valid_closed_at).to_numpy(),
+                ts_series.fillna(-1).astype(np.int64).to_numpy(),
+                np.full(len(df), -1, dtype=np.int64),
+            )
+        else:
+            closed_at = np.full(len(df), -1, dtype=np.int64)
+
     y_native = df["label"].astype(int).values.astype(np.int32)
     y_internal = np.array([LABEL_TO_INTERNAL[int(l)] for l in y_native], dtype=np.int32)
-    closed_at = _resolve_closed_at(df)
     entry_prices = (
         np.array(df["entry_price"].astype(float).values, dtype=np.float64)
         if "entry_price" in df.columns
@@ -160,16 +227,18 @@ def load_training_frame(
             sides = sides[order]
         sorted_flag = True
         if verbose and len(closed_at) > 1:
-            n_zero = int((closed_at == 0).sum())
-            if n_zero:
-                print(f"  WARNING: {n_zero} rows have closed_at=0 (missing); sorted first")
             if np.any(np.diff(closed_at) < 0):
                 raise RuntimeError("closed_at not non-decreasing after sort")
+            if np.any(closed_at < MIN_VALID_CLOSED_AT_MS):
+                raise RuntimeError(
+                    "Internal error: invalid closed_at survived filter"
+                )
 
     if verbose:
         print(f"\n  Total rows:   {total_rows}")
         print(f"  Valid rows:   {len(X)}")
         print(f"  Dropped:      {total_rows - len(X)}")
+        print(f"  Dropped invalid timestamps: {n_dropped_ts}")
         print(f"  Features:     {X.shape[1]}")
         print(f"  Chronological sort: {sorted_flag}")
         print("\n  Native label distribution (-2..+2):")
@@ -191,12 +260,16 @@ def load_training_frame(
         symbols=symbols,
         sides=sides,
         sorted_chronologically=sorted_flag,
+        n_dropped_invalid_timestamp=n_dropped_ts,
+        n_raw_rows=total_rows,
     )
 
 
 def load_training_data(csv_path: str | Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Backward-compatible loader for train.py (no chronological sort). """
-    frame = load_training_frame(csv_path, sort_chronologically=False, verbose=True)
+    """ Backward-compatible loader for train.py (no chronological sort). """
+    frame = load_training_frame(
+        csv_path, sort_chronologically=False, require_valid_timestamps=False, verbose=True
+    )
     return frame.X, frame.y_internal, frame.entry_prices
 
 
