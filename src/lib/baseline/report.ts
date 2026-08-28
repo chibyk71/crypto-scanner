@@ -198,7 +198,7 @@ export function formatBaselineMarkdown(report: BaselineReport): string {
   lines.push('| Field | Value |');
   lines.push('|-------|-------|');
   lines.push(`| Repository | ${m.repository} |`);
-  lines.push(`| Git commit SHA | \`${m.gitCommitSha}\` |`);
+  lines.push('| Git commit SHA | `' + m.gitCommitSha + '` |');
   lines.push(`| Report generated at | ${m.reportGeneratedAt} |`);
   lines.push(`| Data cutoff timestamp | ${m.dataCutoffTimestamp ?? 'none (full table)'} |`);
   lines.push(`| Dataset definition | ${m.datasetDefinition} |`);
@@ -343,7 +343,7 @@ export function formatBaselineMarkdown(report: BaselineReport): string {
 
   lines.push('## 12. Drawdown / equity analysis');
   lines.push('');
-  lines.push(`- Ordering field: \`${report.drawdownMethodology.orderingField}\`);
+  lines.push('- Ordering field: `' + report.drawdownMethodology.orderingField + '`');
   lines.push(`- Starting equity: ${report.drawdownMethodology.startingEquityR} R`);
   lines.push(`- Open trades excluded: ${report.drawdownMethodology.openTradesExcluded}`);
   lines.push(
