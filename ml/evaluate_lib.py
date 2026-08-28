@@ -68,40 +68,50 @@ EVAL_XGB_PARAMS = dict(
 #   inference engine, not a feature subset.
 #
 # Production path (computeScores):
-#   1. Technical buy/sell scores accumulate from indicators
+#   1. buyScore/sellScore accumulate from indicators (not stored in the CSV)
 #   2. ML predict(features) → label + confidence → bonus/penalty on scores
-#   Technical scores are NOT stored in the training CSV.
 #
-# Therefore:
-#   - "ML-only" as a pure feature subset CANNOT be isolated faithfully.
-#   - Closest valid conditions supported by the CSV:
+# Phase 1 measurement adapters (NOT a replay of production scores):
+#   signal_subset_0_26  (key: "technical_only" kept for report continuity):
+#       indices 0–26 — the 27-feature signal-input subset used as the
+#       measurement baseline. Includes contemporaneous indicators, excursion-
+#       history MFE/MAE/ratios, market context, and pattern flags.
+#       This is NOT identical to production buyScore/sellScore calculation.
 #
-#   technical_only  : indices 0–26 (technical + excursion + context + patterns)
-#   full_feature_ml : indices 0–32 (production ML input vector — all 33)
+#   full_feature_ml:
+#       indices 0–32 — all 33 production ML *input* features.
+#       NOT "ML-only". Includes signal subset + prev-sim outcomes + identity.
 #
-# We report technical_only vs full_feature_ml and explicitly document that
-# pure ML-only and production Technical+ML score fusion cannot be measured
-# from the export CSV alone.
+# Pure ML-only cannot be isolated from the export CSV.
+#
+# Partition design (fixed-model diagnostic — no selection on validation):
+#   TRAIN (60%)       → fit only
+#   VALIDATION (20%)  → diagnostic metrics only (not used for selection)
+#   FINAL TEST (20%)  → untouched final evidence
+# All formulations × conditions are reported independently; no winner is
+# chosen from validation or test for model/config selection in Phase 1.
 # =============================================================================
 
 INFORMATION_CONDITIONS = {
     "technical_only": {
         "indices": TECHNICAL_FEATURE_INDICES,
         "description": (
-            "Feature indices 0–26: contemporaneous technical indicators, "
-            "excursion regime, market context, pattern flags. Excludes "
-            "previous-simulation outcomes and symbol_index."
+            "27-feature signal-input subset (indices 0–26): contemporaneous "
+            "indicators, excursion-history MFE/MAE/ratios, market context, "
+            "pattern flags. Measurement baseline only — NOT a replay of "
+            "production buyScore/sellScore (those score-level values are not "
+            "in the training export)."
         ),
-        "role": "Technical-only",
+        "role": "Signal-input subset 0–26 (measurement baseline; not production score)",
     },
     "full_feature_ml": {
         "indices": FULL_FEATURE_INDICES,
         "description": (
-            "All 33 features matching production mlService.extractFeatures(). "
-            "This is the production ML *input* vector, not an ML-only subset. "
-            "Features include technical + historical edge + identity."
+            "All 33 production ML input features matching "
+            "mlService.extractFeatures(). NOT pure ML-only — includes the "
+            "signal-input subset plus prev-sim outcomes and symbol_index."
         ),
-        "role": "Production ML feature set (NOT pure ML-only)",
+        "role": "Full production ML input vector (33 features; not ML-only)",
     },
 }
 
