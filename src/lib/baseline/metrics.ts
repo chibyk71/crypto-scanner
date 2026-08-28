@@ -103,8 +103,13 @@ export function computePerformanceMetrics(rows: BaselineTradeRow[]): Performance
   const profitFactor =
     grossLossR < 0 ? grossProfitR / Math.abs(grossLossR) : null;
 
-  const mfeValues = rows.map((r) => r.mfe).filter((v) => Number.isFinite(v));
-  const maeValues = rows.map((r) => r.mae).filter((v) => Number.isFinite(v));
+  // Exclude null/missing MFE/MAE from aggregates — missing ≠ 0
+  const mfeValues = rows
+    .map((r) => r.mfe)
+    .filter((v): v is number => v != null && Number.isFinite(v));
+  const maeValues = rows
+    .map((r) => r.mae)
+    .filter((v): v is number => v != null && Number.isFinite(v));
   const sortedMfe = [...mfeValues].sort((a, b) => a - b);
   const sortedMae = [...maeValues].sort((a, b) => a - b);
 
@@ -229,14 +234,33 @@ export function auditDataQuality(allRows: BaselineTradeRow[]): {
     });
   }
 
+  // null or non-finite MFE/MAE are missing measurements — never treated as 0
+  const missingMfe = completed.filter((r) => r.mfe == null || !Number.isFinite(r.mfe));
+  const missingMae = completed.filter((r) => r.mae == null || !Number.isFinite(r.mae));
   const missingMfeMae = completed.filter(
-    (r) => !Number.isFinite(r.mfe) || !Number.isFinite(r.mae)
+    (r) => r.mfe == null || !Number.isFinite(r.mfe) || r.mae == null || !Number.isFinite(r.mae)
   );
+  if (missingMfe.length > 0) {
+    issues.push({
+      code: 'missing_mfe',
+      count: missingMfe.length,
+      description: 'Completed simulations with null/non-finite MFE (excluded from MFE aggregates only)',
+      excluded: false,
+    });
+  }
+  if (missingMae.length > 0) {
+    issues.push({
+      code: 'missing_mae',
+      count: missingMae.length,
+      description: 'Completed simulations with null/non-finite MAE (excluded from MAE aggregates only)',
+      excluded: false,
+    });
+  }
   if (missingMfeMae.length > 0) {
     issues.push({
       code: 'missing_mfe_mae',
       count: missingMfeMae.length,
-      description: 'Completed simulations with missing MFE/MAE',
+      description: 'Completed simulations with missing MFE and/or MAE (not fabricated as zero)',
       excluded: false,
     });
   }
