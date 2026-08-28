@@ -43,7 +43,10 @@
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",
         "db:studio": "drizzle-kit studio",
-        "start:github": "node -r dotenv dist/index-github.js"
+        "start:github": "node -r dotenv dist/index-github.js",
+        "baseline:report": "ts-node -r dotenv/config scripts/baseline/generate-baseline-report.ts",
+        "baseline:fixture": "ts-node -r dotenv/config scripts/baseline/generate-baseline-report.ts --fixture",
+        "test:baseline": "ava --timeout=30s build/main/lib/baseline/metrics.spec.js"
     },
     "engines": {
         "node": ">=20"
@@ -104,7 +107,8 @@
         "typescript": {
             "rewritePaths": {
                 "src/": "build/main/"
-            }
+            },
+            "compile": false
         },
         "files": [
             "!build/module/**"
