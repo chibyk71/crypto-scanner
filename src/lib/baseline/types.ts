@@ -21,10 +21,16 @@ export interface BaselineTradeRow {
   /** Realized PnL in quote currency (human units) */
   pnl: number;
   label: number | null;
-  /** MFE as percent of entry (human units, e.g. 1.5 = 1.5%) */
-  mfe: number;
-  /** MAE as percent of entry (human units, typically negative or absolute depending on storage) */
-  mae: number;
+  /**
+   * MFE as percent of entry (human units, e.g. 1.5 = 1.5%).
+   * null = measurement missing (not the same as 0).
+   */
+  mfe: number | null;
+  /**
+   * MAE as percent of entry (human units).
+   * null = measurement missing (not the same as 0).
+   */
+  mae: number | null;
   durationMs: number;
   timeToMFEMs: number;
   timeToMAEMs: number;

@@ -1,6 +1,7 @@
 // src/lib/baseline/loadFromDb.ts
 // Phase 0 — Load simulated_trades into BaselineTradeRow[].
 // Converts storage precision (×1e8 pnl, ×1e4 R/MFE/MAE) to human units.
+// Missing MFE/MAE remain null (never fabricated as 0).
 
 import { desc, isNotNull } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
@@ -16,6 +17,8 @@ type Db = MySql2Database<any>;
  *   - pnl: ×1e8
  *   - rMultiple, mfe, mae: ×1e4
  *   - timestamps: Unix ms
+ *
+ * Null MFE/MAE are preserved as null (missing ≠ 0).
  */
 export async function loadBaselineRowsFromDb(
   db: Db,
@@ -25,7 +28,6 @@ export async function loadBaselineRowsFromDb(
 
   const query = db.select().from(simulatedTrades).orderBy(desc(simulatedTrades.openedAt));
 
-  // Drizzle where is applied conditionally
   const rows = closedOnly
     ? await db
         .select()
@@ -56,8 +58,14 @@ function normalizeRow(row: typeof simulatedTrades.$inferSelect): BaselineTradeRo
         : null,
     pnl: row.pnl != null ? row.pnl / 1e8 : 0,
     label: row.label ?? null,
-    mfe: row.maxFavorableExcursion != null ? row.maxFavorableExcursion / 1e4 : 0,
-    mae: row.maxAdverseExcursion != null ? row.maxAdverseExcursion / 1e4 : 0,
+    mfe:
+      row.maxFavorableExcursion != null && Number.isFinite(row.maxFavorableExcursion)
+        ? row.maxFavorableExcursion / 1e4
+        : null,
+    mae:
+      row.maxAdverseExcursion != null && Number.isFinite(row.maxAdverseExcursion)
+        ? row.maxAdverseExcursion / 1e4
+        : null,
     durationMs: row.durationMs ?? 0,
     timeToMFEMs: row.timeToMFEMs ?? 0,
     timeToMAEMs: row.timeToMAEMs ?? 0,
@@ -70,6 +78,7 @@ function normalizeRow(row: typeof simulatedTrades.$inferSelect): BaselineTradeRo
 /**
  * Normalize a raw object (e.g. from CSV/JSON export) into BaselineTradeRow.
  * Accepts either storage units or already-human units via `units` flag.
+ * Missing MFE/MAE remain null.
  */
 export function normalizeExportRow(
   raw: Record<string, unknown>,
@@ -84,8 +93,8 @@ export function normalizeExportRow(
 
   const rRaw = num(raw.rMultiple ?? raw.r_multiple);
   const pnlRaw = num(raw.pnl) ?? 0;
-  const mfeRaw = num(raw.mfe ?? raw.maxFavorableExcursion ?? raw.max_favorable_excursion) ?? 0;
-  const maeRaw = num(raw.mae ?? raw.maxAdverseExcursion ?? raw.max_adverse_excursion) ?? 0;
+  const mfeRaw = num(raw.mfe ?? raw.maxFavorableExcursion ?? raw.max_favorable_excursion);
+  const maeRaw = num(raw.mae ?? raw.maxAdverseExcursion ?? raw.max_adverse_excursion);
 
   const scaleR = units === 'storage' ? 1e4 : 1;
   const scalePnl = units === 'storage' ? 1e8 : 1;
@@ -106,8 +115,8 @@ export function normalizeExportRow(
     rMultiple: rRaw != null ? rRaw / scaleR : null,
     pnl: pnlRaw / scalePnl,
     label: num(raw.label),
-    mfe: mfeRaw / scaleR,
-    mae: maeRaw / scaleR,
+    mfe: mfeRaw != null ? mfeRaw / scaleR : null,
+    mae: maeRaw != null ? maeRaw / scaleR : null,
     durationMs: num(raw.durationMs ?? raw.duration_ms) ?? 0,
     timeToMFEMs: num(raw.timeToMFEMs ?? raw.time_to_mfe_ms) ?? 0,
     timeToMAEMs: num(raw.timeToMAEMs ?? raw.time_to_mae_ms) ?? 0,
