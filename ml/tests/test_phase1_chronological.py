@@ -301,6 +301,30 @@ def test_validate_does_not_claim_oos():
     assert "safe to upload" not in src
 
 
+def test_partition_design_documented():
+    """Validation is diagnostic only; no selection on test."""
+    lib = (ML_DIR / "evaluate_lib.py").read_text()
+    eval_src = (ML_DIR / "evaluate.py").read_text()
+    assert "not used for selection" in lib or "diagnostic" in lib
+    assert "partition_design" in eval_src
+    assert "not used for model/formulation/hyperparameter selection" in eval_src
+    assert "no winner is selected" in eval_src.lower() or "no winner is" in eval_src.lower()
+    assert "provisional pending more data" not in eval_src
+
+
+def test_signal_subset_terminology():
+    """technical_only key is the 27-feature signal-input subset, not production score."""
+    from evaluate_lib import INFORMATION_CONDITIONS
+    tech = INFORMATION_CONDITIONS["technical_only"]
+    full = INFORMATION_CONDITIONS["full_feature_ml"]
+    assert len(tech["indices"]) == 27
+    assert len(full["indices"]) == 33
+    desc = tech["description"].lower()
+    assert "not a replay" in desc or "measurement baseline" in desc
+    assert "buyscore" in tech["description"] or "production score" in tech["role"].lower()
+    assert "not" in full["role"].lower() and "ml-only" in full["role"].lower().replace(" ", "")
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path as P
