@@ -91,17 +91,28 @@ def build_report(
         "information_conditions": INFORMATION_CONDITIONS,
         "ml_only_limitation": (
             "Pure ML-only cannot be isolated as a feature subset. Production ML "
-            "consumes all 33 features (technical + history + identity) and emits "
-            "label/confidence. None of the 33 features is an ML model output. "
-            "Production Technical+ML is score-level fusion (buyScore/sellScore + "
-            "ML bonus) which is not stored in the training CSV. Closest valid "
-            "comparison: technical_only vs full_feature_ml (production ML inputs)."
+            "consumes all 33 features and emits label/confidence. None of the 33 "
+            "features is an ML model output. Production buyScore/sellScore + ML "
+            "bonus fusion is score-level and is not stored in the training CSV. "
+            "Closest valid comparison: signal_subset_0_26 (report key "
+            "technical_only) vs full_feature_ml (all 33 production ML inputs). "
+            "signal_subset_0_26 is a measurement baseline, not a replay of "
+            "production technical scores."
+        ),
+        "partition_design": (
+            "Phase 1 is a fixed-model diagnostic. TRAIN (60%) is used only for "
+            "fitting. VALIDATION (20%) is reported for diagnostics only and is "
+            "not used for model/formulation/hyperparameter selection. FINAL TEST "
+            "(20%) is untouched until final evidence reporting. All formulations "
+            "and information conditions are reported independently; no winner is "
+            "selected from validation or test for configuration choice."
         ),
         "leakage_audit_features": leakage_audit_features(),
         "leakage_audit_process": [
             "Export ordered DESC by closed_at; evaluation sorts ASC (stable mergesort).",
             "Split 60/20/20 chronological; model.fit uses only train indices.",
-            "Final test never used for fit, formulation selection, or hyperparameter tuning.",
+            "Final test never used for fit or selection (no selection step in Phase 1).",
+            "Validation is diagnostic only — not used for formulation/config selection.",
             "No scaler/imputer fitted on full data; features pre-normalized at export.",
             "Hyperparameters fixed (EVAL_XGB_PARAMS, seed=42); not tuned on test.",
             "Production train.py still fits full dataset for ONNX; unchanged.",
@@ -138,8 +149,10 @@ def build_report(
                 )
 
     conclusions = payload["conclusions"]
+    conclusions.append(payload["partition_design"])
     conclusions.append(
-        "Primary evaluation is chronological; final test was unseen during fitting."
+        "Primary evaluation is chronological; final test was unseen during fitting "
+        "and was not used for any selection decision."
     )
     conclusions.append(
         "Pure ML-only feature subset is not supported by the architecture; "
@@ -149,7 +162,12 @@ def build_report(
         "Severe class imbalance (especially neutral) is quantified; "
         "raw accuracy alone is insufficient."
     )
+    conclusions.append(
+        "signal_subset_0_26 (report key technical_only) is a 27-feature measurement "
+        "baseline, not a replay of production buyScore/sellScore."
+    )
 
+    # Report independent TEST metrics for both conditions — no winner selection.
     five_tech = next(
         (r for r in results
          if r["formulation"] == "five_class" and r["information_condition"] == "technical_only"),
@@ -164,27 +182,14 @@ def build_report(
         t_f1, f_f1 = five_tech["test"]["macro_f1"], five_full["test"]["macro_f1"]
         t_ba, f_ba = five_tech["test"]["balanced_accuracy"], five_full["test"]["balanced_accuracy"]
         conclusions.append(
-            f"Five-class TEST macro_f1: technical_only={t_f1:.4f}, full_feature_ml={f_f1:.4f}."
+            f"Five-class FINAL TEST (independent report, not a selection): "
+            f"signal_subset_0_26 macro_f1={t_f1:.4f} balanced_acc={t_ba:.4f}; "
+            f"full_feature_ml macro_f1={f_f1:.4f} balanced_acc={f_ba:.4f}."
         )
         conclusions.append(
-            f"Five-class TEST balanced_accuracy: technical_only={t_ba:.4f}, full_feature_ml={f_ba:.4f}."
+            "No formulation or information condition is declared the winner on "
+            "the basis of FINAL TEST; all cells are reported for inspection."
         )
-        delta = f_f1 - t_f1
-        if abs(delta) < 0.02:
-            conclusions.append(
-                "No material macro-F1 lift of full_feature_ml over technical_only "
-                "on this test partition (|Δ|<0.02)."
-            )
-        elif delta > 0:
-            conclusions.append(
-                "full_feature_ml shows higher test macro-F1 than technical_only; "
-                "provisional pending more data / walk-forward."
-            )
-        else:
-            conclusions.append(
-                "full_feature_ml shows lower test macro-F1 than technical_only "
-                "on this partition."
-            )
 
     md: List[str] = []
     md.append("# Phase 1 — Measurement & ML Validation Report")
@@ -229,6 +234,10 @@ def build_report(
         )
     md.append(f"- Boundary ties: `{ties}`")
     md.append("")
+    md.append("## Partition design")
+    md.append("")
+    md.append(payload["partition_design"])
+    md.append("")
     md.append("## Information conditions")
     md.append("")
     md.append(payload["ml_only_limitation"])
@@ -260,8 +269,9 @@ def build_report(
     md.append("## Results")
     md.append("")
     md.append(
-        "Validation metrics are diagnostic only. "
-        "**Final conclusions use the TEST partition.**"
+        "VALIDATION metrics are diagnostic only (not used for selection). "
+        "FINAL TEST is untouched evidence. All formulations × conditions are "
+        "reported independently — no winner is selected."
     )
     md.append("")
     for r in results:
