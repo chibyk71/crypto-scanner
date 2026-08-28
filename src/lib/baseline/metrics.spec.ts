@@ -11,6 +11,7 @@ import {
   groupBy,
   holdingTimeBucket,
 } from './metrics';
+import { normalizeExportRow } from './loadFromDb';
 import type { BaselineTradeRow } from './types';
 
 function row(partial: Partial<BaselineTradeRow> & { id: number }): BaselineTradeRow {
@@ -129,4 +130,125 @@ test('computePerformanceMetrics handles empty set', (t) => {
   t.is(m.winRate, 0);
   t.is(m.averageR, 0);
   t.is(m.maxDrawdownR, 0);
+});
+
+// ── Null MFE/MAE regression (missing ≠ 0) ───────────────────────────────────
+
+test('null MFE is audited as missing and does not contribute 0 to average', (t) => {
+  const rows = [
+    row({ id: 1, mfe: 2.0, mae: -1.0 }),
+    row({ id: 2, mfe: null, mae: -1.0 }),
+    row({ id: 3, mfe: 4.0, mae: -1.0 }),
+  ];
+  const { audit } = auditDataQuality(rows);
+  t.true(audit.issues.some((i) => i.code === 'missing_mfe' && i.count === 1));
+  t.true(audit.issues.some((i) => i.code === 'missing_mfe_mae' && i.count === 1));
+
+  const m = computePerformanceMetrics(rows);
+  // Average must be (2+4)/2 = 3, not (2+0+4)/3
+  t.is(m.averageMFE, 3);
+});
+
+test('null MAE is audited as missing and does not contribute 0 to average', (t) => {
+  const rows = [
+    row({ id: 1, mfe: 2.0, mae: -2.0 }),
+    row({ id: 2, mfe: 2.0, mae: null }),
+    row({ id: 3, mfe: 2.0, mae: -4.0 }),
+  ];
+  const { audit } = auditDataQuality(rows);
+  t.true(audit.issues.some((i) => i.code === 'missing_mae' && i.count === 1));
+
+  const m = computePerformanceMetrics(rows);
+  // Average MAE signed: (-2 + -4)/2 = -3, not (-2+0+-4)/3
+  t.is(m.averageMAE, -3);
+});
+
+test('null MFE/MAE do not fabricate MFE/MAE ratio', (t) => {
+  const withNulls = [
+    row({ id: 1, mfe: null, mae: null }),
+    row({ id: 2, mfe: 4.0, mae: -2.0 }),
+  ];
+  const m = computePerformanceMetrics(withNulls);
+  t.is(m.averageMFE, 4);
+  t.is(m.averageMAE, -2);
+  t.is(m.mfeMaeRatio, 2);
+
+  const allMissing = [
+    row({ id: 1, mfe: null, mae: null }),
+    row({ id: 2, mfe: null, mae: null }),
+  ];
+  const m2 = computePerformanceMetrics(allMissing);
+  t.is(m2.averageMFE, 0);
+  t.is(m2.averageMAE, 0);
+  t.is(m2.mfeMaeRatio, null);
+});
+
+test('genuine MFE/MAE of zero remain valid zero measurements', (t) => {
+  const rows = [
+    row({ id: 1, mfe: 0, mae: 0 }),
+    row({ id: 2, mfe: 2.0, mae: -1.0 }),
+  ];
+  const { audit } = auditDataQuality(rows);
+  t.false(audit.issues.some((i) => i.code === 'missing_mfe'));
+  t.false(audit.issues.some((i) => i.code === 'missing_mae'));
+
+  const m = computePerformanceMetrics(rows);
+  t.is(m.averageMFE, 1.0);
+  t.is(m.averageMAE, -0.5);
+});
+
+test('complete rows baseline metrics unchanged with present MFE/MAE', (t) => {
+  const rows = [
+    row({ id: 1, outcome: 'tp', rMultiple: 2, mfe: 2.0, mae: -0.5 }),
+    row({ id: 2, outcome: 'sl', rMultiple: -1, mfe: 0.3, mae: -1.2 }),
+  ];
+  const m = computePerformanceMetrics(rows);
+  t.is(m.tradeCount, 2);
+  t.is(m.winCount, 1);
+  t.is(m.winRate, 50);
+  t.is(m.averageR, 0.5);
+  t.is(m.averageMFE, (2.0 + 0.3) / 2);
+  t.is(m.averageMAE, (-0.5 + -1.2) / 2);
+  t.true(m.mfeMaeRatio != null);
+});
+
+test('normalizeExportRow preserves null MFE/MAE (does not fabricate 0)', (t) => {
+  const r = normalizeExportRow(
+    {
+      id: 1,
+      signal_id: 's1',
+      symbol: 'BTC/USDT',
+      side: 'buy',
+      opened_at: 1,
+      closed_at: 2,
+      outcome: 'tp',
+      r_multiple: 15000,
+      pnl: 0,
+    },
+    'storage'
+  );
+  t.is(r.mfe, null);
+  t.is(r.mae, null);
+  t.is(r.rMultiple, 1.5);
+});
+
+test('normalizeExportRow keeps genuine zero MFE/MAE as zero', (t) => {
+  const r = normalizeExportRow(
+    {
+      id: 1,
+      signal_id: 's1',
+      symbol: 'BTC/USDT',
+      side: 'buy',
+      opened_at: 1,
+      closed_at: 2,
+      outcome: 'tp',
+      mfe: 0,
+      mae: 0,
+      r_multiple: 0,
+      pnl: 0,
+    },
+    'storage'
+  );
+  t.is(r.mfe, 0);
+  t.is(r.mae, 0);
 });
