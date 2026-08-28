@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,7 +20,15 @@ from chronological import (
 )
 from labels import FORMULATION_FIVE, FORMULATION_FOUR, FORMULATION_THREE, class_counts
 from metrics_report import safe_classification_metrics
-from utils import EXPECTED_FEATURES, LABEL_TO_INTERNAL, TECHNICAL_FEATURE_INDICES, FULL_FEATURE_INDICES
+from utils import (
+    EXPECTED_FEATURES,
+    FULL_FEATURE_INDICES,
+    LABEL_TO_INTERNAL,
+    MIN_VALID_CLOSED_AT_MS,
+    TECHNICAL_FEATURE_INDICES,
+    is_valid_closed_at,
+    load_training_frame,
+)
 
 
 def test_chronological_sorting():
@@ -40,7 +49,7 @@ def test_equal_timestamps_stable():
 
 def test_train_val_test_boundaries():
     n = 100
-    ts = np.arange(n, dtype=np.int64) * 1000
+    ts = np.arange(n, dtype=np.int64) * 1000 + MIN_VALID_CLOSED_AT_MS
     split = chronological_split(n, timestamps=ts)
     assert split.train_idx.max() < split.val_idx.min()
     assert split.val_idx.max() < split.test_idx.min()
@@ -51,7 +60,7 @@ def test_train_val_test_boundaries():
 
 def test_no_future_in_training():
     n = 50
-    ts = np.arange(n, dtype=np.int64)
+    ts = np.arange(n, dtype=np.int64) + MIN_VALID_CLOSED_AT_MS
     split = chronological_split(n, timestamps=ts)
     assert ts[split.train_idx].max() <= ts[split.test_idx].min()
 
@@ -105,11 +114,15 @@ def test_no_train_test_split_in_primary_path():
     assert "train_test_split(" not in v
     assert "train_test_split(" not in e
     assert "chronological_split" in (ML_DIR / "validate.py").read_text()
-    assert "chronological_split" in (ML_DIR / "evaluate.py").read_text()
+    assert "chronological_split" in (ML_DIR / "evaluate.py").read_text() or \
+           "chronological_split" in (ML_DIR / "evaluate_lib.py").read_text()
 
 
 def test_final_test_cannot_reach_fitting():
+    """Spy on XGBClassifier.fit to prove only train rows are fitted."""
     from evaluate import fit_predict, make_synthetic_frame
+    from xgboost import XGBClassifier
+
     frame = make_synthetic_frame(n=100, seed=42)
     split = chronological_split(len(frame.X), timestamps=frame.closed_at)
     assert set(split.train_idx).isdisjoint(set(split.test_idx))
@@ -117,8 +130,24 @@ def test_final_test_cannot_reach_fitting():
     X_train = frame.X[split.train_idx]
     y_train = y[split.train_idx]
     X_test = frame.X[split.test_idx]
-    pred = fit_predict(X_train, y_train, X_test, 5)
+
+    fit_call_shapes = []
+    original_fit = XGBClassifier.fit
+
+    def spy_fit(self, X, y, *args, **kwargs):
+        fit_call_shapes.append((np.asarray(X).shape[0], np.asarray(y).shape[0]))
+        assert np.asarray(X).shape[0] == len(X_train)
+        assert np.asarray(y).shape[0] == len(y_train)
+        return original_fit(self, X, y, *args, **kwargs)
+
+    with patch.object(XGBClassifier, "fit", spy_fit):
+        pred = fit_predict(X_train, y_train, X_test, 5)
+
     assert len(pred) == len(split.test_idx)
+    assert len(fit_call_shapes) >= 1
+    for n_x, n_y in fit_call_shapes:
+        assert n_x == len(X_train)
+        assert n_y == len(y_train)
 
 
 def test_feature_dimensions():
@@ -191,12 +220,102 @@ def test_evaluation_deterministic():
     assert np.array_equal(p1, p2)
 
 
+def test_missing_closed_at_not_coerced_to_zero():
+    """Invalid/missing closed_at must NOT become timestamp 0."""
+    assert not is_valid_closed_at(0)
+    assert not is_valid_closed_at(None)
+    assert not is_valid_closed_at(float("nan"))
+    assert not is_valid_closed_at(-1)
+    assert not is_valid_closed_at(1_000_000)
+    assert is_valid_closed_at(MIN_VALID_CLOSED_AT_MS)
+    assert is_valid_closed_at(1_700_000_000_000)
+
+
+def test_invalid_timestamps_dropped_from_evaluation_path(tmp_path):
+    """Evaluation path drops invalid closed_at; never invents epoch-0."""
+    import json
+    import pandas as pd
+
+    n = 60
+    t0 = MIN_VALID_CLOSED_AT_MS + 86_400_000
+    rows = []
+    for i in range(n):
+        if i % 10 == 0:
+            closed = None if i % 20 == 0 else 0
+        else:
+            closed = t0 + i * 60_000
+        rows.append({
+            "features": json.dumps([0.1] * EXPECTED_FEATURES),
+            "label": int([-2, -1, 0, 1, 2][i % 5]),
+            "closed_at": closed,
+            "entry_price": 100.0,
+            "symbol": "TEST",
+            "side": "buy",
+        })
+    csv_path = tmp_path / "bad_ts.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    frame = load_training_frame(
+        csv_path, sort_chronologically=True, min_samples=10, verbose=False
+    )
+    assert frame.n_dropped_invalid_timestamp == 6
+    assert len(frame.X) == n - 6
+    assert np.all(frame.closed_at >= MIN_VALID_CLOSED_AT_MS)
+    assert not np.any(frame.closed_at == 0)
+    assert np.all(np.diff(frame.closed_at) >= 0)
+
+
+def test_all_invalid_timestamps_fail_loudly(tmp_path):
+    """If every row has invalid closed_at, evaluation path must raise."""
+    import json
+    import pandas as pd
+
+    rows = []
+    for i in range(20):
+        rows.append({
+            "features": json.dumps([0.1] * EXPECTED_FEATURES),
+            "label": 1,
+            "closed_at": 0,
+            "entry_price": 100.0,
+        })
+    csv_path = tmp_path / "all_bad.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    try:
+        load_training_frame(
+            csv_path, sort_chronologically=True, min_samples=5, verbose=False
+        )
+        raised = False
+    except ValueError as e:
+        raised = True
+        assert "invalid" in str(e).lower() or "cannot be established" in str(e).lower()
+    assert raised
+
+
+def test_validate_does_not_claim_oos():
+    """validate.py must not claim hold-out / OOS validation."""
+    src = (ML_DIR / "validate.py").read_text().lower()
+    assert "not out-of-sample" in src or "not genuine out-of-sample" in src
+    assert "evaluate.py" in src
+    assert "smoke" in src
+    assert "safe to upload" not in src
+
+
 if __name__ == "__main__":
+    import tempfile
+    from pathlib import Path as P
+
     tests = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
     for t in tests:
         try:
-            t()
+            import inspect
+            sig = inspect.signature(t)
+            if "tmp_path" in sig.parameters:
+                with tempfile.TemporaryDirectory() as d:
+                    t(P(d))
+            else:
+                t()
             print(f"  PASS  {t.__name__}")
         except Exception as e:
             failed += 1
