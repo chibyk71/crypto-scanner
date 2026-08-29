@@ -185,7 +185,7 @@ test('TREND: EMA aligned, ADX ok, but DI separation too small → not TREND', (t
     t.not(r.regime, 'TREND');
 });
 
-test('RANGE: weak directional market → RANGE', (t) => {
+test('RANGE: weak ADX + weak DI + EMA neutral → RANGE with isRangeEvidence', (t) => {
     const ind = makeIndicators({
         htfAdx: 10,
         htfPdi: 22,
@@ -200,18 +200,60 @@ test('RANGE: weak directional market → RANGE', (t) => {
     t.is(r.regime, 'RANGE');
     t.false(r.isBreakout);
     t.false(r.isTrendEvidence);
+    t.true(r.weakAdx);
+    t.true(r.weakDiSeparation);
+    t.true(r.emaNeutral);
+    t.true(r.isRangeEvidence);
 });
 
-test('RANGE: price around VWAP with no trend/breakout → RANGE', (t) => {
+test('RANGE: price around VWAP with no trend/breakout → RANGE + nearVwap', (t) => {
     const ind = makeIndicators({
         htfAdx: 12,
         htfPdi: 18,
         htfMdi: 17,
+        emaShort: 101,
+        emaMid: 100,
+        emaLong: 100.5,
         vwap: 100,
         vwma: 100,
     });
     const r = classifyRegime(ind, 100.2, 'neutral');
     t.is(r.regime, 'RANGE');
+    t.true(r.nearVwap);
+    t.true(r.isRangeEvidence);
+});
+
+test('RANGE: insufficient DI separation + EMA neutral → RANGE evidence', (t) => {
+    const ind = makeIndicators({
+        htfAdx: 25,
+        htfPdi: 22,
+        htfMdi: 20,
+        emaShort: 100,
+        emaMid: 100,
+        emaLong: 100,
+    });
+    const r = classifyRegime(ind, 100, 'neutral');
+    t.is(r.regime, 'RANGE');
+    t.true(r.weakDiSeparation);
+    t.true(r.emaNeutral);
+    t.true(r.isRangeEvidence);
+    t.false(r.isTrendEvidence);
+});
+
+test('RANGE: no EMA directional alignment is exposed on diagnostics', (t) => {
+    const ind = makeIndicators({
+        htfAdx: 8,
+        htfPdi: 15,
+        htfMdi: 14,
+        emaShort: 105,
+        emaMid: 100,
+        emaLong: 102,
+    });
+    const r = classifyRegime(ind, 100, 'neutral');
+    t.is(r.regime, 'RANGE');
+    t.true(r.emaNeutral);
+    t.false(r.emaAlignedBullish);
+    t.false(r.emaAlignedBearish);
 });
 
 test('BREAKOUT: compression + expansion + directional break + volume → BREAKOUT', (t) => {
@@ -460,4 +502,154 @@ test('public regimes are exactly TREND | RANGE | BREAKOUT', (t) => {
     ]) {
         t.false(cases.some((c) => (c.regime as string) === legacy));
     }
+});
+
+test('BEHAVIORAL SHADOW: determineSignal + riskParams unchanged when regime varies', (t) => {
+    const { determineSignal } = require('../signal/determineSignal') as typeof import('../signal/determineSignal');
+    const { computeRiskParams } = require('../risk/riskParams') as typeof import('../risk/riskParams');
+    const { buildFinalSignal } = require('../buildSignal') as typeof import('../buildSignal');
+
+    const buyScore = 62;
+    const sellScore = 28;
+    const trendBias = 'bullish' as const;
+    const isRiskEligible = true;
+
+    const reasonsA: string[] = [];
+    const decisionA = determineSignal(
+        buyScore,
+        sellScore,
+        trendBias,
+        isRiskEligible,
+        reasonsA
+    );
+
+    const trendInd = makeIndicators({
+        htfAdx: 30,
+        htfPdi: 40,
+        htfMdi: 10,
+        emaShort: 120,
+        emaMid: 110,
+        emaLong: 100,
+    });
+    const regimeTrend = classifyRegime(trendInd, 120, 'bullish');
+    t.is(regimeTrend.regime, 'TREND');
+
+    const reasonsB: string[] = [];
+    const decisionB = determineSignal(
+        buyScore,
+        sellScore,
+        trendBias,
+        isRiskEligible,
+        reasonsB
+    );
+    t.deepEqual(decisionA, decisionB);
+
+    const price = 100;
+    const atr = 2;
+    const riskA = computeRiskParams(
+        decisionA.signal === 'hold' ? 'buy' : decisionA.signal,
+        price,
+        1.5,
+        2.0,
+        decisionA.confidence,
+        atr,
+        trendBias,
+        1000,
+        true
+    );
+    const riskB = computeRiskParams(
+        decisionB.signal === 'hold' ? 'buy' : decisionB.signal,
+        price,
+        1.5,
+        2.0,
+        decisionB.confidence,
+        atr,
+        trendBias,
+        1000,
+        true
+    );
+    t.deepEqual(
+        {
+            feasible: riskA.feasible,
+            stopLoss: riskA.stopLoss,
+            takeProfit: riskA.takeProfit,
+            trailingStopDistance: riskA.trailingStopDistance,
+            positionSizeMultiplier: riskA.positionSizeMultiplier,
+        },
+        {
+            feasible: riskB.feasible,
+            stopLoss: riskB.stopLoss,
+            takeProfit: riskB.takeProfit,
+            trailingStopDistance: riskB.trailingStopDistance,
+            positionSizeMultiplier: riskB.positionSizeMultiplier,
+        }
+    );
+
+    const rangeInd = makeIndicators({
+        htfAdx: 10,
+        htfPdi: 20,
+        htfMdi: 18,
+        emaShort: 100,
+        emaMid: 100,
+        emaLong: 100,
+        vwap: 100,
+    });
+    const regimeRange = classifyRegime(rangeInd, 100, 'neutral');
+    t.is(regimeRange.regime, 'RANGE');
+    t.true(regimeRange.isRangeEvidence);
+
+    const base = {
+        symbol: 'BTC/USDT',
+        signal: decisionA.signal,
+        confidence: decisionA.confidence,
+        reasons: ['fixture'],
+        features: [0.1, 0.2],
+        stopLoss: riskA.stopLoss,
+        takeProfit: riskA.takeProfit,
+        trailingStopDistance: riskA.trailingStopDistance,
+        positionSizeMultiplier: riskA.positionSizeMultiplier,
+    };
+    const sigTrend = buildFinalSignal({ ...base, regime: regimeTrend.regime });
+    const sigRange = buildFinalSignal({ ...base, regime: regimeRange.regime });
+    t.not(sigTrend.regime, sigRange.regime);
+    const { regime: _r1, ...restTrend } = sigTrend;
+    const { regime: _r2, ...restRange } = sigRange;
+    t.deepEqual(restTrend, restRange);
+});
+
+test('BEHAVIORAL SHADOW: control path ignores regime — scores drive signal only', (t) => {
+    const { determineSignal } = require('../signal/determineSignal') as typeof import('../signal/determineSignal');
+
+    const bull = classifyRegime(
+        makeIndicators({
+            htfAdx: 35,
+            htfPdi: 40,
+            htfMdi: 10,
+            emaShort: 120,
+            emaMid: 110,
+            emaLong: 100,
+        }),
+        120,
+        'bullish'
+    );
+    const range = classifyRegime(
+        makeIndicators({
+            htfAdx: 8,
+            htfPdi: 15,
+            htfMdi: 14,
+            emaShort: 100,
+            emaMid: 100,
+            emaLong: 100,
+            vwap: 100,
+        }),
+        100,
+        'neutral'
+    );
+    t.is(bull.regime, 'TREND');
+    t.is(range.regime, 'RANGE');
+
+    const d1 = determineSignal(70, 20, 'bullish', true, []);
+    const d2 = determineSignal(70, 20, 'bullish', true, []);
+    t.deepEqual(d1, d2);
+    t.true(bull.regime !== range.regime);
 });
