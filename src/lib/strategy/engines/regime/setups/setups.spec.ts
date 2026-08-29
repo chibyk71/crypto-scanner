@@ -453,3 +453,179 @@ test('setup uses only provided series length — no implicit future bars', (t) =
     const ind = buildIndicators({ n: 3, emaShort: [100, 100, 100], emaMid: [98, 98, 98] });
     t.notThrows(() => detectTrendSetup(ctx(c, ind)));
 });
+
+// ---------------------------------------------------------------------------
+// Temporal separation: pullback on PRIOR candles only
+// ---------------------------------------------------------------------------
+
+test('TREND: current-candle touch alone cannot manufacture pullback (bullish)', (t) => {
+    const n = 6;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(98);
+    const closes = [101.5, 101.8, 102.0, 101.9, 101.5, 100.5];
+    const lows = [101.2, 101.4, 101.6, 101.5, 101.2, 99.8];
+    const highs = closes.map((c) => c + 0.3);
+    const macdHist = [0.1, 0.15, 0.2, 0.18, 0.1, 0.25];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBullish: true,
+        trendBias: 'bullish',
+        emaNeutral: false,
+        weakAdx: false,
+        weakDiSeparation: false,
+        isRangeEvidence: false,
+        adx: 30,
+        diDiff: 20,
+    });
+    const ind = buildIndicators({ n, closes, lows, highs, emaShort, emaMid, macdHist });
+    const result = detectTrendSetup(ctx(c, ind));
+    t.false(result.setupQualified, 'decision candle must not qualify pullback');
+    t.false(result.entryTriggered);
+    t.false(result.detected);
+    t.is(result.side, null);
+});
+
+test('TREND: current-candle touch alone cannot manufacture pullback (bearish)', (t) => {
+    const n = 6;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(102);
+    const closes = [98.5, 98.2, 98.0, 98.1, 98.5, 99.5];
+    const highs = [98.8, 98.6, 98.4, 98.5, 98.8, 100.2];
+    const lows = closes.map((c) => c - 0.3);
+    const macdHist = [-0.1, -0.15, -0.2, -0.18, -0.1, -0.25];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBearish: true,
+        trendBias: 'bearish',
+        emaNeutral: false,
+        weakAdx: false,
+        weakDiSeparation: false,
+        isRangeEvidence: false,
+        adx: 28,
+        diDiff: 18,
+    });
+    const ind = buildIndicators({ n, closes, lows, highs, emaShort, emaMid, macdHist });
+    const result = detectTrendSetup(ctx(c, ind));
+    t.false(result.setupQualified);
+    t.false(result.entryTriggered);
+    t.false(result.detected);
+    t.is(result.side, null);
+});
+
+test('TREND: prior pullback + current trigger → long (temporal separation)', (t) => {
+    const n = 6;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(98);
+    const closes = [100.5, 100.2, 99.8, 99.9, 100.2, 100.6];
+    const lows = [100.2, 99.9, 99.5, 99.7, 100.0, 100.3];
+    const highs = closes.map((c) => c + 0.3);
+    const macdHist = [-0.1, -0.15, -0.2, -0.1, 0.05, 0.2];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBullish: true,
+        trendBias: 'bullish',
+        emaNeutral: false,
+        weakAdx: false,
+        weakDiSeparation: false,
+        isRangeEvidence: false,
+        adx: 30,
+        diDiff: 20,
+    });
+    const ind = buildIndicators({ n, closes, lows, highs, emaShort, emaMid, macdHist });
+    const result = detectTrendSetup(ctx(c, ind));
+    t.true(result.setupQualified);
+    t.true(result.entryTriggered);
+    t.true(result.detected);
+    t.is(result.side, 'buy');
+});
+
+test('TREND: prior pullback + current trigger → short (temporal separation)', (t) => {
+    const n = 6;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(102);
+    const closes = [99.5, 99.8, 100.2, 100.1, 99.8, 99.4];
+    const highs = [99.8, 100.1, 100.5, 100.3, 100.0, 99.7];
+    const lows = closes.map((c) => c - 0.3);
+    const macdHist = [0.1, 0.15, 0.2, 0.1, -0.05, -0.2];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBearish: true,
+        trendBias: 'bearish',
+        emaNeutral: false,
+        weakAdx: false,
+        weakDiSeparation: false,
+        isRangeEvidence: false,
+        adx: 28,
+        diDiff: 18,
+    });
+    const ind = buildIndicators({ n, closes, lows, highs, emaShort, emaMid, macdHist });
+    const result = detectTrendSetup(ctx(c, ind));
+    t.true(result.setupQualified);
+    t.true(result.entryTriggered);
+    t.true(result.detected);
+    t.is(result.side, 'sell');
+});
+
+test('TREND: prior pullback without current trigger → qualified but no entry', (t) => {
+    const n = 6;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(98);
+    const closes = [100.5, 100.2, 99.8, 99.9, 99.7, 99.5];
+    const lows = [100.2, 99.9, 99.5, 99.6, 99.4, 99.3];
+    const highs = closes.map((c) => c + 0.3);
+    const macdHist = [-0.1, -0.15, -0.2, -0.25, -0.3, -0.35];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBullish: true,
+        trendBias: 'bullish',
+        emaNeutral: false,
+    });
+    const ind = buildIndicators({ n, closes, lows, highs, emaShort, emaMid, macdHist });
+    const result = detectTrendSetup(ctx(c, ind));
+    t.true(result.setupQualified);
+    t.false(result.entryTriggered);
+    t.false(result.detected);
+    t.is(result.side, null);
+});
+
+test('TREND: pullback window never includes decision index', (t) => {
+    const n = 5;
+    const emaShort = Array(n).fill(100);
+    const emaMid = Array(n).fill(98);
+    const macdHist = [-0.2, -0.1, 0.0, 0.1, 0.3];
+    const c = baseClassification({
+        regime: 'TREND',
+        isTrendEvidence: true,
+        emaAlignedBullish: true,
+        trendBias: 'bullish',
+        emaNeutral: false,
+    });
+    const failInd = buildIndicators({
+        n,
+        closes: [101, 101.2, 101.5, 101.3, 100.5],
+        lows: [100.8, 101.0, 101.2, 101.0, 99.9],
+        emaShort,
+        emaMid,
+        macdHist,
+    });
+    const fail = detectTrendSetup(ctx(c, failInd));
+    t.false(fail.setupQualified);
+    const okInd = buildIndicators({
+        n,
+        closes: [101, 101.2, 101.5, 99.8, 100.5],
+        lows: [100.8, 101.0, 101.2, 99.6, 100.2],
+        emaShort,
+        emaMid,
+        macdHist,
+    });
+    const ok = detectTrendSetup(ctx(c, okInd));
+    t.true(ok.setupQualified);
+    t.true(ok.entryTriggered);
+    t.true(ok.detected);
+    t.is(ok.side, 'buy');
+});
