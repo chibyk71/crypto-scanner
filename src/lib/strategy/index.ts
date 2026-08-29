@@ -24,6 +24,8 @@ import {
 import {
     classifyRegime,
 } from './regime/classifyRegime';
+import { runRegimeEngine } from './engines/regime/engine';
+import { resolveStrategyEngine } from './engines/selectEngine';
 
 import {
     computeScores,
@@ -58,6 +60,9 @@ const logger = createLogger('Strategy');
  *   • Adaptive risk management
  *   • Signal cooldown per symbol
  *   • Read-only market regime instrumentation (Phase 2 shadow mode)
+ *
+ * Phase 2B: STRATEGY_ENGINE=legacy|regime selects the experimental regime
+ * engine at a single boundary before any scoring. Default is legacy.
  */
 export class Strategy {
     // External dependencies
@@ -84,9 +89,8 @@ export class Strategy {
      * Main entry point for generating a technical trading signal.
      *
      * IMPORTANT:
-     * Market regime classification is instrumentation only (Phase 2 shadow mode).
-     * It must not influence scoring, signal selection, confidence,
-     * risk parameters, or trade eligibility.
+     * Default path (STRATEGY_ENGINE unset or legacy) is the frozen control.
+     * Regime classification on the legacy path is instrumentation only.
      */
     public async generateSignal(
         input: StrategyInput
@@ -103,6 +107,11 @@ export class Strategy {
         } = input;
 
         try {
+            // Phase 2B: single engine boundary — default legacy (body below unchanged).
+            if (resolveStrategyEngine(process.env.STRATEGY_ENGINE) === 'regime') {
+                return runRegimeEngine(input).signal;
+            }
+
             // === 1. Compute all centralized indicators ===
             const indicators = computeIndicators(
                 primaryData,
