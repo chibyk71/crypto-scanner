@@ -73,7 +73,11 @@ export function runRegimeEngine(
 
     reasons.push(`regime engine: classified ${classification.regime}`);
 
-    const setup: SetupResult = detectSetupForRegime(classification);
+    const setup: SetupResult = detectSetupForRegime({
+        classification,
+        indicators,
+        price,
+    });
     reasons.push(...setup.reasons);
 
     const quality = applyQualityFilter(setup);
