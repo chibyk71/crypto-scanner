@@ -39,8 +39,12 @@ export interface RegimeClassification {
     /** EMA structural alignment: short vs mid vs long. */
     emaAlignedBullish: boolean;
     emaAlignedBearish: boolean;
+    /** True when neither bullish nor bearish EMA stack is present. */
+    emaNeutral: boolean;
     /** VWMA relative to VWAP (directional context). */
     vwmaAboveVwap: boolean;
+    /** |price - vwap| / vwap within REGIME_NEAR_VWAP_PCT. */
+    nearVwap: boolean;
     /** Existing directional bias from trend/volume analysis. */
     trendBias: 'bullish' | 'bearish' | 'neutral';
     /**
@@ -48,6 +52,18 @@ export interface RegimeClassification {
      * Independent of the trade-eligibility gate in trendVolumeAnalysis.
      */
     isTrendEvidence: boolean;
+
+    // ---- range diagnostics (explicit evidence, not an unexplained residual) ----
+    /** ADX at or below MIN_ADX — insufficient directional strength. */
+    weakAdx: boolean;
+    /** DI separation at or below MIN_DI_DIFF. */
+    weakDiSeparation: boolean;
+    /**
+     * Explicit RANGE evidence after BREAKOUT is ruled out:
+     * weak directional strength (ADX and/or DI) AND EMA neutrality.
+     * nearVwap is supporting context exposed separately.
+     */
+    isRangeEvidence: boolean;
 
     // ---- volatility / structure diagnostics ----
     atrPct: number;
