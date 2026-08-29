@@ -12,8 +12,11 @@ import type { SetupContext, SetupResult } from '../../types';
 import { emptySetupResult } from '../../types';
 
 /**
- * Fixed structural lookback for pullback evidence (bars, including current).
- * Not optimized against trade outcomes — a short causal window only.
+ * Fixed structural lookback for pullback evidence on PRIOR candles only
+ * (excludes the decision candle). Not optimized against trade outcomes.
+ *
+ * Temporal invariant: pullback is established on bars < decision index;
+ * the decision candle may only provide the continuation trigger / invalidation.
  */
 const PULLBACK_LOOKBACK_BARS = 5;
 
@@ -29,21 +32,26 @@ function seriesLen(indicators: IndicatorMap): number {
 }
 
 /**
- * Bullish pullback: within lookback, at least one bar traded at/below emaShort
- * while structure still held (low stayed above emaMid). Evidence that price
- * retraced into the fast MA without breaking the mid-trend structure.
+ * Bullish pullback on PRIOR candles only: within lookback ending at n-2,
+ * at least one bar traded at/below emaShort while structure held
+ * (low stayed above emaMid). Decision candle is excluded.
  */
 function hasBullishPullback(indicators: IndicatorMap, n: number): boolean {
-    const start = Math.max(0, n - PULLBACK_LOOKBACK_BARS);
+    // Decision candle is index n-1; pullback may only use bars before it.
+    if (n < 2) {
+        return false;
+    }
+    const decisionIdx = n - 1;
+    const start = Math.max(0, decisionIdx - PULLBACK_LOOKBACK_BARS);
     let touchedFastMa = false;
-    for (let i = start; i < n; i++) {
+    for (let i = start; i < decisionIdx; i++) {
         const low = indicators.low[i];
         const emaS = indicators.emaShort[i];
         const emaM = indicators.emaMid[i];
         if (!Number.isFinite(low) || !Number.isFinite(emaS) || !Number.isFinite(emaM)) {
             continue;
         }
-        // Structure broken inside window → not a clean pullback
+        // Structure broken inside prior window → not a clean pullback
         if (low < emaM) {
             return false;
         }
@@ -55,13 +63,19 @@ function hasBullishPullback(indicators: IndicatorMap, n: number): boolean {
 }
 
 /**
- * Bearish pullback: within lookback, at least one bar traded at/above emaShort
- * while structure held (high stayed below emaMid).
+ * Bearish pullback on PRIOR candles only: within lookback ending at n-2,
+ * at least one bar traded at/above emaShort while structure held
+ * (high stayed below emaMid). Decision candle is excluded.
  */
 function hasBearishPullback(indicators: IndicatorMap, n: number): boolean {
-    const start = Math.max(0, n - PULLBACK_LOOKBACK_BARS);
+    // Decision candle is index n-1; pullback may only use bars before it.
+    if (n < 2) {
+        return false;
+    }
+    const decisionIdx = n - 1;
+    const start = Math.max(0, decisionIdx - PULLBACK_LOOKBACK_BARS);
     let touchedFastMa = false;
-    for (let i = start; i < n; i++) {
+    for (let i = start; i < decisionIdx; i++) {
         const high = indicators.high[i];
         const emaS = indicators.emaShort[i];
         const emaM = indicators.emaMid[i];

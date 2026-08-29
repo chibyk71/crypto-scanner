@@ -32,11 +32,13 @@ Market context (indicators at decision candle)
   (or the bearish pair). Contradictory alignment → no trade.
 
 ### Setup qualification (pullback)
-- Within a fixed short lookback (5 bars, structural constant — not optimized):
-  - **Long:** at least one bar’s low traded at/below `emaShort`, while lows
-    stayed above `emaMid` (structure held).
-  - **Short:** at least one bar’s high traded at/above `emaShort`, while highs
-    stayed below `emaMid`.
+- Within a fixed short lookback of **prior** candles only (excludes the decision
+  candle; structural constant — not optimized):
+  - **Long:** at least one prior bar’s low traded at/below `emaShort`, while
+    lows stayed above `emaMid` (structure held).
+  - **Short:** at least one prior bar’s high traded at/above `emaShort`, while
+    highs stayed below `emaMid`.
+- The decision candle **cannot** manufacture its own pullback.
 
 ### Entry trigger (continuation)
 - **Long:** decision close reclaims above `emaShort` **and** MACD histogram
@@ -132,6 +134,9 @@ All conditions use:
 
 No future candles, future highs/lows, future regime labels, or trade outcomes
 are referenced.
+
+**TREND temporal invariant:** pullback qualification uses only bars strictly
+before the decision index; the decision candle provides the trigger only.
 
 ---
 
