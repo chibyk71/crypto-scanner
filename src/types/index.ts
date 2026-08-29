@@ -138,6 +138,19 @@ export interface TradeSignal {
      * signal selection, risk, or trade eligibility.
      */
     regime?: MarketRegime;
+
+    /**
+     * Strategy engine that produced this signal (Phase 2B).
+     * Omitted on legacy path so existing consumers see unchanged shape
+     * unless they read this optional field.
+     */
+    engine?: 'legacy' | 'regime';
+
+    /**
+     * Experimental setup identifier when engine === 'regime'.
+     * Null/undefined when no setup was detected or engine is legacy.
+     */
+    setupId?: string | null;
 }
 
 /**
