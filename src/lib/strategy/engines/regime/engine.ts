@@ -5,10 +5,13 @@
 //   market data → indicators → regime → setup → quality → TradeSignal
 //
 // Does NOT import or call legacy scoring modules (computeScores, determineSignal).
-// Risk params reuse existing computeRiskParams when a setup is accepted
-// (shared infrastructure; not regime-specific sizing/exits).
+//
+// Risk: after quality acceptance, shared computeRiskParams is invoked using
+// only StrategyInput fields and existing config — never invented confidence
+// or account-balance literals at this call site.
 
 import type { TradeSignal } from '../../../../types';
+import { config } from '../../../config/settings';
 import { computeIndicators } from '../../../utils/indicatorUtils';
 import { createLogger } from '../../../logger';
 import { buildFinalSignal } from '../../buildSignal';
@@ -96,16 +99,21 @@ export function runRegimeEngine(
         };
     }
 
-    // Shared risk infrastructure (not redesigned for regimes).
+    // Shared risk infrastructure (not redesigned; not regime-specific).
+    // Confidence: configured gate value from settings — not a fabricated score.
+    // Account balance: omitted so computeRiskParams uses its own documented
+    // default (same unspecified-balance path as callers that omit the arg).
+    const signalConfidence = config.strategy.confidenceThreshold;
+
     const risk = computeRiskParams(
         setup.side,
         price,
         atrMultiplier,
         riskRewardTarget,
-        50, // fixed baseline confidence — not legacy score-derived
+        signalConfidence,
         indicators.last.atr,
         trendAndVolume.trendBias,
-        1000,
+        undefined,
         input.requireAtrFeasibility ?? true
     );
 
@@ -133,7 +141,7 @@ export function runRegimeEngine(
     const signal = buildFinalSignal({
         symbol,
         signal: setup.side,
-        confidence: 50,
+        confidence: signalConfidence,
         reasons,
         features: [],
         stopLoss: risk.stopLoss,
@@ -155,6 +163,7 @@ export function runRegimeEngine(
         {
             regime: classification.regime,
             setupId: setup.setupId,
+            confidence: signalConfidence,
         }
     );
 
