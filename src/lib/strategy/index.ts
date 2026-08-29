@@ -57,7 +57,7 @@ const logger = createLogger('Strategy');
  *   • ML integration
  *   • Adaptive risk management
  *   • Signal cooldown per symbol
- *   • Read-only market regime instrumentation
+ *   • Read-only market regime instrumentation (Phase 2 shadow mode)
  */
 export class Strategy {
     // External dependencies
@@ -84,7 +84,7 @@ export class Strategy {
      * Main entry point for generating a technical trading signal.
      *
      * IMPORTANT:
-     * Market regime classification is instrumentation only.
+     * Market regime classification is instrumentation only (Phase 2 shadow mode).
      * It must not influence scoring, signal selection, confidence,
      * risk parameters, or trade eligibility.
      */
@@ -119,12 +119,18 @@ export class Strategy {
             );
 
             // === 2.5. Market regime classification (READ ONLY) ===
-            // This result is collected for analysis only.
-            // It must not influence any scoring or trading decision.
+            // Phase 2: three-regime engine (TREND / RANGE / BREAKOUT).
+            // Shadow mode — regime is instrumentation only; does not affect
+            // scoring, signal, confidence, ML, risk, or eligibility.
             const regimeClassification = classifyRegime(
                 indicators,
                 price,
-                trendAndVolume.trendBias
+                trendAndVolume.trendBias,
+                {
+                    closes: primaryData.closes,
+                    volumes: primaryData.volumes,
+                    hasVolumeSurge: trendAndVolume.hasVolumeSurge,
+                }
             );
 
             // === 3. Reject non-trending markets ===
@@ -276,6 +282,10 @@ export class Strategy {
                         regimeClassification.bbBandwidth.toFixed(4),
                     regimeAtrPct:
                         regimeClassification.atrPct.toFixed(4),
+                    regimeBreakout:
+                        regimeClassification.isBreakout,
+                    regimeTrendEvidence:
+                        regimeClassification.isTrendEvidence,
 
                     mlConfidence: this.mlService.isReady()
                         ? mlConfidence.toFixed(3)

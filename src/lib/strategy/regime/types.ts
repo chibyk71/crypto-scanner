@@ -1,62 +1,96 @@
 // src/lib/strategy/regime/types.ts
+// Phase 2 — Regime Engine public types
+//
+// Shadow mode: regime classification is instrumentation only.
+// It must not influence scoring, signal generation, confidence,
+// risk parameters, or trade eligibility.
 
 /**
- * High-level classification of the current market environment.
+ * Public market regime model (exactly three values).
  *
- * This is instrumentation only in the current phase. Regime classification
- * must not influence scoring, signal generation, confidence, risk parameters,
- * or trade eligibility.
+ * Precedence when classifying: BREAKOUT → TREND → RANGE.
+ *
+ * Historical note: Phase 0/1 DB rows may still contain legacy labels
+ * (strong_trend, weak_trend, ranging, high_volatility, choppy). Those are
+ * no longer produced by classifyRegime. Baseline metrics treat regime as
+ * string | null and remain compatible with historical values.
  */
-export type MarketRegime =
-    | 'strong_trend'
-    | 'weak_trend'
-    | 'ranging'
-    | 'high_volatility'
-    | 'choppy';
+export type MarketRegime = 'TREND' | 'RANGE' | 'BREAKOUT';
+
+/** Direction implied by a confirmed breakout structure, if any. */
+export type BreakoutDirection = 'bullish' | 'bearish' | null;
 
 /**
- * Raw market inputs and final classification captured at signal time.
+ * Auditable classification result captured at candidate-candle time.
  *
- * The raw values are intentionally retained so historical classifications can
- * be audited and thresholds can be tuned later using collected simulation data.
+ * Raw diagnostics answer: why was this candidate classified as TREND /
+ * RANGE / BREAKOUT? No full indicator series are stored.
  */
 export interface RegimeClassification {
-    /** Final assigned market regime. */
+    /** Final public regime label. */
     regime: MarketRegime;
 
-    /** Higher-timeframe ADX used for trend-strength classification. */
+    // ---- directional / trend diagnostics ----
     adx: number;
+    pdi: number;
+    mdi: number;
+    /** |pdi - mdi| */
+    diDiff: number;
+    /** EMA structural alignment: short vs mid vs long. */
+    emaAlignedBullish: boolean;
+    emaAlignedBearish: boolean;
+    /** True when neither bullish nor bearish EMA stack is present. */
+    emaNeutral: boolean;
+    /** VWMA relative to VWAP (directional context). */
+    vwmaAboveVwap: boolean;
+    /** |price - vwap| / vwap within REGIME_NEAR_VWAP_PCT. */
+    nearVwap: boolean;
+    /** Existing directional bias from trend/volume analysis. */
+    trendBias: 'bullish' | 'bearish' | 'neutral';
+    /**
+     * Classifier-internal TREND evidence (ADX + DI + EMA alignment).
+     * Independent of the trade-eligibility gate in trendVolumeAnalysis.
+     */
+    isTrendEvidence: boolean;
 
-    /** Bollinger Band width as a percentage of the middle band. */
+    // ---- range diagnostics (explicit evidence, not an unexplained residual) ----
+    /** ADX at or below MIN_ADX — insufficient directional strength. */
+    weakAdx: boolean;
+    /** DI separation at or below MIN_DI_DIFF. */
+    weakDiSeparation: boolean;
+    /**
+     * Explicit RANGE evidence after BREAKOUT is ruled out:
+     * weak directional strength (ADX and/or DI) AND EMA neutrality.
+     * nearVwap is supporting context exposed separately.
+     */
+    isRangeEvidence: boolean;
+
+    // ---- volatility / structure diagnostics ----
+    atrPct: number;
     bbBandwidth: number;
 
-    /** ATR expressed as a percentage of the current price. */
-    atrPct: number;
+    // ---- breakout diagnostics (causal; candidate candle only) ----
+    /** True when compression + expansion + directional break all hold. */
+    breakoutStructure: boolean;
+    breakoutDirection: BreakoutDirection;
+    /** Volume confirmation required for BREAKOUT (relative volume and/or surge). */
+    volumeConfirmed: boolean;
+    /** True only when structure AND volume confirmation both hold. */
+    isBreakout: boolean;
+}
 
-    /** Existing directional bias from trend and volume analysis. */
-    trendBias: 'bullish' | 'bearish' | 'neutral';
-
+/**
+ * Optional candle context for breakout detection.
+ * When omitted, BREAKOUT cannot be assigned (structure requires closes).
+ */
+export interface RegimeCandleContext {
+    /** Primary-timeframe closes (causal series ending at candidate). */
+    closes: number[];
+    /** Primary-timeframe volumes aligned with closes (for volume confirmation). */
+    volumes?: number[];
     /**
-     * Raw positive directional indicator used to calculate DI separation.
+     * Optional precomputed surge flag from analyzeTrendAndVolume.
+     * When true, counts as volume confirmation without recomputing.
      */
-    pdi: number;
-
-    /**
-     * Raw negative directional indicator used to calculate DI separation.
-     */
-    mdi: number;
-
-    /**
-     * Absolute directional movement separation: |pdi - mdi|.
-     */
-    diDiff: number;
-
-    /**
-     * Regime's own ADX+DI trending determination — computed independently
-     * inside classifyRegime.ts, decoupled from the trade-eligibility gate
-     * in trendVolumeAnalysis.ts (which uses DI-separation only, no ADX
-     * floor). This keeps regime labels internally consistent even as gate
-     * logic evolves.
-     */
-    isTrending: boolean;
+    hasVolumeSurge?: boolean;
 }
