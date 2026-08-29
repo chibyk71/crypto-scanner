@@ -1,18 +1,23 @@
-// RANGE setup detector — architectural placeholder.
-// Explicit range mean-reversion entry rules are deferred to later evidence-backed phases.
-// Does NOT call scoring / computeScores.
+// RANGE setup — intentionally NO_TRADE in this phase.
+//
+// A defensible mean-reversion hypothesis requires reliable range boundaries
+// (swing high/low or accepted value-area edges) and a rejection trigger at
+// those edges. The current indicator set exposes BB/VWAP location but does
+// not provide a clean, causal range-boundary model that we are willing to
+// treat as an entry specification without evidence-backed design.
+//
+// Prefer explicit NO_TRADE over manufactured thresholds.
+// Not tuned on simulated_trades.csv.
 
-import type { RegimeClassification } from '../../../regime/types';
-import type { SetupResult } from '../../types';
+import type { SetupContext, SetupResult } from '../../types';
+import { emptySetupResult } from '../../types';
 
 /**
- * RANGE path for Phase 2B: structure only.
- * Returns detected:false with auditable diagnostics so routing can be tested
- * without inventing unvalidated mean-reversion entry rules.
+ * RANGE path: explicit no-entry.
+ * Regime context is recorded for audit; no side is ever returned.
  */
-export function detectRangeSetup(
-    classification: RegimeClassification
-): SetupResult {
+export function detectRangeSetup(ctx: SetupContext): SetupResult {
+    const { classification } = ctx;
     const reasons: string[] = [];
     const diagnostics: SetupResult['diagnostics'] = {
         isRangeEvidence: classification.isRangeEvidence,
@@ -26,23 +31,17 @@ export function detectRangeSetup(
 
     if (classification.regime !== 'RANGE') {
         reasons.push('range setup: regime is not RANGE');
-        return {
-            detected: false,
-            setupId: null,
-            side: null,
-            reasons,
-            diagnostics,
-        };
+        return emptySetupResult({ reasons, diagnostics });
     }
 
     reasons.push(
-        'range setup: mean-reversion entry not defined in Phase 2B (architecture only)'
+        'range setup: NO_TRADE — mean-reversion entry deferred (no defensible boundary model yet)'
     );
-    return {
-        detected: false,
-        setupId: null,
-        side: null,
+    return emptySetupResult({
         reasons,
         diagnostics,
-    };
+        setupQualified: false,
+        entryTriggered: false,
+        invalidation: null,
+    });
 }
