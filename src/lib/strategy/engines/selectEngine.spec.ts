@@ -197,3 +197,24 @@ test('breakout setup rejects missing direction', (t) => {
     const setup = detectBreakoutSetup(c);
     t.false(setup.detected);
 });
+
+test('regime engine does not hard-code confidence=50 or accountBalance=1000', (t) => {
+    const fs = require('fs') as typeof import('fs');
+    const path = require('path') as typeof import('path');
+    const src = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/lib/strategy/engines/regime/engine.ts'),
+        'utf8'
+    );
+    // Forbid literal experimental risk assumptions at the computeRiskParams call site.
+    t.false(/,\s*50\s*,/.test(src), 'must not pass literal confidence 50');
+    t.false(/,\s*1000\s*,/.test(src), 'must not pass literal accountBalance 1000');
+    t.false(/confidence\s*=\s*50/.test(src), 'must not assign confidence = 50');
+    t.true(
+        src.includes('config.strategy.confidenceThreshold'),
+        'must use configured confidenceThreshold'
+    );
+    t.true(
+        src.includes('undefined'),
+        'must omit accountBalance (undefined) rather than invent equity'
+    );
+});
