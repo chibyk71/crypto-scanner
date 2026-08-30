@@ -60,14 +60,43 @@ Validation rejects (does **not** silently sort or dedupe). Successful validation
 - If `candles.length < minPrimaryBars`, `runHistoricalComparison` **throws** with a clear error.
 - Override only via explicit `assumptions.minPrimaryBars` / `minHtfBars` (or CLI env `EVAL_MIN_PRIMARY_BARS`, etc.).
 
-## HTF convention (when no separate HTF series)
+## HTF convention
+
+**Production config** (`src/lib/config/settings.ts`):
+
+| Setting | Default |
+|---------|---------|
+| `TIMEFRAME` (primary) | `3m` |
+| `HTF_TIMEFRAME` | `15m` |
+
+Live scanner fetches primary and HTF as **separate** exchange series (`scanner.ts` → `getHtfData`).
+
+**Harness behavior:**
+
+1. If a separate HTF series is supplied → use it causally (`htf.timestamp <= decisionTs`). Manifest: `htfSource: 'provided_series'`.
+2. If not → synthetic aggregate with **explicit** `htfAggregationRatio` (default **5** = 15m/3m). **Not** derived from `minPrimaryBars`. Manifest records ratio + timeframe labels.
 
 `downsampleToHtf(primary[0..T], ratio)`:
 
 - Emits only **complete** buckets of exactly `ratio` primary bars.
-- Bucket ending at index `i` uses primary `[i-ratio+1 .. i]` only.
-- Trailing incomplete primary bars are **omitted** (not treated as a finished HTF candle).
-- HTF timestamp = last primary bar in the bucket → always ≤ decision time T when primary is sliced to T.
+- Trailing incomplete primary bars are **omitted**.
+- HTF timestamp = last primary bar in the bucket → always ≤ T.
+
+## End-of-data / incomplete trades
+
+| Case | Outcome |
+|------|---------|
+| TP/SL within available bars | completed (`tp` / `partial_tp` / `sl`) |
+| Full `maxHoldBars` future bars observed, no TP/SL | genuine `timeout` |
+| Dataset ends before full `maxHoldBars` future bars | **`incomplete`** (censored) |
+
+Incomplete trades:
+
+- Remain in `trades` for audit (last midpoint may be recorded).
+- Are **excluded** from `metrics` / `baselineRows`.
+- Counted in `incompleteCount`.
+
+They are **never** coerced to `timeout` for performance metrics.
 
 ## Assumptions (identical for both engines)
 
@@ -79,13 +108,14 @@ Validation rejects (does **not** silently sort or dedupe). Successful validation
 | Look-ahead | Decision at T uses only candles `0..T`. |
 | Same-bar TP/SL | partial TP → full TP → SL. |
 | Overlaps | Independent. |
-| End of data | Timeout midpoint / incomplete. |
+| End of data | `timeout` only if full horizon available; else `incomplete`. |
 
 ## Fresh evaluation data
 
 1. Supply chronological `HistoricalCandle[]` with **≥ 300** primary bars (or explicit warm-up override).
-2. Manifest records range, content hash, and `legacyControlVariant`.
-3. **Do not** use `simulated_trades.csv` for design/tuning.
+2. Optionally supply a separate HTF series with the production relationship (3m→15m).
+3. Manifest records range, content hash, `legacyControlVariant`, HTF source/ratio.
+4. **Do not** use `simulated_trades.csv` for design/tuning.
 
 CLI: `npm run eval:historical -- --fixture` or `--from-json path.json`  
 Optional: `EVAL_MIN_PRIMARY_BARS=40` only when intentionally testing short series.
