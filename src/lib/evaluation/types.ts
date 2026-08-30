@@ -86,6 +86,12 @@ export interface EvaluationManifest {
   legacyControlVariant: LegacyControlVariant;
   /** Human-readable legacy control description. */
   legacyControlDescription: string;
+  /** How HTF was obtained for this run. */
+  htfSource: 'provided_series' | 'synthetic_aggregate';
+  /** Aggregation ratio used when htfSource is synthetic_aggregate. */
+  htfAggregationRatio: number;
+  primaryTimeframe: string;
+  htfTimeframe: string;
 }
 
 export interface CandleValidationIssue {
@@ -139,9 +145,10 @@ export interface EvaluationAssumptions {
    */
   sameBarPriority: 'partial_tp_then_tp_then_sl';
   /**
-   * End of dataset with open position: force timeout at last bar midpoint.
+   * End of data: genuine timeout only if full maxHoldBars was available;
+   * otherwise incomplete/censored.
    */
-  endOfData: 'timeout_midpoint';
+  endOfData: 'timeout_or_incomplete';
   /** Minimum primary candles before any decision (indicator warm-up). */
   minPrimaryBars: number;
   /** Minimum HTF bars when HTF series provided. */
@@ -152,6 +159,16 @@ export interface EvaluationAssumptions {
   riskRewardTarget: number;
   /** Trailing stop percent (matches settings default 0.10). */
   trailingStopPercent: number;
+  /**
+   * Primary→HTF aggregation ratio when no separate HTF series is supplied.
+   * Production defaults: TIMEFRAME=3m, HTF_TIMEFRAME=15m → ratio 5.
+   * NOT derived from minPrimaryBars / warm-up.
+   */
+  htfAggregationRatio: number;
+  /** Documented primary timeframe label (evaluation assumption). */
+  primaryTimeframe: string;
+  /** Documented HTF timeframe label (evaluation assumption). */
+  htfTimeframe: string;
 }
 
 export const DEFAULT_EVALUATION_ASSUMPTIONS: EvaluationAssumptions = {
@@ -162,13 +179,17 @@ export const DEFAULT_EVALUATION_ASSUMPTIONS: EvaluationAssumptions = {
   slippageRate: 0,
   overlappingPositions: 'independent',
   sameBarPriority: 'partial_tp_then_tp_then_sl',
-  endOfData: 'timeout_midpoint',
+  endOfData: 'timeout_or_incomplete',
   // Align with config.historyLength default (300) and EMA-200 needs.
   minPrimaryBars: 300,
   minHtfBars: 50,
   atrMultiplier: 1.5,
   riskRewardTarget: 3.0,
   trailingStopPercent: 0.1,
+  // Production defaults: TIMEFRAME=3m, HTF_TIMEFRAME=15m → 5 primary bars per HTF bar.
+  htfAggregationRatio: 5,
+  primaryTimeframe: '3m',
+  htfTimeframe: '15m',
 };
 
 export type SimulationOutcome = 'tp' | 'partial_tp' | 'sl' | 'timeout' | 'incomplete';
@@ -208,7 +229,14 @@ export interface EngineEvaluationResult {
   warmUpSkipped: number;
   /** Bars evaluated (decision attempts after warm-up). */
   decisionsAttempted: number;
+  /** Trades censored by end-of-data before full maxHoldBars horizon. */
+  incompleteCount: number;
+  /**
+   * Metrics computed only from completed trades (incomplete excluded).
+   * Incomplete trades remain in `trades` for audit.
+   */
   metrics: PerformanceMetrics | null;
+  /** Baseline rows for completed trades only (incomplete excluded). */
   baselineRows: BaselineTradeRow[];
 }
 
