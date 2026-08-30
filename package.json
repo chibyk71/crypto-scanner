@@ -46,7 +46,9 @@
         "start:github": "node -r dotenv dist/index-github.js",
         "baseline:report": "ts-node -r dotenv/config scripts/baseline/generate-baseline-report.ts",
         "baseline:fixture": "ts-node -r dotenv/config scripts/baseline/generate-baseline-report.ts --fixture",
-        "test:baseline": "ava --timeout=30s build/main/lib/baseline/metrics.spec.js"
+        "test:baseline": "ava --timeout=30s build/main/lib/baseline/metrics.spec.js",
+        "eval:historical": "ts-node -r dotenv/config scripts/evaluation/run-historical-comparison.ts",
+        "test:evaluation": "ava --timeout=60s build/main/lib/evaluation/evaluation.spec.js"
     },
     "engines": {
         "node": ">=20"
