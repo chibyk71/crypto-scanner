@@ -6,6 +6,36 @@ import type { TradeSignal } from '../../types';
 import type { StrategyEngineId } from '../strategy/engines/types';
 
 /**
+ * What the historical "legacy" arm actually measures.
+ *
+ * Production Strategy.generateSignal (legacy path) can apply:
+ *   - ML bonus/penalty when mlService.isReady()
+ *   - order-book imbalance points when |imbalance| is material and score is near threshold
+ *
+ * Historical OHLCV cannot reconstruct live order book or causal ML labels without
+ * a separately designed, leakage-free feature pipeline (not in this PR).
+ *
+ * Therefore the default harness control is the technical legacy path with:
+ *   - ML unavailable (isReady() === false → no prediction bonus; same as production when no ONNX model is loaded)
+ *   - order-book imbalance neutral 0 (no points; same as production when book is unavailable or |imbalance| below threshold)
+ *
+ * This is NOT silently identical to "production with ML loaded + live book".
+ * It is the frozen technical scoring/signal path under those unavailable inputs.
+ */
+export type LegacyControlVariant =
+  | 'legacy_technical_ml_unavailable_book_neutral';
+
+export const LEGACY_CONTROL_VARIANT: LegacyControlVariant =
+  'legacy_technical_ml_unavailable_book_neutral';
+
+export const LEGACY_CONTROL_DESCRIPTION =
+  'Legacy arm runs Strategy.generateSignal with STRATEGY_ENGINE=legacy, ' +
+  'StubMLService (isReady=false → no ML bonus), and StubExchangeService ' +
+  '(order-book imbalance 0 → no book points). Technical scoring and signal rules ' +
+  'are unmodified. This matches production when the ONNX model is not loaded and ' +
+  'the order book is unavailable/neutral — not production with live ML + book.';
+
+/**
  * Single historical OHLCV candle (one bar).
  * timestamp is Unix milliseconds (candle close time, matching OhlcvData convention).
  */
@@ -40,6 +70,10 @@ export interface EvaluationManifest {
   evaluatedAtIso: string;
   /** Git commit if known. */
   gitSha?: string;
+  /** Explicit legacy-control semantics for this run. */
+  legacyControlVariant: LegacyControlVariant;
+  /** Human-readable legacy control description. */
+  legacyControlDescription: string;
 }
 
 export interface CandleValidationIssue {
@@ -169,6 +203,9 @@ export interface EngineEvaluationResult {
 export interface HistoricalComparisonResult {
   manifest: EvaluationManifest;
   assumptions: EvaluationAssumptions;
+  /** Explicit: what the legacy arm measures under historical constraints. */
+  legacyControlVariant: LegacyControlVariant;
+  legacyControlDescription: string;
   legacy: EngineEvaluationResult;
   regime: EngineEvaluationResult;
   /**
