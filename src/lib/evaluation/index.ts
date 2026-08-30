@@ -11,11 +11,14 @@ export type {
   EvaluatedTrade,
   HistoricalCandle,
   HistoricalComparisonResult,
+  LegacyControlVariant,
   SimulationOutcome,
 } from './types';
 
 export {
   DEFAULT_EVALUATION_ASSUMPTIONS,
+  LEGACY_CONTROL_DESCRIPTION,
+  LEGACY_CONTROL_VARIANT,
 } from './types';
 
 export {

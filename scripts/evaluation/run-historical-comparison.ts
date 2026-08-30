@@ -8,6 +8,9 @@
  * Does NOT optimize strategy parameters.
  * Does NOT use simulated_trades.csv for tuning.
  * Production default remains legacy.
+ *
+ * Warm-up defaults come from DEFAULT_EVALUATION_ASSUMPTIONS (minPrimaryBars=300).
+ * Override only via EVAL_MIN_PRIMARY_BARS / EVAL_MIN_HTF_BARS / EVAL_MAX_HOLD_BARS.
  */
 
 import * as fs from 'fs';
@@ -17,7 +20,7 @@ import {
   type HistoricalCandle,
 } from '../../src/lib/evaluation';
 
-function fixtureCandles(n = 120): HistoricalCandle[] {
+function fixtureCandles(n = 400): HistoricalCandle[] {
   const out: HistoricalCandle[] = [];
   let price = 50000;
   for (let i = 0; i < n; i++) {
@@ -47,7 +50,7 @@ async function main(): Promise<void> {
   let label = 'cli-run';
 
   if (args.includes('--fixture')) {
-    candles = fixtureCandles(150);
+    candles = fixtureCandles(400); // >= DEFAULT minPrimaryBars (300)
     label = 'synthetic-fixture';
   } else if (args.includes('--from-json')) {
     const idx = args.indexOf('--from-json');
@@ -64,20 +67,34 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Warm-up: DEFAULT_EVALUATION_ASSUMPTIONS (minPrimaryBars=300, minHtfBars=50).
+  // Do not silently reduce warm-up based on dataset length.
+  const assumptions: {
+    minPrimaryBars?: number;
+    minHtfBars?: number;
+    maxHoldBars?: number;
+  } = {};
+  if (process.env.EVAL_MIN_PRIMARY_BARS) {
+    assumptions.minPrimaryBars = Number(process.env.EVAL_MIN_PRIMARY_BARS);
+  }
+  if (process.env.EVAL_MIN_HTF_BARS) {
+    assumptions.minHtfBars = Number(process.env.EVAL_MIN_HTF_BARS);
+  }
+  if (process.env.EVAL_MAX_HOLD_BARS) {
+    assumptions.maxHoldBars = Number(process.env.EVAL_MAX_HOLD_BARS);
+  }
+
   const result = await runHistoricalComparison({
     candles,
     manifestLabel: label,
-    assumptions: {
-      minPrimaryBars: Math.min(50, Math.floor(candles.length / 3)),
-      minHtfBars: 10,
-      maxHoldBars: 10,
-    },
+    assumptions,
   });
 
   console.log(JSON.stringify({
     disclaimer: result.disclaimer,
     manifest: result.manifest,
     assumptions: result.assumptions,
+    legacyControlVariant: result.legacyControlVariant,
     legacy: {
       decisionsAttempted: result.legacy.decisionsAttempted,
       holdCount: result.legacy.holdCount,
