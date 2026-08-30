@@ -2,6 +2,12 @@
 // Deterministic offline trade lifecycle for historical evaluation.
 // Mirrors simulateTrade exit priority (partial TP → full TP → SL) without live polling.
 // Does not change strategy behavior.
+//
+// Slippage rule (identical for LONG/SHORT, all exit types):
+//   1. Derive executed entry from raw decision close + adverse slippage.
+//   2. On exit, derive executed exit from raw TP/SL/timeout price + adverse slippage.
+//   3. Realize P&L (and R) only from executed exit vs executed entry.
+//   4. Apply fees to that realized P&L.
 
 import type { TradeSignal } from '../../types';
 import type { EvaluationAssumptions, EvaluatedTrade, SimulationOutcome } from './types';
@@ -14,12 +20,17 @@ const EPSILON = 1e-8;
 export interface OfflineSimInput {
   engine: StrategyEngineId;
   signal: TradeSignal;
+  /** Index of decision candle in the full series. */
   decisionIndex: number;
   candles: HistoricalCandle[];
   assumptions: EvaluationAssumptions;
 }
 
-function applySlippage(
+/**
+ * Adverse slippage on a raw price.
+ * Entry long / exit short → pay up; entry short / exit long → sell down.
+ */
+export function applySlippage(
   price: number,
   isLong: boolean,
   isEntry: boolean,
@@ -32,11 +43,36 @@ function applySlippage(
   return isLong ? price * (1 - rate) : price * (1 + rate);
 }
 
+/** Realized fractional P&L from executed prices (before fees). */
+function pnlFromExecuted(
+  isLong: boolean,
+  executedEntry: number,
+  executedExit: number
+): number {
+  return isLong
+    ? (executedExit - executedEntry) / executedEntry
+    : (executedEntry - executedExit) / executedEntry;
+}
+
+/**
+ * Resolve one trade offline from decision candle onward.
+ *
+ * Entry: decision candle close → adverse slippage → executed entry.
+ * Exit: raw TP/SL/timeout → adverse slippage → executed exit; P&L from executed prices.
+ * Same-bar priority: partial TP → full TP → SL (matches simulateTrade).
+ * End of data: timeout at last bar midpoint.
+ */
 export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
   const { engine, signal, decisionIndex, candles, assumptions } = input;
   const isLong = signal.signal === 'buy';
   const decision = candles[decisionIndex]!;
-  const entryPrice = applySlippage(decision.close, isLong, true, assumptions.slippageRate);
+  const rawEntry = decision.close;
+  const entryPrice = applySlippage(
+    rawEntry,
+    isLong,
+    true,
+    assumptions.slippageRate
+  );
   const entryTimestamp = decision.timestamp;
 
   let remaining = 1.0;
@@ -44,12 +80,17 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
   let bestFavorable = entryPrice;
   let bestAdverse = entryPrice;
 
-  const stopLoss = signal.stopLoss != null && signal.stopLoss > 0 ? signal.stopLoss : null;
-  const takeProfit = signal.takeProfit != null && signal.takeProfit > 0 ? signal.takeProfit : null;
+  const stopLoss =
+    signal.stopLoss != null && signal.stopLoss > 0 ? signal.stopLoss : null;
+  const takeProfit =
+    signal.takeProfit != null && signal.takeProfit > 0 ? signal.takeProfit : null;
   const tpLevels = signal.takeProfitLevels ?? [];
 
   const startIdx = decisionIndex + 1;
-  const endIdx = Math.min(candles.length - 1, decisionIndex + assumptions.maxHoldBars);
+  const endIdx = Math.min(
+    candles.length - 1,
+    decisionIndex + assumptions.maxHoldBars
+  );
 
   let outcome: SimulationOutcome = 'timeout';
   let exitPrice: number | null = null;
@@ -66,6 +107,16 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
     }
   };
 
+  const realizeAt = (rawExit: number, weight: number): number => {
+    const executedExit = applySlippage(
+      rawExit,
+      isLong,
+      false,
+      assumptions.slippageRate
+    );
+    return pnlFromExecuted(isLong, entryPrice, executedExit) * weight;
+  };
+
   for (let i = startIdx; i <= endIdx && remaining > 0.01; i++) {
     const bar = candles[i]!;
     updateExcursions(bar.high, bar.low);
@@ -74,22 +125,26 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
       const sorted = [...tpLevels].sort((a, b) =>
         isLong ? a.price - b.price : b.price - a.price
       );
+      let lastExecutedPartial: number | null = null;
       for (const level of sorted) {
         if (remaining < level.weight - EPSILON) continue;
         const hit = isLong
           ? bar.high >= level.price - EPSILON
           : bar.low <= level.price + EPSILON;
         if (hit) {
-          const pnlThis = isLong
-            ? (level.price - entryPrice) / entryPrice
-            : (entryPrice - level.price) / entryPrice;
-          totalPnl += pnlThis * level.weight;
+          totalPnl += realizeAt(level.price, level.weight);
           remaining -= level.weight;
+          lastExecutedPartial = applySlippage(
+            level.price,
+            isLong,
+            false,
+            assumptions.slippageRate
+          );
         }
       }
       if (remaining <= 0.01) {
         outcome = 'partial_tp';
-        exitPrice = applySlippage(sorted[sorted.length - 1]!.price, isLong, false, assumptions.slippageRate);
+        exitPrice = lastExecutedPartial;
         exitTimestamp = bar.timestamp;
         remaining = 0;
         break;
@@ -101,13 +156,16 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
         ? bar.high >= takeProfit - EPSILON
         : bar.low <= takeProfit + EPSILON;
       if (hit) {
-        const pnlThis = isLong
-          ? (takeProfit - entryPrice) / entryPrice
-          : (entryPrice - takeProfit) / entryPrice;
-        totalPnl += pnlThis * remaining;
+        totalPnl += realizeAt(takeProfit, remaining);
+        const executedExit = applySlippage(
+          takeProfit,
+          isLong,
+          false,
+          assumptions.slippageRate
+        );
         remaining = 0;
         outcome = 'tp';
-        exitPrice = applySlippage(takeProfit, isLong, false, assumptions.slippageRate);
+        exitPrice = executedExit;
         exitTimestamp = bar.timestamp;
         break;
       }
@@ -118,13 +176,16 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
         ? bar.low <= stopLoss + EPSILON
         : bar.high >= stopLoss - EPSILON;
       if (hit) {
-        const pnlThis = isLong
-          ? (stopLoss - entryPrice) / entryPrice
-          : (entryPrice - stopLoss) / entryPrice;
-        totalPnl += pnlThis * remaining;
+        totalPnl += realizeAt(stopLoss, remaining);
+        const executedExit = applySlippage(
+          stopLoss,
+          isLong,
+          false,
+          assumptions.slippageRate
+        );
         remaining = 0;
         outcome = 'sl';
-        exitPrice = applySlippage(stopLoss, isLong, false, assumptions.slippageRate);
+        exitPrice = executedExit;
         exitTimestamp = bar.timestamp;
         break;
       }
@@ -135,22 +196,25 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
     const lastIdx = Math.min(endIdx, candles.length - 1);
     const last = candles[Math.max(lastIdx, decisionIndex)]!;
     const mid = (last.high + last.low) / 2;
-    const exitRaw = applySlippage(mid, isLong, false, assumptions.slippageRate);
-    const pnlThis = isLong
-      ? (exitRaw - entryPrice) / entryPrice
-      : (entryPrice - exitRaw) / entryPrice;
-    totalPnl += pnlThis * remaining;
+    totalPnl += realizeAt(mid, remaining);
+    const executedExit = applySlippage(
+      mid,
+      isLong,
+      false,
+      assumptions.slippageRate
+    );
     remaining = 0;
     outcome = 'timeout';
     if (startIdx >= candles.length) {
       incomplete = true;
       outcome = 'incomplete';
     }
-    exitPrice = exitRaw;
+    exitPrice = executedExit;
     exitTimestamp = last.timestamp;
   }
 
-  const fees = assumptions.feeRate > 0 ? assumptions.feeRate * 2 : 0;
+  const fees =
+    assumptions.feeRate > 0 ? assumptions.feeRate * 2 : 0;
   const pnlAfterFees = totalPnl - fees;
 
   let riskPct: number;
@@ -162,9 +226,15 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
   const rMultiple = pnlAfterFees / riskPct;
 
   const mfePct =
-    ((isLong ? bestFavorable - entryPrice : entryPrice - bestFavorable) / entryPrice) * 100;
+    ((isLong ? bestFavorable - entryPrice : entryPrice - bestFavorable) /
+      entryPrice) *
+    100;
   const maePct =
-    -Math.abs(((isLong ? entryPrice - bestAdverse : bestAdverse - entryPrice) / entryPrice) * 100);
+    -Math.abs(
+      ((isLong ? entryPrice - bestAdverse : bestAdverse - entryPrice) /
+        entryPrice) *
+        100
+    );
 
   const durationMs =
     exitTimestamp != null ? Math.max(0, exitTimestamp - entryTimestamp) : 0;
