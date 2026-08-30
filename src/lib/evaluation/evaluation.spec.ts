@@ -401,3 +401,148 @@ test('warm-up skips decisions until minPrimaryBars', async (t) => {
   t.true(result.legacy.warmUpSkipped >= 39);
   t.is(result.legacy.warmUpSkipped, result.regime.warmUpSkipped);
 });
+
+test('legacy control variant is explicit on result and manifest', async (t) => {
+  const { LEGACY_CONTROL_VARIANT, LEGACY_CONTROL_DESCRIPTION } = await import(
+    './types'
+  );
+  const candles = series(80);
+  const result = await runHistoricalComparison({
+    candles,
+    assumptions: {
+      minPrimaryBars: 30,
+      minHtfBars: 5,
+      maxHoldBars: 5,
+    },
+    manifestLabel: 'control-semantics',
+  });
+  t.is(result.legacyControlVariant, LEGACY_CONTROL_VARIANT);
+  t.is(
+    result.legacyControlVariant,
+    'legacy_technical_ml_unavailable_book_neutral'
+  );
+  t.is(result.manifest.legacyControlVariant, LEGACY_CONTROL_VARIANT);
+  t.true(
+    result.legacyControlDescription.includes('ML_CONFIDENCE_DISCOUNT') ||
+      result.legacyControlDescription.includes('0.8') ||
+      result.legacyControlDescription.includes('isReady')
+  );
+  t.true(result.manifest.legacyControlDescription.length > 40);
+  t.true(result.disclaimer.includes(LEGACY_CONTROL_VARIANT));
+  t.true(
+    LEGACY_CONTROL_DESCRIPTION.includes('isReady') ||
+      LEGACY_CONTROL_DESCRIPTION.includes('ML')
+  );
+});
+
+test('StubMLService is never ready (ML-unavailable production branch)', (t) => {
+  const { StubMLService } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const stub = new StubMLService();
+  t.false(stub.isReady());
+});
+
+test('StubExchangeService returns neutral order-book imbalance', async (t) => {
+  const { StubExchangeService } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const stub = new StubExchangeService();
+  const book = await stub.getOrderBookImbalance();
+  t.is(book.imbalance, 0);
+  t.is(book.bidVolume, 0);
+  t.is(book.askVolume, 0);
+});
+
+test('DEFAULT minPrimaryBars is 300 (not reduced by dataset length)', (t) => {
+  t.is(DEFAULT_EVALUATION_ASSUMPTIONS.minPrimaryBars, 300);
+  t.is(DEFAULT_EVALUATION_ASSUMPTIONS.minHtfBars, 50);
+});
+
+test('insufficient primary bars vs default warm-up throws (no silent Math.min reduce)', async (t) => {
+  // Old incorrect CLI used Math.min(50, floor(n/3)) which would allow n=100.
+  // Default requires 300; a series of 100 must fail without explicit override.
+  const candles = series(100);
+  await t.throwsAsync(
+    () =>
+      runHistoricalComparison({
+        candles,
+        // no assumptions override → DEFAULT minPrimaryBars=300
+      }),
+    { message: /Insufficient primary candles for warm-up/ }
+  );
+});
+
+test('explicit warm-up override below series length is allowed', async (t) => {
+  const candles = series(80);
+  const result = await runHistoricalComparison({
+    candles,
+    assumptions: {
+      minPrimaryBars: 40,
+      minHtfBars: 5,
+      maxHoldBars: 3,
+    },
+  });
+  t.true(result.legacy.decisionsAttempted > 0);
+  t.is(result.assumptions.minPrimaryBars, 40);
+});
+
+test('downsampleToHtf emits only complete buckets (causal, no partial current)', (t) => {
+  const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const primary = series(10);
+  const ratio = 3;
+  const htf = downsampleToHtf(primary, ratio);
+  // floor(10/3)=3 complete buckets; trailing 1 bar omitted
+  t.is(htf.length, 3);
+  // Bucket 0 ends at primary index 2 → timestamp of primary[2]
+  t.is(htf[0]!.timestamp, primary[2]!.timestamp);
+  t.is(htf[1]!.timestamp, primary[5]!.timestamp);
+  t.is(htf[2]!.timestamp, primary[8]!.timestamp);
+  // No HTF timestamp can exceed last primary in its bucket
+  for (const h of htf) {
+    t.true(h.timestamp <= primary[primary.length - 1]!.timestamp);
+  }
+});
+
+test('downsampleToHtf on causal prefix never includes future primary bars', (t) => {
+  const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const full = series(20);
+  const ratio = 4;
+  // Decision at T=11 → primary[0..11]
+  const prefix = full.slice(0, 12);
+  const htf = downsampleToHtf(prefix, ratio);
+  // Complete buckets end at indices 3,7,11 → 3 HTF candles
+  t.is(htf.length, 3);
+  const maxHtfTs = Math.max(...htf.map((c) => c.timestamp));
+  t.true(maxHtfTs <= full[11]!.timestamp);
+  // Shock after T must not appear
+  t.false(htf.some((c) => c.timestamp > full[11]!.timestamp));
+});
+
+test('downsampleToHtf incomplete trailing bucket is omitted (no future fill)', (t) => {
+  const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const primary = series(5);
+  const ratio = 3;
+  // indices 0,1,2 → one bucket; 3,4 incomplete → omitted
+  const htf = downsampleToHtf(primary, ratio);
+  t.is(htf.length, 1);
+  t.is(htf[0]!.timestamp, primary[2]!.timestamp);
+  t.is(htf[0]!.open, primary[0]!.open);
+  t.is(htf[0]!.close, primary[2]!.close);
+});
+
+test('HTF minHtfBars gate uses only causal complete aggregates', async (t) => {
+  const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
+  // With ratio = max(5, floor(minP/50)), minP=30 → ratio=5
+  // Need at least minHtfBars complete HTF bars before decisions
+  const candles = series(50);
+  const result = await runHistoricalComparison({
+    candles,
+    assumptions: {
+      minPrimaryBars: 30,
+      minHtfBars: 5,
+      maxHoldBars: 3,
+    },
+  });
+  // At first eligible primary index t=29, downsample length = floor(30/5)=6 >= 5
+  t.true(result.legacy.decisionsAttempted > 0);
+  // Sanity: downsample of first 30 bars with ratio 5 has 6 candles
+  const down = downsampleToHtf(candles.slice(0, 30), 5);
+  t.is(down.length, 6);
+});
