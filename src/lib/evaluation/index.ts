@@ -33,6 +33,7 @@ export {
   stableResultFingerprint,
   causalWindow,
   downsampleToHtf,
+  inferHtfAggregationRatio,
   StubMLService,
   StubExchangeService,
 } from './runEvaluation';
