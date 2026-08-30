@@ -1,8 +1,34 @@
 # Historical Evaluation Harness
 
-**Purpose:** Measure the current independent regime/setup strategy against the frozen legacy strategy on identical, chronological historical OHLCV data.
+**Purpose:** Measure the independent regime/setup strategy against an explicit **legacy control variant** on identical, chronological historical OHLCV data.
 
 **This module is evaluation infrastructure only.** It does **not** establish that the regime strategy is profitable or superior. No strategy parameters were optimized against evaluation data in this work.
+
+## Legacy control semantics (required reading)
+
+Production `Strategy.generateSignal` (legacy path) may apply:
+
+1. **ML bonus/penalty** when `mlService.isReady()` is true (ONNX model loaded).
+2. **Order-book imbalance points** when leading score is near the confidence threshold and `|imbalance|` is material.
+
+Historical OHLCV alone cannot reconstruct:
+
+- live order-book imbalance at decision time, or
+- leakage-free ML features/predictions without a dedicated causal ML replay pipeline (out of scope for this PR).
+
+Therefore the harness **does not** claim to replay "production with ML + live book."
+
+### Control variant actually measured
+
+| Field | Value |
+|-------|--------|
+| `legacyControlVariant` | `legacy_technical_ml_unavailable_book_neutral` |
+| Strategy engine | `STRATEGY_ENGINE=legacy` → unmodified `Strategy.generateSignal` body |
+| ML | `StubMLService.isReady() === false` → **no** ML bonus (same branch as production when no ONNX model is loaded) |
+| Order book | `StubExchangeService` imbalance **0** → **no** book points (same as unavailable book or below threshold) |
+| Technical scoring / signal / risk | **Unmodified** legacy source |
+
+Regime arm still uses independent `runRegimeEngine` (no legacy scoring).
 
 ## Input format
 
@@ -19,63 +45,54 @@ interface HistoricalCandle {
 }
 ```
 
-Validation rejects (does **not** silently sort or dedupe):
+Validation rejects (does **not** silently sort or dedupe). Successful validation returns a **copy of the chronological input sequence**.
 
-- Empty input
-- Missing / non-finite fields
-- Invalid OHLC relationships
-- Duplicate timestamps
-- Out-of-order timestamps
+## Warm-up convention
 
-Successful validation returns a **copy of the chronological input sequence**.
+| Parameter | Default (`DEFAULT_EVALUATION_ASSUMPTIONS`) |
+|-----------|--------------------------------------------|
+| `minPrimaryBars` | **300** |
+| `minHtfBars` | **50** |
+
+- Defaults are **not** reduced based on dataset length.
+- If `candles.length < minPrimaryBars`, `runHistoricalComparison` **throws** with a clear error.
+- Override only via explicit `assumptions.minPrimaryBars` / `minHtfBars` (or CLI env `EVAL_MIN_PRIMARY_BARS`, etc.).
+
+## HTF convention (when no separate HTF series)
+
+`downsampleToHtf(primary[0..T], ratio)`:
+
+- Emits only **complete** buckets of exactly `ratio` primary bars.
+- Bucket ending at index `i` uses primary `[i-ratio+1 .. i]` only.
+- Trailing incomplete primary bars are **omitted** (not treated as a finished HTF candle).
+- HTF timestamp = last primary bar in the bucket → always ≤ decision time T when primary is sliced to T.
 
 ## Assumptions (identical for both engines)
 
 | Topic | Convention |
 |-------|------------|
-| Entry timing | Signal on candle **T** enters at **T close** (matches live `closes.at(-1)`). |
-| Slippage | Adverse on entry and exit; **P&L and R use executed prices only**. |
-| Fees | Applied to realized P&L after executed-price calculation. |
+| Entry timing | Signal on candle **T** enters at **T close**. |
+| Slippage | Adverse on entry/exit; **P&L and R from executed prices only**. |
+| Fees | After executed-price P&L. |
 | Look-ahead | Decision at T uses only candles `0..T`. |
-| Warm-up | No decisions until `minPrimaryBars` (default 300). HTF needs `minHtfBars` (default 50). |
-| Resolution | Subsequent bars of the **same** series; `maxHoldBars` (default 10). |
-| Same-bar TP/SL | **partial TP → full TP → SL**. |
-| Overlapping positions | **Independent**. |
-| End of data | Timeout at last bar midpoint; incomplete if no post-entry bars. |
-| ML on legacy | Stub `isReady()=false`. |
-| Order book | Stub imbalance **0**. |
+| Same-bar TP/SL | partial TP → full TP → SL. |
+| Overlaps | Independent. |
+| End of data | Timeout midpoint / incomplete. |
 
 ## Fresh evaluation data
 
-1. Supply chronological `HistoricalCandle[]`.
-2. Filter to the evaluation range before calling the harness if needed.
-3. Result `manifest` records symbol, timeframe, range, count, content hash.
-4. **Do not** use `simulated_trades.csv` for design/tuning.
+1. Supply chronological `HistoricalCandle[]` with **≥ 300** primary bars (or explicit warm-up override).
+2. Manifest records range, content hash, and `legacyControlVariant`.
+3. **Do not** use `simulated_trades.csv` for design/tuning.
 
-```ts
-import { runHistoricalComparison } from '../src/lib/evaluation';
-const result = await runHistoricalComparison({
-  candles: myUnseenOhlcv,
-  manifestLabel: 'BTCUSDT-3m-2024H2',
-});
-```
-
-CLI: `npm run eval:historical -- --fixture` or `--from-json path.json`
+CLI: `npm run eval:historical -- --fixture` or `--from-json path.json`  
+Optional: `EVAL_MIN_PRIMARY_BARS=40` only when intentionally testing short series.
 
 ## Intentionally unchanged
 
-- Legacy scoring / signal determination
-- Regime classifier thresholds
-- TREND / BREAKOUT / RANGE setup rules
-- ML behavior and thresholds
-- Exits as a strategy improvement
-- Position sizing
-- Production default (`STRATEGY_ENGINE` default remains **legacy**)
+- Legacy scoring / signal determination source
+- Regime classifier; TREND / BREAKOUT / RANGE
+- ML thresholds; setup thresholds
+- Exits / sizing as strategy redesign
+- Production default remains **legacy**
 - `simulated_trades.csv`
-
-## Known limitations
-
-- Outcome resolution uses the decision timeframe series, not a separate 1m path.
-- HTF without a separate series is a coarse aggregate of primary bars.
-- No order-book history.
-- No claim of profitability from smoke tests.
