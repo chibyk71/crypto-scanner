@@ -24,9 +24,11 @@ Therefore the harness **does not** claim to replay "production with ML + live bo
 |-------|--------|
 | `legacyControlVariant` | `legacy_technical_ml_unavailable_book_neutral` |
 | Strategy engine | `STRATEGY_ENGINE=legacy` → unmodified `Strategy.generateSignal` body |
-| ML | `StubMLService.isReady() === false` → **no** ML bonus (same branch as production when no ONNX model is loaded) |
-| Order book | `StubExchangeService` imbalance **0** → **no** book points (same as unavailable book or below threshold) |
+| ML | `StubMLService.isReady() === false` → production **ML-unavailable** branch: **no** prediction bonus/penalty **and** technical buy/sell scores × `ML_CONFIDENCE_DISCOUNT` (0.8). Same as production when no ONNX model is loaded. |
+| Order book | `StubExchangeService` imbalance **0** → **no** book points (same as unavailable book or `|imbalance|` below threshold) |
 | Technical scoring / signal / risk | **Unmodified** legacy source |
+
+**Why not live ML + book?** Causal ML features cannot be reconstructed from OHLCV alone (`extractFeatures` uses excursion history cache and wall-clock time). Live order-book imbalance is not present in historical OHLCV. Preferring a true causal control over a contaminated "production ML" replay is intentional.
 
 Regime arm still uses independent `runRegimeEngine` (no legacy scoring).
 
