@@ -456,14 +456,11 @@ test('DEFAULT minPrimaryBars is 300 (not reduced by dataset length)', (t) => {
 });
 
 test('insufficient primary bars vs default warm-up throws (no silent Math.min reduce)', async (t) => {
-  // Old incorrect CLI used Math.min(50, floor(n/3)) which would allow n=100.
-  // Default requires 300; a series of 100 must fail without explicit override.
   const candles = series(100);
   await t.throwsAsync(
     () =>
       runHistoricalComparison({
         candles,
-        // no assumptions override → DEFAULT minPrimaryBars=300
       }),
     { message: /Insufficient primary candles for warm-up/ }
   );
@@ -488,13 +485,10 @@ test('downsampleToHtf emits only complete buckets (causal, no partial current)',
   const primary = series(10);
   const ratio = 3;
   const htf = downsampleToHtf(primary, ratio);
-  // floor(10/3)=3 complete buckets; trailing 1 bar omitted
   t.is(htf.length, 3);
-  // Bucket 0 ends at primary index 2 → timestamp of primary[2]
   t.is(htf[0]!.timestamp, primary[2]!.timestamp);
   t.is(htf[1]!.timestamp, primary[5]!.timestamp);
   t.is(htf[2]!.timestamp, primary[8]!.timestamp);
-  // No HTF timestamp can exceed last primary in its bucket
   for (const h of htf) {
     t.true(h.timestamp <= primary[primary.length - 1]!.timestamp);
   }
@@ -504,14 +498,11 @@ test('downsampleToHtf on causal prefix never includes future primary bars', (t) 
   const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
   const full = series(20);
   const ratio = 4;
-  // Decision at T=11 → primary[0..11]
   const prefix = full.slice(0, 12);
   const htf = downsampleToHtf(prefix, ratio);
-  // Complete buckets end at indices 3,7,11 → 3 HTF candles
   t.is(htf.length, 3);
   const maxHtfTs = Math.max(...htf.map((c) => c.timestamp));
   t.true(maxHtfTs <= full[11]!.timestamp);
-  // Shock after T must not appear
   t.false(htf.some((c) => c.timestamp > full[11]!.timestamp));
 });
 
@@ -519,7 +510,6 @@ test('downsampleToHtf incomplete trailing bucket is omitted (no future fill)', (
   const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
   const primary = series(5);
   const ratio = 3;
-  // indices 0,1,2 → one bucket; 3,4 incomplete → omitted
   const htf = downsampleToHtf(primary, ratio);
   t.is(htf.length, 1);
   t.is(htf[0]!.timestamp, primary[2]!.timestamp);
@@ -529,8 +519,6 @@ test('downsampleToHtf incomplete trailing bucket is omitted (no future fill)', (
 
 test('HTF minHtfBars gate uses only causal complete aggregates', async (t) => {
   const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
-  // With ratio = max(5, floor(minP/50)), minP=30 → ratio=5
-  // Need at least minHtfBars complete HTF bars before decisions
   const candles = series(50);
   const result = await runHistoricalComparison({
     candles,
@@ -540,9 +528,173 @@ test('HTF minHtfBars gate uses only causal complete aggregates', async (t) => {
       maxHoldBars: 3,
     },
   });
-  // At first eligible primary index t=29, downsample length = floor(30/5)=6 >= 5
   t.true(result.legacy.decisionsAttempted > 0);
-  // Sanity: downsample of first 30 bars with ratio 5 has 6 candles
   const down = downsampleToHtf(candles.slice(0, 30), 5);
   t.is(down.length, 6);
+});
+
+test('zero future bars → incomplete (not timeout)', (t) => {
+  const candles = series(5);
+  const trade = resolveTradeOffline({
+    engine: 'legacy',
+    signal: {
+      symbol: 'TEST/USDT',
+      signal: 'buy',
+      confidence: 40,
+      reason: [],
+      features: [],
+      stopLoss: candles[4]!.close * 0.98,
+      takeProfit: candles[4]!.close * 1.05,
+    },
+    decisionIndex: 4,
+    candles,
+    assumptions: { ...DEFAULT_EVALUATION_ASSUMPTIONS, maxHoldBars: 10 },
+  });
+  t.true(trade.incomplete);
+  t.is(trade.outcome, 'incomplete');
+});
+
+test('partial future bars (< maxHoldBars) → incomplete censored', (t) => {
+  const candles = series(10);
+  const entry = candles[5]!.close;
+  const trade = resolveTradeOffline({
+    engine: 'legacy',
+    signal: {
+      symbol: 'TEST/USDT',
+      signal: 'buy',
+      confidence: 50,
+      reason: [],
+      features: [],
+      stopLoss: entry * 0.5,
+      takeProfit: entry * 2,
+    },
+    decisionIndex: 5,
+    candles,
+    assumptions: { ...DEFAULT_EVALUATION_ASSUMPTIONS, maxHoldBars: 10 },
+  });
+  t.true(trade.incomplete);
+  t.is(trade.outcome, 'incomplete');
+});
+
+test('exactly maxHoldBars future bars with no TP/SL → genuine timeout', (t) => {
+  const candles = series(8);
+  const entry = candles[2]!.close;
+  const trade = resolveTradeOffline({
+    engine: 'legacy',
+    signal: {
+      symbol: 'TEST/USDT',
+      signal: 'buy',
+      confidence: 50,
+      reason: [],
+      features: [],
+      stopLoss: entry * 0.5,
+      takeProfit: entry * 2,
+    },
+    decisionIndex: 2,
+    candles,
+    assumptions: { ...DEFAULT_EVALUATION_ASSUMPTIONS, maxHoldBars: 5 },
+  });
+  t.false(trade.incomplete);
+  t.is(trade.outcome, 'timeout');
+});
+
+test('TP before dataset end is completed trade (not incomplete)', (t) => {
+  const candles = series(10);
+  const entry = candles[2]!.close;
+  const tp = entry * 1.05;
+  candles[3] = {
+    ...candles[3]!,
+    high: tp + 1,
+    low: entry * 0.99,
+    close: tp,
+  };
+  const trade = resolveTradeOffline({
+    engine: 'legacy',
+    signal: {
+      symbol: 'TEST/USDT',
+      signal: 'buy',
+      confidence: 50,
+      reason: [],
+      features: [],
+      stopLoss: entry * 0.95,
+      takeProfit: tp,
+    },
+    decisionIndex: 2,
+    candles,
+    assumptions: { ...DEFAULT_EVALUATION_ASSUMPTIONS, maxHoldBars: 10 },
+  });
+  t.false(trade.incomplete);
+  t.is(trade.outcome, 'tp');
+});
+
+test('incomplete trades excluded from metrics; incompleteCount visible', async (t) => {
+  const candles = series(40);
+  const result = await runHistoricalComparison({
+    candles,
+    assumptions: {
+      minPrimaryBars: 25,
+      minHtfBars: 3,
+      maxHoldBars: 20,
+      htfAggregationRatio: 5,
+    },
+    manifestLabel: 'incomplete-metrics',
+  });
+  t.true(result.legacy.incompleteCount >= 0);
+  t.is(
+    result.legacy.incompleteCount,
+    result.legacy.trades.filter((x) => x.incomplete).length
+  );
+  for (const row of result.legacy.baselineRows) {
+    t.not(row.outcome, 'incomplete');
+  }
+  const completed = result.legacy.trades.filter((x) => !x.incomplete).length;
+  if (result.legacy.metrics) {
+    t.is(result.legacy.metrics.tradeCount, completed);
+  } else {
+    t.is(completed, 0);
+  }
+});
+
+test('DEFAULT htfAggregationRatio is 5 (3m→15m), not warm-up derived', (t) => {
+  t.is(DEFAULT_EVALUATION_ASSUMPTIONS.htfAggregationRatio, 5);
+  t.is(DEFAULT_EVALUATION_ASSUMPTIONS.primaryTimeframe, '3m');
+  t.is(DEFAULT_EVALUATION_ASSUMPTIONS.htfTimeframe, '15m');
+});
+
+test('inferHtfAggregationRatio matches production 3m→15m = 5', (t) => {
+  const { inferHtfAggregationRatio } = require('./runEvaluation') as typeof import('./runEvaluation');
+  t.is(inferHtfAggregationRatio('3m', '15m'), 5);
+  t.is(inferHtfAggregationRatio('5m', '1h'), 12);
+  t.is(inferHtfAggregationRatio('1h', '4h'), 4);
+  t.is(inferHtfAggregationRatio('15m', '3m'), null);
+  t.is(inferHtfAggregationRatio('bad', '15m'), null);
+});
+
+test('manifest records explicit HTF convention (not warm-up-derived)', async (t) => {
+  const candles = series(60);
+  const result = await runHistoricalComparison({
+    candles,
+    assumptions: {
+      minPrimaryBars: 30,
+      minHtfBars: 3,
+      maxHoldBars: 5,
+      htfAggregationRatio: 5,
+    },
+  });
+  t.is(result.manifest.htfSource, 'synthetic_aggregate');
+  t.is(result.manifest.htfAggregationRatio, 5);
+  t.is(result.manifest.primaryTimeframe, '3m');
+  t.is(result.manifest.htfTimeframe, '15m');
+  t.not(result.manifest.htfAggregationRatio, Math.floor(30 / 50));
+});
+
+test('synthetic HTF uses assumptions.htfAggregationRatio not minPrimaryBars', (t) => {
+  const { downsampleToHtf } = require('./runEvaluation') as typeof import('./runEvaluation');
+  const primary = series(20);
+  const ratio = 5;
+  const htf = downsampleToHtf(primary, ratio);
+  t.is(htf.length, 4);
+  const ratioOverride = 4;
+  const htf2 = downsampleToHtf(primary, ratioOverride);
+  t.is(htf2.length, 5);
 });
