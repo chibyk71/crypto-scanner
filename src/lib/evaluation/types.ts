@@ -57,7 +57,7 @@ export interface CandleValidationIssue {
 export interface CandleValidationResult {
   ok: boolean;
   issues: CandleValidationIssue[];
-  /** Sorted unique valid candles when ok; empty when not. */
+  /** Validated chronological sequence copied from input when ok (not sorted/deduped); empty when not. */
   candles: HistoricalCandle[];
 }
 
