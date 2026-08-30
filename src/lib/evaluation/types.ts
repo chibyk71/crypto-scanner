@@ -16,11 +16,19 @@ import type { StrategyEngineId } from '../strategy/engines/types';
  * a separately designed, leakage-free feature pipeline (not in this PR).
  *
  * Therefore the default harness control is the technical legacy path with:
- *   - ML unavailable (isReady() === false → no prediction bonus; same as production when no ONNX model is loaded)
- *   - order-book imbalance neutral 0 (no points; same as production when book is unavailable or |imbalance| below threshold)
+ *   - ML unavailable (isReady() === false → production branch: no prediction
+ *     bonus/penalty AND buy/sell scores × ML_CONFIDENCE_DISCOUNT 0.8)
+ *   - order-book imbalance neutral 0 (no points; same as production when book is
+ *     unavailable or |imbalance| below threshold)
  *
- * This is NOT silently identical to "production with ML loaded + live book".
- * It is the frozen technical scoring/signal path under those unavailable inputs.
+ * Causal ML features/predictions cannot be rebuilt from OHLCV alone
+ * (extractFeatures depends on excursion history cache + wall-clock time).
+ * Live order book cannot be reconstructed from OHLCV.
+ *
+ * This is NOT "production with ML loaded + live book".
+ * It is the frozen technical scoring/signal path under those unavailable inputs,
+ * which is also the production behavior when no ONNX model is loaded and the book
+ * is unavailable/neutral.
  */
 export type LegacyControlVariant =
   | 'legacy_technical_ml_unavailable_book_neutral';
@@ -30,10 +38,14 @@ export const LEGACY_CONTROL_VARIANT: LegacyControlVariant =
 
 export const LEGACY_CONTROL_DESCRIPTION =
   'Legacy arm runs Strategy.generateSignal with STRATEGY_ENGINE=legacy, ' +
-  'StubMLService (isReady=false → no ML bonus), and StubExchangeService ' +
-  '(order-book imbalance 0 → no book points). Technical scoring and signal rules ' +
-  'are unmodified. This matches production when the ONNX model is not loaded and ' +
-  'the order book is unavailable/neutral — not production with live ML + book.';
+  'StubMLService (isReady=false → production ML-unavailable branch: no prediction ' +
+  'bonus/penalty AND technical buy/sell scores multiplied by ML_CONFIDENCE_DISCOUNT=0.8), ' +
+  'and StubExchangeService (order-book imbalance 0 → no book points; same as ' +
+  'unavailable book or |imbalance| below threshold). Technical scoring formulas and ' +
+  'signal/risk rules are unmodified. This is NOT production with a loaded ONNX model ' +
+  'or a live order book. Causal ML features cannot be reconstructed from OHLCV alone ' +
+  '(extractFeatures uses excursion history cache and wall-clock time); therefore the ' +
+  'harness intentionally measures the technical path under unavailable ML + neutral book.';
 
 /**
  * Single historical OHLCV candle (one bar).
