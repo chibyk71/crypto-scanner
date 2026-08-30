@@ -1,36 +1,32 @@
 // Regime → setup router. One subsystem per public regime.
+// Each detector receives full SetupContext (classification + indicators + price)
+// so setup qualification and entry triggers can use causal candle data.
 
-import type { MarketRegime, RegimeClassification } from '../../../regime/types';
-import type { SetupResult } from '../../types';
+import type { MarketRegime } from '../../../regime/types';
+import type { SetupContext, SetupResult } from '../../types';
+import { emptySetupResult } from '../../types';
 import { detectBreakoutSetup } from './breakoutSetup';
 import { detectRangeSetup } from './rangeSetup';
 import { detectTrendSetup } from './trendSetup';
 
 /**
- * Route classification to the matching setup detector.
+ * Route classification to the matching setup + entry-trigger detector.
  * Does not use legacy scores.
  */
-export function detectSetupForRegime(
-    classification: RegimeClassification
-): SetupResult {
-    const regime: MarketRegime = classification.regime;
+export function detectSetupForRegime(ctx: SetupContext): SetupResult {
+    const regime: MarketRegime = ctx.classification.regime;
     switch (regime) {
         case 'TREND':
-            return detectTrendSetup(classification);
+            return detectTrendSetup(ctx);
         case 'RANGE':
-            return detectRangeSetup(classification);
+            return detectRangeSetup(ctx);
         case 'BREAKOUT':
-            return detectBreakoutSetup(classification);
+            return detectBreakoutSetup(ctx);
         default: {
-            // Exhaustiveness guard
             const _exhaustive: never = regime;
-            return {
-                detected: false,
-                setupId: null,
-                side: null,
+            return emptySetupResult({
                 reasons: [`unknown regime: ${String(_exhaustive)}`],
-                diagnostics: {},
-            };
+            });
         }
     }
 }
