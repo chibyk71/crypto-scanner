@@ -23,7 +23,7 @@ export {
   candlesToOhlcvData,
 } from './validateCandles';
 
-export { resolveTradeOffline } from './offlineSimulate';
+export { resolveTradeOffline, applySlippage } from './offlineSimulate';
 
 export {
   runHistoricalComparison,
