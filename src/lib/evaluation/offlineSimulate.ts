@@ -60,7 +60,13 @@ function pnlFromExecuted(
  * Entry: decision candle close → adverse slippage → executed entry.
  * Exit: raw TP/SL/timeout → adverse slippage → executed exit; P&L from executed prices.
  * Same-bar priority: partial TP → full TP → SL (matches simulateTrade).
- * End of data: timeout at last bar midpoint.
+ *
+ * End-of-data classification:
+ *   - Natural TP/SL before horizon → completed outcome.
+ *   - Full maxHoldBars horizon available and no TP/SL → genuine timeout
+ *     (exit at last horizon bar midpoint).
+ *   - Dataset ends before full maxHoldBars horizon → incomplete/censored
+ *     (incomplete=true; still records last available midpoint for audit).
  */
 export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
   const { engine, signal, decisionIndex, candles, assumptions } = input;
@@ -193,6 +199,12 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
   }
 
   if (remaining > 0.01) {
+    // Full holding horizon requires maxHoldBars future bars after entry.
+    // endIdx == decisionIndex + maxHoldBars means the horizon was fully available.
+    const fullHorizonAvailable =
+      startIdx < candles.length &&
+      decisionIndex + assumptions.maxHoldBars <= candles.length - 1;
+
     const lastIdx = Math.min(endIdx, candles.length - 1);
     const last = candles[Math.max(lastIdx, decisionIndex)]!;
     const mid = (last.high + last.low) / 2;
@@ -204,13 +216,18 @@ export function resolveTradeOffline(input: OfflineSimInput): EvaluatedTrade {
       assumptions.slippageRate
     );
     remaining = 0;
-    outcome = 'timeout';
-    if (startIdx >= candles.length) {
-      incomplete = true;
-      outcome = 'incomplete';
-    }
     exitPrice = executedExit;
     exitTimestamp = last.timestamp;
+
+    if (fullHorizonAvailable) {
+      // Genuine timeout: full configured hold was observed without TP/SL.
+      outcome = 'timeout';
+      incomplete = false;
+    } else {
+      // Censored: dataset ends before maxHoldBars future bars were available.
+      outcome = 'incomplete';
+      incomplete = true;
+    }
   }
 
   const fees =
