@@ -19,6 +19,8 @@ import {
 import { resolveTradeOffline } from './offlineSimulate';
 import {
   DEFAULT_EVALUATION_ASSUMPTIONS,
+  LEGACY_CONTROL_DESCRIPTION,
+  LEGACY_CONTROL_VARIANT,
   type EngineEvaluationResult,
   type EvaluationAssumptions,
   type EvaluationManifest,
@@ -72,7 +74,17 @@ export function causalWindow(
   return candlesToOhlcvData(candles.slice(0, endInclusive + 1));
 }
 
-/** Coarse HTF aggregate when no separate HTF series is supplied. */
+/**
+ * Coarse HTF aggregate when no separate HTF series is supplied.
+ *
+ * Causality convention:
+ * - Only complete buckets of exactly `ratio` primary bars emit an HTF candle.
+ * - Bucket ending at primary index i uses primary[i-ratio+1 .. i] inclusive.
+ * - Trailing primary bars that do not fill a full bucket are omitted (not a
+ *   partial "live" HTF bar). Therefore when called on primary[0..T], no
+ *   primary bar after T can appear in any emitted HTF candle.
+ * - HTF candle timestamp = last primary bar timestamp in the bucket.
+ */
 export function downsampleToHtf(
   primary: HistoricalCandle[],
   ratio: number
@@ -281,6 +293,16 @@ export async function runHistoricalComparison(
     ...options.assumptions,
   };
 
+  if (candles.length < assumptions.minPrimaryBars) {
+    throw new Error(
+      `Insufficient primary candles for warm-up: have ${candles.length}, ` +
+        `require minPrimaryBars=${assumptions.minPrimaryBars} ` +
+        `(DEFAULT_EVALUATION_ASSUMPTIONS.minPrimaryBars=` +
+        `${DEFAULT_EVALUATION_ASSUMPTIONS.minPrimaryBars}). ` +
+        `Supply more history or explicitly override assumptions.minPrimaryBars.`
+    );
+  }
+
   const symbol = candles[0]!.symbol;
   const timeframe = candles[0]!.timeframe;
 
@@ -316,15 +338,20 @@ export async function runHistoricalComparison(
     contentHash: contentHash(candles),
     evaluatedAtIso: new Date().toISOString(),
     gitSha: options.gitSha,
+    legacyControlVariant: LEGACY_CONTROL_VARIANT,
+    legacyControlDescription: LEGACY_CONTROL_DESCRIPTION,
   };
 
   return {
     manifest,
     assumptions,
+    legacyControlVariant: LEGACY_CONTROL_VARIANT,
+    legacyControlDescription: LEGACY_CONTROL_DESCRIPTION,
     legacy,
     regime,
     disclaimer:
-      'This evaluation harness measures current legacy vs regime behavior on the supplied historical candles. ' +
+      'This evaluation harness measures regime against the explicit legacy control variant ' +
+      `'${LEGACY_CONTROL_VARIANT}' (technical path; ML unavailable; book neutral). ` +
       'It does not establish that the regime strategy is profitable or superior. ' +
       'No strategy parameters were optimized against this dataset in this PR.',
   };
