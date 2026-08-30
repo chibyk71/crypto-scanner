@@ -113,6 +113,32 @@ export function downsampleToHtf(
   return out;
 }
 
+/**
+ * Infer primary→HTF bar ratio from timeframe labels (e.g. 3m + 15m → 5).
+ * Matches production ExchangeService.toTimeframeMs units (m/h/d).
+ * Returns null if labels are unparseable or HTF is not an integer multiple.
+ */
+export function inferHtfAggregationRatio(
+  primaryTimeframe: string,
+  htfTimeframe: string
+): number | null {
+  const toMs = (tf: string): number | null => {
+    const m = tf.trim().match(/^(\d+)([mhd])$/i);
+    if (!m) return null;
+    const v = parseInt(m[1]!, 10);
+    const u = m[2]!.toLowerCase();
+    if (u === 'm') return v * 60_000;
+    if (u === 'h') return v * 3_600_000;
+    return v * 86_400_000;
+  };
+  const p = toMs(primaryTimeframe);
+  const h = toMs(htfTimeframe);
+  if (p == null || h == null || p <= 0 || h < p) return null;
+  const ratio = h / p;
+  if (!Number.isInteger(ratio) || ratio < 1) return null;
+  return ratio;
+}
+
 function buildStrategyInput(
   symbol: string,
   primary: OhlcvData,
@@ -163,10 +189,10 @@ async function runEngineOnSeries(
       }
       htfWin = candlesToOhlcvData(htfUpTo);
     } else {
-      const down = downsampleToHtf(
-        candles.slice(0, t + 1),
-        Math.max(5, Math.floor(minP / 50))
-      );
+      // Synthetic HTF: production-aligned ratio (default 3m→15m = 5),
+      // NOT derived from minPrimaryBars / warm-up.
+      const ratio = Math.max(1, assumptions.htfAggregationRatio);
+      const down = downsampleToHtf(candles.slice(0, t + 1), ratio);
       if (down.length < assumptions.minHtfBars) {
         warmUpSkipped++;
         continue;
@@ -219,7 +245,10 @@ async function runEngineOnSeries(
     );
   }
 
-  const baselineRows = tradesToBaselineRows(trades);
+  const incompleteCount = trades.filter((t) => t.incomplete).length;
+  // Incomplete/censored trades stay in `trades` for audit but are excluded from metrics.
+  const completed = trades.filter((t) => !t.incomplete);
+  const baselineRows = tradesToBaselineRows(completed);
   const metrics =
     baselineRows.length > 0 ? computePerformanceMetrics(baselineRows) : null;
 
@@ -229,34 +258,46 @@ async function runEngineOnSeries(
     holdCount,
     warmUpSkipped,
     decisionsAttempted,
+    incompleteCount,
     metrics,
     baselineRows,
   };
 }
 
+/**
+ * Map completed evaluation trades to baseline rows.
+ * Callers must pass only completed trades — incomplete must not be coerced to timeout.
+ */
 function tradesToBaselineRows(trades: EvaluatedTrade[]): BaselineTradeRow[] {
-  return trades.map((t, i) => ({
-    id: i + 1,
-    signalId: `${t.engine}-${t.decisionTimestamp}-${t.side}`,
-    symbol: t.symbol,
-    side: t.side,
-    regime: t.regime,
-    confidence: t.confidence,
-    openedAt: t.entryTimestamp,
-    closedAt: t.exitTimestamp,
-    outcome: t.outcome === 'incomplete' ? 'timeout' : t.outcome,
-    rMultiple: t.rMultiple,
-    pnl: t.pnl,
-    label: null,
-    mfe: t.mfe,
-    mae: t.mae,
-    durationMs: t.durationMs,
-    timeToMFEMs: 0,
-    timeToMAEMs: 0,
-    wasTaken: true,
-    mlPredictedLabel: null,
-    mlPredictedConfidence: null,
-  }));
+  return trades.map((t, i) => {
+    if (t.incomplete || t.outcome === 'incomplete') {
+      throw new Error(
+        'tradesToBaselineRows: incomplete trades must not enter completed-trade metrics'
+      );
+    }
+    return {
+      id: i + 1,
+      signalId: `${t.engine}-${t.decisionTimestamp}-${t.side}`,
+      symbol: t.symbol,
+      side: t.side,
+      regime: t.regime,
+      confidence: t.confidence,
+      openedAt: t.entryTimestamp,
+      closedAt: t.exitTimestamp,
+      outcome: t.outcome,
+      rMultiple: t.rMultiple,
+      pnl: t.pnl,
+      label: null,
+      mfe: t.mfe,
+      mae: t.mae,
+      durationMs: t.durationMs,
+      timeToMFEMs: 0,
+      timeToMAEMs: 0,
+      wasTaken: true,
+      mlPredictedLabel: null,
+      mlPredictedConfidence: null,
+    };
+  });
 }
 
 export interface RunHistoricalComparisonOptions {
@@ -332,6 +373,9 @@ export async function runHistoricalComparison(
     null
   );
 
+  const htfSource =
+    htfCandles != null ? 'provided_series' : 'synthetic_aggregate';
+
   const manifest: EvaluationManifest = {
     label: options.manifestLabel ?? `${symbol}-${timeframe}`,
     symbol,
@@ -344,6 +388,10 @@ export async function runHistoricalComparison(
     gitSha: options.gitSha,
     legacyControlVariant: LEGACY_CONTROL_VARIANT,
     legacyControlDescription: LEGACY_CONTROL_DESCRIPTION,
+    htfSource,
+    htfAggregationRatio: assumptions.htfAggregationRatio,
+    primaryTimeframe: assumptions.primaryTimeframe,
+    htfTimeframe: assumptions.htfTimeframe,
   };
 
   return {
