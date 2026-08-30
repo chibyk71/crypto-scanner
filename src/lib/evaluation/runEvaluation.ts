@@ -29,7 +29,11 @@ import {
   type HistoricalComparisonResult,
 } from './types';
 
-/** Stub ML: never ready → legacy path runs without ML bonus. */
+/**
+ * Stub ML: never ready → production ML-unavailable branch in computeScores:
+ * no prediction bonus/penalty, and buy/sell scores × ML_CONFIDENCE_DISCOUNT (0.8).
+ * Does not claim to replay production with a loaded ONNX model.
+ */
 export class StubMLService {
   isReady(): boolean {
     return false;
