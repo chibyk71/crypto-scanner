@@ -7,6 +7,7 @@
 // Does not embed if (regimeMode) inside scoring.
 
 import type { TradeSignal } from '../../../types';
+import type { MLService } from '../../services/mlService';
 import type { StrategyInput } from '../types';
 import { runRegimeEngine } from './regime/engine';
 import type { StrategyEngineId } from './types';
@@ -24,14 +25,19 @@ export interface LegacyStrategyLike {
  *
  * Legacy path is a pure passthrough to Strategy.generateSignal — behavior
  * unchanged. Regime path never enters scoring.
+ *
+ * mlService is required for the regime path so extractFeatures can populate
+ * signal.features (needed by simulateTrade). It is not used for ML predict
+ * on the regime decision path (intentional for first live run).
  */
 export async function dispatchStrategyEngine(
     engine: StrategyEngineId,
     legacyStrategy: LegacyStrategyLike,
-    input: StrategyInput
+    input: StrategyInput,
+    mlService: MLService
 ): Promise<TradeSignal> {
     if (engine === 'regime') {
-        return runRegimeEngine(input).signal;
+        return (await runRegimeEngine(input, mlService)).signal;
     }
     return legacyStrategy.generateSignal(input);
 }

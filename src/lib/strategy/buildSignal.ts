@@ -34,6 +34,10 @@ export function buildFinalSignal(params: {
     tplevels?: PartialTPLevel[];
     mlPredictedLabel?: SignalLabel;
     regime?: MarketRegime;
+    /** Strategy engine that produced this signal. Default 'legacy' so legacy
+     *  rows are attributable in simulated_trades without every call site
+     *  having to pass engine explicitly. Regime engine overrides to 'regime'. */
+    engine?: 'legacy' | 'regime';
 }): TradeSignal {
     const {
         symbol,
@@ -47,6 +51,7 @@ export function buildFinalSignal(params: {
         positionSizeMultiplier,
         mlConfidence,
         regime,
+        engine = 'legacy',
     } = params;
 
     // Only attach risk levels if we have a valid buy/sell signal
@@ -67,5 +72,6 @@ export function buildFinalSignal(params: {
         mlConfidence,
         takeProfitLevels: hasValidSignal ? params.tplevels ?? [] : [],
         mlPredictedLabel: hasValidSignal ? params.mlPredictedLabel : undefined,
+        engine,
     };
 }
