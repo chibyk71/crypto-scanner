@@ -128,7 +128,7 @@ export class TelegramBotController {
             authorizedChatId: this.authorizedChatId,
             userStates: this.stateManager.map,
             watchAlertService: this.watchAlertService,
-            isAuthorized: (chatId: number) => this.isAuthorized(chatId),
+            isAuthorized: (chatId) => this.isAuthorized(chatId),
             sendMessage: (message, options) => this.sendMessage(message, options),
             updateUserState: (chatId, newState) => this.stateManager.updateUserState(chatId, newState),
         };
@@ -151,16 +151,6 @@ export class TelegramBotController {
      * Order of registration is preserved exactly from the original.
      */
     private registerListeners(): void {
-        // TEMP DEBUG — remove after fixing
-        this.bot.on('message', (msg) => {
-            console.log('=== INCOMING MESSAGE ===');
-            console.log('From chat ID:', msg.chat.id);
-            console.log('From user ID:', msg.from?.id);
-            console.log('Text:', msg.text);
-            console.log('Your configured TELEGRAM_CHAT_ID:', this.authorizedChatId);
-            console.log('Match?', String(msg.chat.id) === this.authorizedChatId);
-            console.log('========================');
-        });
         // =================================================================
         // TELEGRAM COMMAND REGISTRATION – Centralized & Grouped
         // =================================================================
