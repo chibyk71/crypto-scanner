@@ -325,8 +325,14 @@ class DatabaseService {
         mlPredictedLabel?: number,
         mlPredictedConfidence?: number,
         regime?: MarketRegime,
+        engine?: 'legacy' | 'regime' | null,
+        setupId?: string | null,
     ): Promise<string> {
-        return simWrite.createNewSimulation(this.db, signalId, symbol, side, entryPrice, openedAt, features, confidence, mlPredictedLabel, mlPredictedConfidence, regime);
+        return simWrite.createNewSimulation(
+            this.db, signalId, symbol, side, entryPrice, openedAt, features,
+            confidence, mlPredictedLabel, mlPredictedConfidence, regime,
+            engine, setupId
+        );
     }
 
     public async updateCompletedSimulation(
