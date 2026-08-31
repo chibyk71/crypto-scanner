@@ -193,6 +193,18 @@ export const simulatedTrades = mysqlTable(
          */
         regime: varchar('regime', { length: 32 }).$type<MarketRegime | null>(),
 
+        /**
+         * Strategy engine that produced this simulation row.
+         * 'legacy' | 'regime'. Nullable for rows that predate this column.
+         */
+        engine: varchar('engine', { length: 10 }).$type<'legacy' | 'regime' | null>(),
+
+        /**
+         * Experimental setup identifier when engine === 'regime'.
+         * Nullable for legacy rows and when no setup was detected.
+         */
+        setupId: varchar('setup_id', { length: 64 }),
+
         /** Entry price ×1e8 (high precision) */
         entryPrice: float('entry_price').notNull(),
 
