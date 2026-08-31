@@ -287,7 +287,7 @@ export class MLService {
      * rather than throwing.
      *
      * @param direction 'buy' or 'sell' — which side model to use
-     * @param features Vector from extractFeatures() — must be length 26
+     * @param features Vector from extractFeatures() — must be length 33
      * @returns { label, confidence } — confidence = P(label +1) + P(label +2)
      */
     public async predictDirectional(
@@ -627,7 +627,7 @@ export class MLService {
      * Note: This is async because onnxruntime-node's session.run() is async.
      * The caller in strategy.ts must await this call.
      *
-     * @param features Vector from extractFeatures() — must be length 26
+     * @param features Vector from extractFeatures() — must be length 33
      * @returns { label, confidence } where confidence = P(label +1) + P(label +2)
      */
     public async predict(features: number[]): Promise<{ label: SignalLabel; confidence: number }> {

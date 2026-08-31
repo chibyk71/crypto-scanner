@@ -265,14 +265,18 @@ export class AutoTradeService {
             let finalTakeProfit: number;
 
             if (signal.takeProfit !== undefined && signal.takeProfit > 0) {
-                const signalTpDistance = Math.abs(signal.takeProfit - (signal.stopLoss ?? 0) !== undefined
-                    ? signal.takeProfit - (finalSide === 'buy'
-                        ? currentPrice - slDistanceFromEntry
-                        : currentPrice + slDistanceFromEntry)
-                    : signal.takeProfit - currentPrice);
+                // Preserve the signal's original TP distance and re-anchor to
+                // currentPrice (same pattern as finalStopLoss above). The prior
+                // ternary's !== undefined check was always true (arithmetic on
+                // numbers), so only the first branch was reachable — this keeps
+                // that behavior with correct parentheses.
+                const signalTpAnchor = finalSide === 'buy'
+                    ? currentPrice - slDistanceFromEntry
+                    : currentPrice + slDistanceFromEntry;
+                const signalTpDistance = Math.abs(signal.takeProfit - signalTpAnchor);
                 finalTakeProfit = finalSide === 'buy'
-                    ? currentPrice + Math.abs(signalTpDistance)
-                    : currentPrice - Math.abs(signalTpDistance);
+                    ? currentPrice + signalTpDistance
+                    : currentPrice - signalTpDistance;
             } else {
                 const rrTarget = config.strategy.riskRewardTarget ?? 2;
                 finalTakeProfit = finalSide === 'buy'
