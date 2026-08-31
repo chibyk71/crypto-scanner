@@ -39,6 +39,8 @@ export async function createNewSimulation(
     mlPredictedLabel?: number,
     mlPredictedConfidence?: number,
     regime?: MarketRegime,
+    engine?: 'legacy' | 'regime' | null,
+    setupId?: string | null,
 ): Promise<string> {
     try {
         const [inserted] = await db
@@ -48,6 +50,8 @@ export async function createNewSimulation(
                 symbol,
                 side,
                 regime: regime ?? null,
+                engine: engine ?? null,
+                setupId: setupId ?? null,
                 entryPrice,               // stored as raw float
                 openedAt,
                 wasTaken: false,
@@ -86,6 +90,8 @@ export async function createNewSimulation(
             symbol,
             side,
             regime,
+            engine,
+            setupId,
             entryPrice,
             openedAt: new Date(openedAt).toISOString(),
         });
@@ -97,6 +103,8 @@ export async function createNewSimulation(
             symbol,
             side,
             regime,
+            engine,
+            setupId,
             entryPrice,
             error: error instanceof Error
                 ? error.message
