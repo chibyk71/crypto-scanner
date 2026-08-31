@@ -38,8 +38,9 @@ export class StubMLService {
   isReady(): boolean {
     return false;
   }
+  /** Neutral 33-vector so regime-engine simulate path is not skipped. */
   async extractFeatures(): Promise<number[]> {
-    return [];
+    return new Array(33).fill(0);
   }
   async predict(): Promise<{ label: 0; confidence: 0 }> {
     return { label: 0, confidence: 0 };
@@ -170,6 +171,8 @@ async function runEngineOnSeries(
   let warmUpSkipped = 0;
   let decisionsAttempted = 0;
   const minP = assumptions.minPrimaryBars;
+  // Stub ML for regime path feature extraction only (no predict on decision path).
+  const mlService = new StubMLService() as unknown as MLService;
 
   for (let t = 0; t < candles.length; t++) {
     if (t + 1 < minP) {
@@ -213,7 +216,7 @@ async function runEngineOnSeries(
     let signal: TradeSignal;
     if (engine === 'regime') {
       // Independent regime path — never enters legacy scoring
-      signal = runRegimeEngine(input).signal;
+      signal = (await runRegimeEngine(input, mlService as MLService)).signal;
     } else {
       if (!legacyStrategy) {
         throw new Error('Legacy engine requires Strategy instance');
