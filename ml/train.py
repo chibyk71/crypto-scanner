@@ -31,8 +31,25 @@ from utils import (
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_PATH   = Path('data/simulated_trades.csv')
+# Prefer training_export.csv (Telegram /export_training_data), fall back to
+# simulated_trades.csv — same order as validate.py and evaluate_lib.
+DATA_CANDIDATES = [
+    Path('data/training_export.csv'),
+    Path('data/simulated_trades.csv'),
+]
 OUTPUT_PATH = Path('models/model.onnx')
+
+
+def _resolve_data_path() -> Path:
+    for p in DATA_CANDIDATES:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        'Training data not found. Tried: '
+        + ', '.join(str(p) for p in DATA_CANDIDATES)
+        + '. Export via Telegram /export_training_data and place at '
+        'ml/data/training_export.csv'
+    )
 
 # ── XGBoost hyperparameters ───────────────────────────────────────────────────
 # Tuned for small-to-medium tabular datasets (500–5000 rows)
@@ -60,7 +77,9 @@ def main():
 
     # ── 1. Load and clean data ────────────────────────────────────────────────
     print("\n[1/4] Loading training data...")
-    X, y, entry_prices = load_training_data(DATA_PATH)
+    data_path = _resolve_data_path()
+    print(f"  Using: {data_path}")
+    X, y, entry_prices = load_training_data(data_path)
 
     # Warn if any class is severely underrepresented
     print("\n  Checking class balance...")
@@ -83,68 +102,21 @@ def main():
     model = XGBClassifier(**XGBOOST_PARAMS)
     model.fit(X, y)
 
-    print("  Training complete.")
-
     # ── 3. Feature importances ────────────────────────────────────────────────
-    print("\n[3/4] Feature importances (top 10):")
+    print("\n[3/4] Feature importances (top 15):")
     importances = model.feature_importances_
+    ranked = sorted(zip(FEATURE_NAMES, importances), key=lambda x: -x[1])
+    for name, imp in ranked[:15]:
+        print(f"  {name:25s} {imp:.4f}")
 
-    # Pair names with importances and sort descending
-    paired = sorted(
-        zip(FEATURE_NAMES, importances),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    print(f"\n  {'Feature':<20} {'Importance':>10}  {'Bar'}")
-    print(f"  {'-'*20}  {'-'*10}  {'-'*30}")
-    for name, score in paired[:10]:
-        bar = '█' * int(score * 200)
-        print(f"  {name:<20} {score:>10.4f}  {bar}")
-
-    # Warn if symbol_index has near-zero importance
-    # (means the model isn't using symbol identity at all)
-    symbol_importance = dict(paired).get('symbol_index', 0)
-    if symbol_importance < 0.01:
-        print(
-            "\n  NOTE: symbol_index importance is very low "
-            f"({symbol_importance:.4f})."
-        )
-        print(
-            "  This is normal with few symbols or few samples per symbol."
-        )
-        print(
-            "  It will increase as more per-symbol simulations accumulate."
-        )
-
-    # ── 4. Export to ONNX ─────────────────────────────────────────────────────
-    print(f"\n[4/4] Exporting to ONNX...")
+    # ── 4. Export ONNX ────────────────────────────────────────────────────────
+    print(f"\n[4/4] Exporting ONNX to {OUTPUT_PATH}...")
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     initial_type = [('float_input', FloatTensorType([None, EXPECTED_FEATURES]))]
-
-    onnx_model = convert_xgboost(
-        model,
-        initial_types=initial_type,
-        target_opset=12,     # opset 12 is widely supported including onnxruntime-node
-    )
-
-    with open(OUTPUT_PATH, 'wb') as f:
-        f.write(onnx_model.SerializeToString())
-
-    size_kb = OUTPUT_PATH.stat().st_size / 1024
-    print(f"  Saved to {OUTPUT_PATH} ({size_kb:.1f} KB)")
-
-    # ── Done ──────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  Training complete.")
-    print(f"  Model: {OUTPUT_PATH}")
-    print("")
-    print("  Next steps:")
-    print("    1. Run:    python validate.py")
-    print("    2. Upload: models/model.onnx → production models/model.onnx")
-    print("    3. Send:   /ml_reload to your Telegram bot")
-    print("=" * 60)
+    onnx_model = convert_xgboost(model, initial_types=initial_type)
+    onnx.save_model(onnx_model, str(OUTPUT_PATH))
+    print(f"  Saved {OUTPUT_PATH} ({OUTPUT_PATH.stat().st_size // 1024} KB)")
+    print("\nDone. Run validate.py before uploading to production.")
 
 
 if __name__ == '__main__':
