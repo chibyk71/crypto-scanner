@@ -25,7 +25,7 @@ function makeOhlcv(n = 50, startPrice = 100): OhlcvData {
         timestamps.push(1_700_000_000_000 + i * 180_000);
         p = c;
     }
-    return { opens, highs, lows, closes, volumes, timestamps };
+    return { opens, highs, lows, closes, volumes, timestamps, length: n };
 }
 
 function makeInput(overrides: Partial<StrategyInput> = {}): StrategyInput {
