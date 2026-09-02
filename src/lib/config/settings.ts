@@ -206,6 +206,7 @@ export const config = {
      */
     env: rawConfig.ENV,                    // 'dev' | 'test' | 'prod'
     log_level: rawConfig.LOG_LEVEL,        // Controls Winston logger verbosity
+    strategyEngine: rawConfig.STRATEGY_ENGINE, // 'legacy' | 'regime'
 
     // =========================================================================
     // AUTOTRADE MASTER SWITCH

@@ -98,7 +98,7 @@ export class Strategy {
 
         try {
             // Phase 2B: single engine boundary — default legacy (body below unchanged).
-            if (resolveStrategyEngine(process.env.STRATEGY_ENGINE) === 'regime') {
+            if (resolveStrategyEngine(config.strategyEngine) === 'regime') {
                 return (await runRegimeEngine(input, this.mlService)).signal;
             }
 

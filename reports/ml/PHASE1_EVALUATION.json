@@ -1,0 +1,1793 @@
+{
+  "phase": 1,
+  "title": "Phase 1 \u2014 Measurement & ML Validation",
+  "generated_at": "2026-09-02T02:37:01Z",
+  "data_source": "C:\\Users\\user\\Documents\\projects\\crypto-scanner\\ml\\data\\simulated_trades.csv",
+  "is_fixture": false,
+  "result_kind": "real_training_export",
+  "random_seed": 42,
+  "dataset": {
+    "n": 3876,
+    "n_features": 33,
+    "feature_names": [
+      "rsi",
+      "ema_short_dev",
+      "ema_mid_dev",
+      "ema_long_dev",
+      "macd_line_norm",
+      "macd_signal_norm",
+      "macd_hist_norm",
+      "stoch_k",
+      "stoch_d",
+      "atr_pct",
+      "htf_adx",
+      "percent_b",
+      "bb_bandwidth",
+      "momentum",
+      "engulfing",
+      "buy_mfe",
+      "buy_mae",
+      "buy_ratio",
+      "sell_mfe",
+      "sell_mae",
+      "sell_ratio",
+      "obv_delta_norm",
+      "vwap_deviation",
+      "vwma_vwap_spread",
+      "rel_volume",
+      "liquidity_sweep",
+      "bb_squeeze_breakout",
+      "prev_buy_outcome",
+      "prev_buy_label",
+      "prev_sell_outcome",
+      "prev_sell_label",
+      "time_since_last_sim",
+      "symbol_index"
+    ],
+    "symbols": [
+      "AAVE/USDT",
+      "ADA/USDT",
+      "ALGO/USDT",
+      "APT/USDT",
+      "ARB/USDT",
+      "AVAX/USDT",
+      "BCH/USDT",
+      "BNB/USDT",
+      "BTC/USDT",
+      "DOGE/USDT",
+      "DOT/USDT",
+      "ENA/USDT",
+      "ETH/USDT",
+      "FIL/USDT",
+      "ICP/USDT",
+      "INJ/USDT",
+      "LINK/USDT",
+      "LTC/USDT",
+      "NEAR/USDT",
+      "NOT/USDT",
+      "OP/USDT",
+      "PEPE/USDT",
+      "SOL/USDT",
+      "STX/USDT",
+      "SUI/USDT",
+      "TRX/USDT",
+      "UNI/USDT",
+      "WLD/USDT",
+      "XAUT/USDT",
+      "XRP/USDT"
+    ],
+    "sides": {
+      "buy": 2063,
+      "sell": 1813
+    },
+    "sorted_chronologically": true,
+    "time_range": {
+      "n": 3876,
+      "t_min": 1787120961747,
+      "t_max": 1788314883632,
+      "t_min_iso": "2026-08-19T06:29:21Z",
+      "t_max_iso": "2026-09-02T02:08:03Z"
+    },
+    "native_label_counts": {
+      "-2": 1535,
+      "-1": 576,
+      "0": 32,
+      "1": 1195,
+      "2": 538
+    },
+    "five_class_counts": {
+      "0": 1535,
+      "1": 576,
+      "2": 32,
+      "3": 1195,
+      "4": 538
+    },
+    "five_class_proportions": {
+      "0": 0.3960268317853457,
+      "1": 0.14860681114551083,
+      "2": 0.008255933952528379,
+      "3": 0.30830753353973167,
+      "4": 0.1388028895768834
+    }
+  },
+  "split": {
+    "train_ratio": 0.6,
+    "val_ratio": 0.2,
+    "test_ratio": 0.2,
+    "train": {
+      "n": 2325,
+      "t_min": 1787120961747,
+      "t_max": 1787666508681,
+      "t_min_iso": "2026-08-19T06:29:21Z",
+      "t_max_iso": "2026-08-25T14:01:48Z"
+    },
+    "validation": {
+      "n": 775,
+      "t_min": 1787666509381,
+      "t_max": 1787936688674,
+      "t_min_iso": "2026-08-25T14:01:49Z",
+      "t_max_iso": "2026-08-28T17:04:48Z"
+    },
+    "test": {
+      "n": 776,
+      "t_min": 1787937284361,
+      "t_max": 1788314883632,
+      "t_min_iso": "2026-08-28T17:14:44Z",
+      "t_max_iso": "2026-09-02T02:08:03Z"
+    },
+    "boundary_ties": {
+      "train_val_boundary_same_ts": 0,
+      "val_test_boundary_same_ts": 0,
+      "note": "If 1, last train and first val (or val/test) share closed_at. Rows are non-overlapping by index; same-ms events may be concurrent."
+    }
+  },
+  "model_config": {
+    "n_estimators": 150,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 3,
+    "gamma": 0.1,
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "random_state": 42,
+    "n_jobs": 1
+  },
+  "label_mappings": {
+    "five_class": "native -2..+2 \u2192 internal 0..4 (repository default)",
+    "four_class": "disaster=-2\u21920, loss=-1\u21921, neutral=0\u21922, win=+1|+2\u21923",
+    "three_class": "loss=-2|-1\u21920, neutral=0\u21921, win=+1|+2\u21922"
+  },
+  "information_conditions": {
+    "technical_only": {
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26
+      ],
+      "description": "27-feature signal-input subset (indices 0\u201326): contemporaneous indicators, excursion-history MFE/MAE/ratios, market context, pattern flags. Measurement baseline only \u2014 NOT a replay of production buyScore/sellScore (those score-level values are not in the training export).",
+      "role": "Signal-input subset 0\u201326 (measurement baseline; not production score)"
+    },
+    "full_feature_ml": {
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32
+      ],
+      "description": "All 33 production ML input features matching mlService.extractFeatures(). NOT pure ML-only \u2014 includes the signal-input subset plus prev-sim outcomes and symbol_index.",
+      "role": "Full production ML input vector (33 features; not ML-only)"
+    }
+  },
+  "ml_only_limitation": "Pure ML-only cannot be isolated as a feature subset. Production ML consumes all 33 features and emits label/confidence. None of the 33 features is an ML model output. Production buyScore/sellScore + ML bonus fusion is score-level and is not stored in the training CSV. Closest valid comparison: signal_subset_0_26 (report key technical_only) vs full_feature_ml (all 33 production ML inputs). signal_subset_0_26 is a measurement baseline, not a replay of production technical scores.",
+  "partition_design": "Phase 1 is a fixed-model diagnostic. TRAIN (60%) is used only for fitting. VALIDATION (20%) is reported for diagnostics only and is not used for model/formulation/hyperparameter selection. FINAL TEST (20%) is untouched until final evidence reporting. All formulations and information conditions are reported independently; no winner is selected from validation or test for configuration choice.",
+  "leakage_audit_features": [
+    {
+      "index": 0,
+      "name": "rsi",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 1,
+      "name": "ema_short_dev",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 2,
+      "name": "ema_mid_dev",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 3,
+      "name": "ema_long_dev",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 4,
+      "name": "macd_line_norm",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 5,
+      "name": "macd_signal_norm",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 6,
+      "name": "macd_hist_norm",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 7,
+      "name": "stoch_k",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 8,
+      "name": "stoch_d",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 9,
+      "name": "atr_pct",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 10,
+      "name": "htf_adx",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 11,
+      "name": "percent_b",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 12,
+      "name": "bb_bandwidth",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 13,
+      "name": "momentum",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 14,
+      "name": "engulfing",
+      "group": "technical indicators",
+      "status": "available_at_prediction",
+      "note": "Computed from candles at signal time in computeIndicators."
+    },
+    {
+      "index": 15,
+      "name": "buy_mfe",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 16,
+      "name": "buy_mae",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 17,
+      "name": "buy_ratio",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 18,
+      "name": "sell_mfe",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 19,
+      "name": "sell_mae",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 20,
+      "name": "sell_ratio",
+      "group": "excursion regime MFE/MAE",
+      "status": "available_at_prediction",
+      "note": "Historical aggregates from prior closed sims via excursionHistoryCache."
+    },
+    {
+      "index": 21,
+      "name": "obv_delta_norm",
+      "group": "market context",
+      "status": "available_at_prediction",
+      "note": "OBV/VWAP/volume from current candle window."
+    },
+    {
+      "index": 22,
+      "name": "vwap_deviation",
+      "group": "market context",
+      "status": "available_at_prediction",
+      "note": "OBV/VWAP/volume from current candle window."
+    },
+    {
+      "index": 23,
+      "name": "vwma_vwap_spread",
+      "group": "market context",
+      "status": "available_at_prediction",
+      "note": "OBV/VWAP/volume from current candle window."
+    },
+    {
+      "index": 24,
+      "name": "rel_volume",
+      "group": "market context",
+      "status": "available_at_prediction",
+      "note": "OBV/VWAP/volume from current candle window."
+    },
+    {
+      "index": 25,
+      "name": "liquidity_sweep",
+      "group": "pattern flags",
+      "status": "available_at_prediction",
+      "note": "Liquidity sweep / BB squeeze on current candle."
+    },
+    {
+      "index": 26,
+      "name": "bb_squeeze_breakout",
+      "group": "pattern flags",
+      "status": "available_at_prediction",
+      "note": "Liquidity sweep / BB squeeze on current candle."
+    },
+    {
+      "index": 27,
+      "name": "prev_buy_outcome",
+      "group": "prev sim outcome/label",
+      "status": "available_at_prediction",
+      "note": "Prior closed sim for same symbol. Not the current trade's outcome."
+    },
+    {
+      "index": 28,
+      "name": "prev_buy_label",
+      "group": "prev sim outcome/label",
+      "status": "available_at_prediction",
+      "note": "Prior closed sim for same symbol. Not the current trade's outcome."
+    },
+    {
+      "index": 29,
+      "name": "prev_sell_outcome",
+      "group": "prev sim outcome/label",
+      "status": "available_at_prediction",
+      "note": "Prior closed sim for same symbol. Not the current trade's outcome."
+    },
+    {
+      "index": 30,
+      "name": "prev_sell_label",
+      "group": "prev sim outcome/label",
+      "status": "available_at_prediction",
+      "note": "Prior closed sim for same symbol. Not the current trade's outcome."
+    },
+    {
+      "index": 31,
+      "name": "time_since_last_sim",
+      "group": "time_since_last_sim",
+      "status": "available_at_prediction",
+      "note": "Elapsed since most recent prior sim; uses Date.now at extract time."
+    },
+    {
+      "index": 32,
+      "name": "symbol_index",
+      "group": "symbol_index",
+      "status": "available_at_prediction",
+      "note": "Stable registry index; not outcome-derived."
+    }
+  ],
+  "leakage_audit_process": [
+    "Export ordered DESC by closed_at; evaluation sorts ASC (stable mergesort).",
+    "Split 60/20/20 chronological; model.fit uses only train indices.",
+    "Final test never used for fit or selection (no selection step in Phase 1).",
+    "Validation is diagnostic only \u2014 not used for formulation/config selection.",
+    "No scaler/imputer fitted on full data; features pre-normalized at export.",
+    "Hyperparameters fixed (EVAL_XGB_PARAMS, seed=42); not tuned on test.",
+    "Production train.py still fits full dataset for ONNX; unchanged.",
+    "Equal closed_at: stable order; boundary_ties recorded if partition edge shares ms."
+  ],
+  "results": [
+    {
+      "formulation": "five_class",
+      "n_classes": 5,
+      "information_condition": "technical_only",
+      "role": "Signal-input subset 0\u201326 (measurement baseline; not production score)",
+      "n_features": 27,
+      "class_names": {
+        "0": "disaster",
+        "1": "loss",
+        "2": "neutral",
+        "3": "good",
+        "4": "monster"
+      },
+      "train_class_counts": {
+        "0": 865,
+        "1": 314,
+        "2": 23,
+        "3": 779,
+        "4": 344
+      },
+      "val_class_counts": {
+        "0": 308,
+        "1": 148,
+        "2": 1,
+        "3": 212,
+        "4": 106
+      },
+      "test_class_counts": {
+        "0": 362,
+        "1": 114,
+        "2": 8,
+        "3": 204,
+        "4": 88
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.3496774193548387,
+        "balanced_accuracy": 0.20654847447300279,
+        "macro_f1": 0.1854129005242846,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.3917525773195876,
+            "recall": 0.6168831168831169,
+            "f1": 0.4791929382093317,
+            "support": 308,
+            "predicted_count": 485,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.2,
+            "recall": 0.033783783783783786,
+            "f1": 0.057803468208092484,
+            "support": 148,
+            "predicted_count": 25,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "good",
+            "precision": 0.28174603174603174,
+            "recall": 0.33490566037735847,
+            "f1": 0.30603448275862066,
+            "support": 212,
+            "predicted_count": 252,
+            "reliable": true
+          },
+          {
+            "class_id": 4,
+            "name": "monster",
+            "precision": 0.38461538461538464,
+            "recall": 0.04716981132075472,
+            "f1": 0.08403361344537816,
+            "support": 106,
+            "predicted_count": 13,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            190,
+            6,
+            0,
+            108,
+            4
+          ],
+          [
+            99,
+            5,
+            0,
+            41,
+            3
+          ],
+          [
+            0,
+            0,
+            0,
+            1,
+            0
+          ],
+          [
+            129,
+            11,
+            0,
+            71,
+            1
+          ],
+          [
+            67,
+            3,
+            0,
+            31,
+            5
+          ]
+        ],
+        "true_counts": {
+          "0": 308,
+          "1": 148,
+          "2": 1,
+          "3": 212,
+          "4": 106
+        },
+        "pred_counts": {
+          "0": 485,
+          "1": 25,
+          "2": 0,
+          "3": 252,
+          "4": 13
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.40335051546391754,
+        "balanced_accuracy": 0.22296622209644118,
+        "macro_f1": 0.21112925849545242,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.4794816414686825,
+            "recall": 0.6132596685082873,
+            "f1": 0.5381818181818182,
+            "support": 362,
+            "predicted_count": 463,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.2558139534883721,
+            "recall": 0.09649122807017543,
+            "f1": 0.14012738853503184,
+            "support": 114,
+            "predicted_count": 43,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "good",
+            "precision": 0.30115830115830117,
+            "recall": 0.38235294117647056,
+            "f1": 0.3369330453563715,
+            "support": 204,
+            "predicted_count": 259,
+            "reliable": true
+          },
+          {
+            "class_id": 4,
+            "name": "monster",
+            "precision": 0.18181818181818182,
+            "recall": 0.022727272727272728,
+            "f1": 0.04040404040404041,
+            "support": 88,
+            "predicted_count": 11,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            222,
+            18,
+            0,
+            118,
+            4
+          ],
+          [
+            73,
+            11,
+            0,
+            30,
+            0
+          ],
+          [
+            6,
+            1,
+            0,
+            1,
+            0
+          ],
+          [
+            112,
+            9,
+            0,
+            78,
+            5
+          ],
+          [
+            50,
+            4,
+            0,
+            32,
+            2
+          ]
+        ],
+        "true_counts": {
+          "0": 362,
+          "1": 114,
+          "2": 8,
+          "3": 204,
+          "4": 88
+        },
+        "pred_counts": {
+          "0": 463,
+          "1": 43,
+          "2": 0,
+          "3": 259,
+          "4": 11
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    },
+    {
+      "formulation": "five_class",
+      "n_classes": 5,
+      "information_condition": "full_feature_ml",
+      "role": "Full production ML input vector (33 features; not ML-only)",
+      "n_features": 33,
+      "class_names": {
+        "0": "disaster",
+        "1": "loss",
+        "2": "neutral",
+        "3": "good",
+        "4": "monster"
+      },
+      "train_class_counts": {
+        "0": 865,
+        "1": 314,
+        "2": 23,
+        "3": 779,
+        "4": 344
+      },
+      "val_class_counts": {
+        "0": 308,
+        "1": 148,
+        "2": 1,
+        "3": 212,
+        "4": 106
+      },
+      "test_class_counts": {
+        "0": 362,
+        "1": 114,
+        "2": 8,
+        "3": 204,
+        "4": 88
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.36258064516129035,
+        "balanced_accuracy": 0.21821592481969837,
+        "macro_f1": 0.19904777460187834,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.4004282655246253,
+            "recall": 0.6071428571428571,
+            "f1": 0.48258064516129034,
+            "support": 308,
+            "predicted_count": 467,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.1875,
+            "recall": 0.04054054054054054,
+            "f1": 0.06666666666666667,
+            "support": 148,
+            "predicted_count": 32,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "good",
+            "precision": 0.31297709923664124,
+            "recall": 0.3867924528301887,
+            "f1": 0.3459915611814346,
+            "support": 212,
+            "predicted_count": 262,
+            "reliable": true
+          },
+          {
+            "class_id": 4,
+            "name": "monster",
+            "precision": 0.42857142857142855,
+            "recall": 0.05660377358490566,
+            "f1": 0.1,
+            "support": 106,
+            "predicted_count": 14,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            187,
+            9,
+            0,
+            109,
+            3
+          ],
+          [
+            93,
+            6,
+            0,
+            45,
+            4
+          ],
+          [
+            0,
+            0,
+            0,
+            1,
+            0
+          ],
+          [
+            117,
+            12,
+            0,
+            82,
+            1
+          ],
+          [
+            70,
+            5,
+            0,
+            25,
+            6
+          ]
+        ],
+        "true_counts": {
+          "0": 308,
+          "1": 148,
+          "2": 1,
+          "3": 212,
+          "4": 106
+        },
+        "pred_counts": {
+          "0": 467,
+          "1": 32,
+          "2": 0,
+          "3": 262,
+          "4": 14
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.39690721649484534,
+        "balanced_accuracy": 0.22089596683527887,
+        "macro_f1": 0.2109573016681861,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.47096774193548385,
+            "recall": 0.6049723756906077,
+            "f1": 0.5296251511487303,
+            "support": 362,
+            "predicted_count": 465,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.2708333333333333,
+            "recall": 0.11403508771929824,
+            "f1": 0.16049382716049382,
+            "support": 114,
+            "predicted_count": 48,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "good",
+            "precision": 0.2924901185770751,
+            "recall": 0.3627450980392157,
+            "f1": 0.3238512035010941,
+            "support": 204,
+            "predicted_count": 253,
+            "reliable": true
+          },
+          {
+            "class_id": 4,
+            "name": "monster",
+            "precision": 0.2,
+            "recall": 0.022727272727272728,
+            "f1": 0.04081632653061224,
+            "support": 88,
+            "predicted_count": 10,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            219,
+            17,
+            0,
+            123,
+            3
+          ],
+          [
+            74,
+            13,
+            0,
+            26,
+            1
+          ],
+          [
+            7,
+            0,
+            0,
+            1,
+            0
+          ],
+          [
+            114,
+            12,
+            0,
+            74,
+            4
+          ],
+          [
+            51,
+            6,
+            0,
+            29,
+            2
+          ]
+        ],
+        "true_counts": {
+          "0": 362,
+          "1": 114,
+          "2": 8,
+          "3": 204,
+          "4": 88
+        },
+        "pred_counts": {
+          "0": 465,
+          "1": 48,
+          "2": 0,
+          "3": 253,
+          "4": 10
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    },
+    {
+      "formulation": "four_class",
+      "n_classes": 4,
+      "information_condition": "technical_only",
+      "role": "Signal-input subset 0\u201326 (measurement baseline; not production score)",
+      "n_features": 27,
+      "class_names": {
+        "0": "disaster",
+        "1": "loss",
+        "2": "neutral",
+        "3": "win"
+      },
+      "train_class_counts": {
+        "0": 865,
+        "1": 314,
+        "2": 23,
+        "3": 1123
+      },
+      "val_class_counts": {
+        "0": 308,
+        "1": 148,
+        "2": 1,
+        "3": 318
+      },
+      "test_class_counts": {
+        "0": 362,
+        "1": 114,
+        "2": 8,
+        "3": 292
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.4232258064516129,
+        "balanced_accuracy": 0.26448566307056876,
+        "macro_f1": 0.24173340420468792,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.4097222222222222,
+            "recall": 0.38311688311688313,
+            "f1": 0.3959731543624161,
+            "support": 308,
+            "predicted_count": 288,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.25,
+            "recall": 0.02702702702702703,
+            "f1": 0.04878048780487805,
+            "support": 148,
+            "predicted_count": 16,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "win",
+            "precision": 0.43736730360934184,
+            "recall": 0.6477987421383647,
+            "f1": 0.5221799746514575,
+            "support": 318,
+            "predicted_count": 471,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            118,
+            6,
+            0,
+            184
+          ],
+          [
+            64,
+            4,
+            0,
+            80
+          ],
+          [
+            0,
+            0,
+            0,
+            1
+          ],
+          [
+            106,
+            6,
+            0,
+            206
+          ]
+        ],
+        "true_counts": {
+          "0": 308,
+          "1": 148,
+          "2": 1,
+          "3": 318
+        },
+        "pred_counts": {
+          "0": 288,
+          "1": 16,
+          "2": 0,
+          "3": 471
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.4420103092783505,
+        "balanced_accuracy": 0.2810401704328937,
+        "macro_f1": 0.2723861197299792,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.4952681388012618,
+            "recall": 0.43370165745856354,
+            "f1": 0.46244477172312226,
+            "support": 362,
+            "predicted_count": 317,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.3333333333333333,
+            "recall": 0.08771929824561403,
+            "f1": 0.1388888888888889,
+            "support": 114,
+            "predicted_count": 30,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "win",
+            "precision": 0.41025641025641024,
+            "recall": 0.6027397260273972,
+            "f1": 0.4882108183079057,
+            "support": 292,
+            "predicted_count": 429,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            157,
+            9,
+            0,
+            196
+          ],
+          [
+            52,
+            10,
+            0,
+            52
+          ],
+          [
+            2,
+            1,
+            0,
+            5
+          ],
+          [
+            106,
+            10,
+            0,
+            176
+          ]
+        ],
+        "true_counts": {
+          "0": 362,
+          "1": 114,
+          "2": 8,
+          "3": 292
+        },
+        "pred_counts": {
+          "0": 317,
+          "1": 30,
+          "2": 0,
+          "3": 429
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    },
+    {
+      "formulation": "four_class",
+      "n_classes": 4,
+      "information_condition": "full_feature_ml",
+      "role": "Full production ML input vector (33 features; not ML-only)",
+      "n_features": 33,
+      "class_names": {
+        "0": "disaster",
+        "1": "loss",
+        "2": "neutral",
+        "3": "win"
+      },
+      "train_class_counts": {
+        "0": 865,
+        "1": 314,
+        "2": 23,
+        "3": 1123
+      },
+      "val_class_counts": {
+        "0": 308,
+        "1": 148,
+        "2": 1,
+        "3": 318
+      },
+      "test_class_counts": {
+        "0": 362,
+        "1": 114,
+        "2": 8,
+        "3": 292
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.4167741935483871,
+        "balanced_accuracy": 0.2629831497756026,
+        "macro_f1": 0.2439562222632363,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.4163424124513619,
+            "recall": 0.3474025974025974,
+            "f1": 0.3787610619469027,
+            "support": 308,
+            "predicted_count": 257,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.2413793103448276,
+            "recall": 0.0472972972972973,
+            "f1": 0.07909604519774012,
+            "support": 148,
+            "predicted_count": 29,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "win",
+            "precision": 0.4274028629856851,
+            "recall": 0.6572327044025157,
+            "f1": 0.5179677819083024,
+            "support": 318,
+            "predicted_count": 489,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            107,
+            11,
+            0,
+            190
+          ],
+          [
+            52,
+            7,
+            0,
+            89
+          ],
+          [
+            0,
+            0,
+            0,
+            1
+          ],
+          [
+            98,
+            11,
+            0,
+            209
+          ]
+        ],
+        "true_counts": {
+          "0": 308,
+          "1": 148,
+          "2": 1,
+          "3": 318
+        },
+        "pred_counts": {
+          "0": 257,
+          "1": 29,
+          "2": 0,
+          "3": 489
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.43556701030927836,
+        "balanced_accuracy": 0.27958617642645933,
+        "macro_f1": 0.2701760625831905,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "disaster",
+            "precision": 0.5068493150684932,
+            "recall": 0.4088397790055249,
+            "f1": 0.4525993883792049,
+            "support": 362,
+            "predicted_count": 292,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "loss",
+            "precision": 0.24444444444444444,
+            "recall": 0.09649122807017543,
+            "f1": 0.13836477987421383,
+            "support": 114,
+            "predicted_count": 45,
+            "reliable": true
+          },
+          {
+            "class_id": 2,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 3,
+            "name": "win",
+            "precision": 0.40774487471526194,
+            "recall": 0.613013698630137,
+            "f1": 0.4897400820793434,
+            "support": 292,
+            "predicted_count": 439,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            148,
+            16,
+            0,
+            198
+          ],
+          [
+            43,
+            11,
+            0,
+            60
+          ],
+          [
+            5,
+            1,
+            0,
+            2
+          ],
+          [
+            96,
+            17,
+            0,
+            179
+          ]
+        ],
+        "true_counts": {
+          "0": 362,
+          "1": 114,
+          "2": 8,
+          "3": 292
+        },
+        "pred_counts": {
+          "0": 292,
+          "1": 45,
+          "2": 0,
+          "3": 439
+        },
+        "unreliable_classes": [
+          2
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    },
+    {
+      "formulation": "three_class",
+      "n_classes": 3,
+      "information_condition": "technical_only",
+      "role": "Signal-input subset 0\u201326 (measurement baseline; not production score)",
+      "n_features": 27,
+      "class_names": {
+        "0": "loss",
+        "1": "neutral",
+        "2": "win"
+      },
+      "train_class_counts": {
+        "0": 1179,
+        "1": 23,
+        "2": 1123
+      },
+      "val_class_counts": {
+        "0": 456,
+        "1": 1,
+        "2": 318
+      },
+      "test_class_counts": {
+        "0": 476,
+        "1": 8,
+        "2": 292
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.56,
+        "balanced_accuracy": 0.35563555114200596,
+        "macro_f1": 0.35437582197221246,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "loss",
+            "precision": 0.6137254901960785,
+            "recall": 0.6864035087719298,
+            "f1": 0.6480331262939959,
+            "support": 456,
+            "predicted_count": 510,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 2,
+            "name": "win",
+            "precision": 0.45660377358490567,
+            "recall": 0.3805031446540881,
+            "f1": 0.41509433962264153,
+            "support": 318,
+            "predicted_count": 265,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            313,
+            0,
+            143
+          ],
+          [
+            0,
+            0,
+            1
+          ],
+          [
+            197,
+            0,
+            121
+          ]
+        ],
+        "true_counts": {
+          "0": 456,
+          "1": 1,
+          "2": 318
+        },
+        "pred_counts": {
+          "0": 510,
+          "1": 0,
+          "2": 265
+        },
+        "unreliable_classes": [
+          1
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.604381443298969,
+        "balanced_accuracy": 0.37344115728483174,
+        "macro_f1": 0.3702192862676646,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "loss",
+            "precision": 0.6495575221238938,
+            "recall": 0.7710084033613446,
+            "f1": 0.7050912584053795,
+            "support": 476,
+            "predicted_count": 565,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 2,
+            "name": "win",
+            "precision": 0.4834123222748815,
+            "recall": 0.3493150684931507,
+            "f1": 0.40556660039761433,
+            "support": 292,
+            "predicted_count": 211,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            367,
+            0,
+            109
+          ],
+          [
+            8,
+            0,
+            0
+          ],
+          [
+            190,
+            0,
+            102
+          ]
+        ],
+        "true_counts": {
+          "0": 476,
+          "1": 8,
+          "2": 292
+        },
+        "pred_counts": {
+          "0": 565,
+          "1": 0,
+          "2": 211
+        },
+        "unreliable_classes": [
+          1
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    },
+    {
+      "formulation": "three_class",
+      "n_classes": 3,
+      "information_condition": "full_feature_ml",
+      "role": "Full production ML input vector (33 features; not ML-only)",
+      "n_features": 33,
+      "class_names": {
+        "0": "loss",
+        "1": "neutral",
+        "2": "win"
+      },
+      "train_class_counts": {
+        "0": 1179,
+        "1": 23,
+        "2": 1123
+      },
+      "val_class_counts": {
+        "0": 456,
+        "1": 1,
+        "2": 318
+      },
+      "test_class_counts": {
+        "0": 476,
+        "1": 8,
+        "2": 292
+      },
+      "validation": {
+        "n": 775,
+        "accuracy": 0.5483870967741935,
+        "balanced_accuracy": 0.34747048438706835,
+        "macro_f1": 0.3459051328431599,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "loss",
+            "precision": 0.6046966731898239,
+            "recall": 0.6776315789473685,
+            "f1": 0.6390899689762151,
+            "support": 456,
+            "predicted_count": 511,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 1,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 2,
+            "name": "win",
+            "precision": 0.4393939393939394,
+            "recall": 0.36477987421383645,
+            "f1": 0.39862542955326463,
+            "support": 318,
+            "predicted_count": 264,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            309,
+            0,
+            147
+          ],
+          [
+            0,
+            0,
+            1
+          ],
+          [
+            202,
+            0,
+            116
+          ]
+        ],
+        "true_counts": {
+          "0": 456,
+          "1": 1,
+          "2": 318
+        },
+        "pred_counts": {
+          "0": 511,
+          "1": 0,
+          "2": 264
+        },
+        "unreliable_classes": [
+          1
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      },
+      "test": {
+        "n": 776,
+        "accuracy": 0.6056701030927835,
+        "balanced_accuracy": 0.37590652699435934,
+        "macro_f1": 0.37324939002035373,
+        "per_class": [
+          {
+            "class_id": 0,
+            "name": "loss",
+            "precision": 0.6523297491039427,
+            "recall": 0.7647058823529411,
+            "f1": 0.7040618955512572,
+            "support": 476,
+            "predicted_count": 558,
+            "reliable": true
+          },
+          {
+            "class_id": 1,
+            "name": "neutral",
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "support": 8,
+            "predicted_count": 0,
+            "reliable": false
+          },
+          {
+            "class_id": 2,
+            "name": "win",
+            "precision": 0.48623853211009177,
+            "recall": 0.363013698630137,
+            "f1": 0.41568627450980394,
+            "support": 292,
+            "predicted_count": 218,
+            "reliable": true
+          }
+        ],
+        "confusion_matrix": [
+          [
+            364,
+            0,
+            112
+          ],
+          [
+            8,
+            0,
+            0
+          ],
+          [
+            186,
+            0,
+            106
+          ]
+        ],
+        "true_counts": {
+          "0": 476,
+          "1": 8,
+          "2": 292
+        },
+        "pred_counts": {
+          "0": 558,
+          "1": 0,
+          "2": 218
+        },
+        "unreliable_classes": [
+          1
+        ],
+        "missing_classes": [],
+        "min_reliable_support": 10
+      }
+    }
+  ],
+  "limitations": [
+    "Pure ML-only cannot be isolated as a feature subset. Production ML consumes all 33 features and emits label/confidence. None of the 33 features is an ML model output. Production buyScore/sellScore + ML bonus fusion is score-level and is not stored in the training CSV. Closest valid comparison: signal_subset_0_26 (report key technical_only) vs full_feature_ml (all 33 production ML inputs). signal_subset_0_26 is a measurement baseline, not a replay of production technical scores.",
+    "five_class/technical_only/validation: missing=[] unreliable=[2]",
+    "five_class/technical_only/test: missing=[] unreliable=[2]",
+    "five_class/full_feature_ml/validation: missing=[] unreliable=[2]",
+    "five_class/full_feature_ml/test: missing=[] unreliable=[2]",
+    "four_class/technical_only/validation: missing=[] unreliable=[2]",
+    "four_class/technical_only/test: missing=[] unreliable=[2]",
+    "four_class/full_feature_ml/validation: missing=[] unreliable=[2]",
+    "four_class/full_feature_ml/test: missing=[] unreliable=[2]",
+    "three_class/technical_only/validation: missing=[] unreliable=[1]",
+    "three_class/technical_only/test: missing=[] unreliable=[1]",
+    "three_class/full_feature_ml/validation: missing=[] unreliable=[1]",
+    "three_class/full_feature_ml/test: missing=[] unreliable=[1]"
+  ],
+  "conclusions": [
+    "Phase 1 is a fixed-model diagnostic. TRAIN (60%) is used only for fitting. VALIDATION (20%) is reported for diagnostics only and is not used for model/formulation/hyperparameter selection. FINAL TEST (20%) is untouched until final evidence reporting. All formulations and information conditions are reported independently; no winner is selected from validation or test for configuration choice.",
+    "Primary evaluation is chronological; final test was unseen during fitting and was not used for any selection decision.",
+    "Pure ML-only feature subset is not supported by the architecture; see ml_only_limitation.",
+    "Severe class imbalance (especially neutral) is quantified; raw accuracy alone is insufficient.",
+    "signal_subset_0_26 (report key technical_only) is a 27-feature measurement baseline, not a replay of production buyScore/sellScore.",
+    "Five-class FINAL TEST (independent report, not a selection): signal_subset_0_26 macro_f1=0.2111 balanced_acc=0.2230; full_feature_ml macro_f1=0.2110 balanced_acc=0.2209.",
+    "No formulation or information condition is declared the winner on the basis of FINAL TEST; all cells are reported for inspection."
+  ]
+}
