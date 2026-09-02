@@ -19,23 +19,22 @@
 //   • Heartbeat monitoring for operational visibility
 // =============================================================================
 
-import type { OhlcvData } from '../types';
-
-import { config } from './config/settings';
-import { dbService } from './db';
-import { createLogger } from './logger';
-import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
-import { cooldownService } from './services/cooldownService';
 import { ExchangeService } from './services/exchange';
-import type { MLService } from './services/mlService';
-import { simulateTrade } from './services/simulateTrade';
-import { escape, formatR } from './services/telegram/utils/markdown';
+import { dbService } from './db';
+import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
+import { createLogger } from './logger';
+import { config } from './config/settings';
+import type { OhlcvData } from '../types';
 import type { TelegramBotController } from './services/telegramBotController';
+import { simulateTrade } from './services/simulateTrade';
+import { cooldownService } from './services/cooldownService';
+import type { MLService } from './services/mlService';
+import type { Strategy } from './strategy/';
 import { WatchAlertService } from './services/watchAlerts';
 import { checkAndNotify as checkTrendingNotify } from './services/watchAlerts/trending/trendingNotifier';
-import type { Strategy } from './strategy/';
-import { analyzeTrendAndVolume } from './strategy/market/trendVolumeAnalysis';
 import { computeIndicators } from './utils/indicatorUtils';
+import { analyzeTrendAndVolume } from './strategy/market/trendVolumeAnalysis';
+import { escape, formatR } from './services/telegram/utils/markdown';
 
 
 const logger = createLogger('MarketScanner');
@@ -546,7 +545,7 @@ export class MarketScanner {
 
         try {
             const events = await this.watchAlertService.evaluateActiveAlerts();
-            for (const ev of events) {
+            events.forEach(async ev => {
                 try {
                     if (ev.event === 'triggered' && ev.resolvedPlan) {
                         const p = ev.resolvedPlan;
@@ -587,7 +586,7 @@ export class MarketScanner {
                         error: sendErr,
                     });
                 }
-            }
+            });
         } catch (err) {
             logger.error('checkWatchAlerts failed', { error: err });
         }
