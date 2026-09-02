@@ -3,7 +3,8 @@
 
 import { eq } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { locks, heartbeat } from '../schema';
+
+import { heartbeat, locks } from '../schema';
 
 type Db = MySql2Database<any>;
 

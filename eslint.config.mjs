@@ -2,7 +2,6 @@ import { defineConfig, globalIgnores } from 'eslint/config';
 import { fixupConfigRules, fixupPluginRules } from '@eslint/compat';
 import { importX } from 'eslint-plugin-import-x';
 import eslintComments from 'eslint-plugin-eslint-comments';
-import functional from 'eslint-plugin-functional';
 import tsParser from '@typescript-eslint/parser';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +18,6 @@ const compat = new FlatCompat({
 
 export default defineConfig([
     globalIgnores(['**/node_modules', '**/build', '**/coverage']),
-    functional.configs.lite,
     {
         extends: fixupConfigRules(
             compat.extends(

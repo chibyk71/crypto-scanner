@@ -13,17 +13,18 @@
 //   • Light logging of close (optional)
 // =============================================================================
 
-import { ExchangeService } from './exchange';
-import { createLogger } from '../logger';
-import { config } from '../config/settings';
 import type { TradeSignal } from '../../types';
-import { getExcursionAdvice } from '../utils/excursionUtils';
-import type { TelegramBotController } from './telegramBotController';
-import { excursionCache } from './excursionHistoryCache';
-import { simulateTrade } from './simulateTrade';
+import { config } from '../config/settings';
 import { dbService } from '../db';
-import { MLService } from './mlService';
+import { createLogger } from '../logger';
+import { getExcursionAdvice } from '../utils/excursionUtils';
 import { computeTrailingLevels } from '../utils/trailingStopUtils';
+
+import { ExchangeService } from './exchange';
+import { excursionCache } from './excursionHistoryCache';
+import { MLService } from './mlService';
+import { simulateTrade } from './simulateTrade';
+import type { TelegramBotController } from './telegramBotController';
 
 const logger = createLogger('AutoTradeService');
 
@@ -343,7 +344,7 @@ export class AutoTradeService {
                     finalSide,
                     currentPrice: currentPrice.toFixed(8)
                 });
-                let signalId = crypto.randomUUID(); // Generate unique ID for this simulation (for tracking)
+                const signalId = crypto.randomUUID(); // Generate unique ID for this simulation (for tracking)
                 void simulateTrade(this.exchange, symbol, adjustedSignal, currentPrice, adjustedSignal.features, signalId);
                 // Note: feeds cache only — no ML feature extraction needed here
             }

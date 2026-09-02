@@ -1,18 +1,8 @@
 import type { SignalLabel } from '../../../types';
-
+import { createLogger } from '../../logger';
 import type { ExchangeService } from '../../services/exchange';
 import type { MLService } from '../../services/mlService';
-
-import { createLogger } from '../../logger';
-
 import type { IndicatorMap } from '../../utils/indicatorUtils';
-
-import type {
-    ScoresAndML,
-    StrategyInput,
-    TrendAndVolume,
-} from '../types';
-
 import {
     ADX_POINTS,
     AMBIGUOUS_CONFIDENCE_MAX,
@@ -45,14 +35,17 @@ import {
     VWMA_SLOPE_POINTS,
     VWMA_VWAP_POINTS,
 } from '../constants';
-
 import {
     detectBbSqueezeBreakout,
 } from '../patterns/bbSqueezeBreakout';
-
 import {
     findRecentIgnitionTrigger,
 } from '../patterns/momentumIgnition';
+import type {
+    ScoresAndML,
+    StrategyInput,
+    TrendAndVolume,
+} from '../types';
 
 const logger = createLogger('Strategy');
 

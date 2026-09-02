@@ -11,9 +11,11 @@
 //   • Respects LOG_LEVEL from config (debug in dev, info/warn in prod)
 // =============================================================================
 
-import { createLogger as winstonCreateLogger, format, transports } from 'winston';
-import * as path from 'path';
 import * as fs from 'fs';
+import * as path from 'path';
+
+import { format, transports, createLogger as winstonCreateLogger } from 'winston';
+
 import { config } from './config/settings';
 
 // Ensure logs directory exists (critical for Docker/K8s environments)

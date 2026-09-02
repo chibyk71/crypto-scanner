@@ -3,8 +3,9 @@
 
 import { and, count, desc, eq, gte, isNotNull, isNull, not, sql } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { simulatedTrades } from '../../schema';
+
 import { createLogger } from '../../../logger';
+import { simulatedTrades } from '../../schema';
 
 const logger = createLogger('db:simulations:analytics');
 

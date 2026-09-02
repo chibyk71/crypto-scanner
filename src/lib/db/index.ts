@@ -24,35 +24,35 @@ import { drizzle, MySql2Database } from 'drizzle-orm/mysql2';
 import mysql from 'mysql2/promise';
 
 // Import all table definitions and TypeScript types from schema
-import {
-    locks,
-    heartbeat,
-    trades,
-    simulatedTrades,
-    type NewTrade,
-    type SimulatedTrade,
-    coolDownTable,
-    ohlcvHistory,
-    watchAlerts,
-} from './schema';
 
+import type { PartialTPLevel } from '../../types';
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
-import type { PartialTPLevel } from '../../types';
 import type { MarketRegime } from '../strategy/regime/types';
 
 // Re-export types for consumers
 export type { EnrichedSymbolHistory } from './types';
 
 // Domain repositories (extracted from the former god file)
-import * as tradesRepo from './repositories/trades';
-import * as locksRepo from './repositories/locks';
 import * as cooldownRepo from './repositories/cooldown';
-import * as simWrite from './repositories/simulations/writePath';
-import * as simRead from './repositories/simulations/readPath';
+import * as locksRepo from './repositories/locks';
 import * as simAnalytics from './repositories/simulations/analytics';
-import * as watchAlertsWrite from './repositories/watchAlerts/writePath';
+import * as simRead from './repositories/simulations/readPath';
+import * as simWrite from './repositories/simulations/writePath';
+import * as tradesRepo from './repositories/trades';
 import * as watchAlertsRead from './repositories/watchAlerts/readPath';
+import * as watchAlertsWrite from './repositories/watchAlerts/writePath';
+import {
+    coolDownTable,
+    heartbeat,
+    locks,
+    type NewTrade,
+    ohlcvHistory,
+    type SimulatedTrade,
+    simulatedTrades,
+    trades,
+    watchAlerts,
+} from './schema';
 
 // Dedicated logger for database operations
 const logger = createLogger('db');

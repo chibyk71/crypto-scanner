@@ -20,15 +20,14 @@
 // =============================================================================
 
 import type { OhlcvData } from '../../../types';
-import { ExchangeService } from '../../services/exchange';
-import { createLogger } from '../../logger';
 import { config } from '../../config/settings';
-import type { IndicatorMap } from '../../utils/indicatorUtils';
 import {
     detectEngulfing,
     detectLiquiditySweep,
 } from '../../indicators';
-
+import { createLogger } from '../../logger';
+import { ExchangeService } from '../../services/exchange';
+import type { IndicatorMap } from '../../utils/indicatorUtils';
 import {
     BULL_MARKET_LIQUIDITY_MULTIPLIER,
     LIQUIDITY_SWEEP_LOOKBACK,
@@ -37,7 +36,6 @@ import {
     RELATIVE_VOLUME_MULTIPLIER,
     VOLUME_SURGE_MULTIPLIER,
 } from '../constants';
-
 import type { TrendAndVolume } from '../types';
 
 // Dedicated logger – all strategy-related messages tagged 'Strategy'

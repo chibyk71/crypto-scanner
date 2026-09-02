@@ -7,18 +7,20 @@ if (!process.env.DATABASE_URL) {
 }
 
 import test from 'ava';
+
+import { resolveStrategyEngine } from '../strategy/engines/selectEngine';
+
 import {
-  validateHistoricalCandles,
+  applySlippage,
   candlesToOhlcvData,
   causalWindow,
-  resolveTradeOffline,
-  applySlippage,
-  runHistoricalComparison,
-  stableResultFingerprint,
   DEFAULT_EVALUATION_ASSUMPTIONS,
   type HistoricalCandle,
+  resolveTradeOffline,
+  runHistoricalComparison,
+  stableResultFingerprint,
+  validateHistoricalCandles,
 } from './index';
-import { resolveStrategyEngine } from '../strategy/engines/selectEngine';
 
 function candle(
   i: number,

@@ -5,6 +5,7 @@
 import type { MarketRegime } from '../../../regime/types';
 import type { SetupContext, SetupResult } from '../../types';
 import { emptySetupResult } from '../../types';
+
 import { detectBreakoutSetup } from './breakoutSetup';
 import { detectRangeSetup } from './rangeSetup';
 import { detectTrendSetup } from './trendSetup';

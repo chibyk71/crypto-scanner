@@ -1,15 +1,18 @@
 // Phase 2B/3 — engine selection + isolation + routing tests
 
 import test from 'ava';
-import { resolveStrategyEngine, isRegimeEngine } from './selectEngine';
-import { detectSetupForRegime } from './regime/setups';
-import { applyQualityFilter } from './regime/quality';
-import { detectTrendSetup } from './regime/setups/trendSetup';
-import { detectRangeSetup } from './regime/setups/rangeSetup';
-import { detectBreakoutSetup } from './regime/setups/breakoutSetup';
-import type { RegimeClassification } from '../regime/types';
-import type { SetupContext, SetupResult } from './types';
+
 import type { IndicatorMap } from '../../utils/indicatorUtils';
+import type { RegimeClassification } from '../regime/types';
+
+import { applyQualityFilter } from './regime/quality';
+import { detectSetupForRegime } from './regime/setups';
+import { detectBreakoutSetup } from './regime/setups/breakoutSetup';
+import { detectRangeSetup } from './regime/setups/rangeSetup';
+import { detectTrendSetup } from './regime/setups/trendSetup';
+import { isRegimeEngine, resolveStrategyEngine } from './selectEngine';
+import type { SetupContext, SetupResult } from './types';
+
 
 function baseClassification(
     overrides: Partial<RegimeClassification>

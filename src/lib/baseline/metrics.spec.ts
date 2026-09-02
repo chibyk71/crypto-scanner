@@ -2,6 +2,8 @@
 // Phase 0 — Unit tests for pure baseline metrics (no DB, no strategy).
 
 import test from 'ava';
+
+import { normalizeExportRow } from './loadFromDb';
 import {
   auditDataQuality,
   buildEquityCurve,
@@ -11,7 +13,6 @@ import {
   groupBy,
   holdingTimeBucket,
 } from './metrics';
-import { normalizeExportRow } from './loadFromDb';
 import type { BaselineTradeRow } from './types';
 
 function row(partial: Partial<BaselineTradeRow> & { id: number }): BaselineTradeRow {

@@ -2,9 +2,11 @@
 // Shared dependency bag passed to every extracted handler / menu function
 
 import type TelegramBot from 'node-telegram-bot-api';
+
 import type { ExchangeService } from '../exchange';
 import type { MLService } from '../mlService';
 import type { WatchAlertService } from '../watchAlerts';
+
 import type { AlertState } from './types';
 
 /**

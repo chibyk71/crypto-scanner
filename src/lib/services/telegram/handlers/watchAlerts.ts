@@ -3,11 +3,12 @@
 // Every function takes ctx: TelegramContext as first param — no `this`.
 
 import type TelegramBot from 'node-telegram-bot-api';
+
 import { createLogger } from '../../../logger';
-import type { TelegramContext } from '../context';
-import { escape, formatR } from '../utils/markdown';
 import type { PendingWatchAlert } from '../../watchAlerts';
 import { clampExpiryHours } from '../../watchAlerts/schema';
+import type { TelegramContext } from '../context';
+import { escape, formatR } from '../utils/markdown';
 
 const logger = createLogger('Telegram.WatchAlerts');
 

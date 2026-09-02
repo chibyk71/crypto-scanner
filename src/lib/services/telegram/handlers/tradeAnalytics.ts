@@ -3,6 +3,7 @@
 // CRITICAL: MarkdownV2 escaping copied VERBATIM — do not add/remove escape calls
 
 import type TelegramBot from 'node-telegram-bot-api';
+
 import { dbService } from '../../../db';
 import { createLogger } from '../../../logger';
 import { excursionCache } from '../../excursionHistoryCache';

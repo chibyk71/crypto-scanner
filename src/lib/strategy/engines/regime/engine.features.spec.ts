@@ -1,9 +1,11 @@
 // P0.1 — regime engine always populates signal.features (length 33)
 
 import test from 'ava';
-import type { StrategyInput } from '../../types';
+
 import type { OhlcvData } from '../../../../types';
 import type { MLService } from '../../../services/mlService';
+import type { StrategyInput } from '../../types';
+
 import { runRegimeEngine } from './engine';
 
 function makeOhlcv(n = 50, startPrice = 100): OhlcvData {

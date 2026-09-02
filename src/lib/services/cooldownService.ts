@@ -13,9 +13,9 @@
 //   await cooldownService.setCooldown(symbol);
 // =============================================================================
 
-import { createLogger } from '../logger';
 import { config } from '../config/settings';
 import { dbService } from '../db'; // only used if backend === 'database'
+import { createLogger } from '../logger';
 
 const logger = createLogger('CooldownService');
 

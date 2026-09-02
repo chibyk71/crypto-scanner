@@ -2,12 +2,15 @@
 // Rules are structural hypotheses, not tuned on simulated_trades.csv.
 
 import test from 'ava';
+
 import type { IndicatorMap } from '../../../../utils/indicatorUtils';
 import type { RegimeClassification } from '../../../regime/types';
 import type { SetupContext } from '../../types';
+
 import { detectBreakoutSetup } from './breakoutSetup';
 import { detectRangeSetup } from './rangeSetup';
 import { detectTrendSetup } from './trendSetup';
+
 import { detectSetupForRegime } from './index';
 
 function baseClassification(

@@ -1,12 +1,12 @@
 // src/lib/watchAlerts/trending/trendingNotifier.ts
 // isTrending-gate consumer — max once per symbol per TRENDING_NOTIFY_COOLDOWN_MS.
 
-import { createLogger } from '../../../logger';
 import { dbService } from '../../../db';
-import type { IndicatorMap } from '../../../utils/indicatorUtils';
+import { createLogger } from '../../../logger';
 import type { TrendAndVolume } from '../../../strategy/types';
-import type { TelegramBotController } from '../../telegramBotController';
+import type { IndicatorMap } from '../../../utils/indicatorUtils';
 import { escape, formatPercent } from '../../telegram/utils/markdown';
+import type { TelegramBotController } from '../../telegramBotController';
 import { TRENDING_NOTIFY_COOLDOWN_MS } from '../constants';
 
 const logger = createLogger('TrendingNotifier');

@@ -4,12 +4,13 @@
 
 import { createLogger } from '../../../logger';
 import {
-    isConditionGroup,
-    isConditionLeaf,
     type ConditionLeaf,
     type ConditionNode,
+    isConditionGroup,
+    isConditionLeaf,
     type LeafProgress,
 } from '../types';
+
 import { resolveSeries, type SeriesCache } from './seriesCache';
 
 const logger = createLogger('WatchAlerts.Eval');

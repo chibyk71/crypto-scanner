@@ -1,10 +1,12 @@
 // Unit tests for evaluateConditionTree — covers the 5 required cases.
 import test from 'ava';
+
 import type { IndicatorMap } from '../../../utils/indicatorUtils';
+import type { ConditionNode } from '../types';
+
 import {
     evaluateConditionTree,
 } from './evaluateConditionTree';
-import type { ConditionNode } from '../types';
 
 /**
  * Minimal SeriesCache stand-in: returns a pre-seeded IndicatorMap per timeframe.

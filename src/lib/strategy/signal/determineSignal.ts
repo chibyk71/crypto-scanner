@@ -14,14 +14,12 @@
 // =============================================================================
 
 import type { TradeSignal } from '../../../types';
-
-import type { TrendAndVolume } from '../types';
-
 import {
     CONFIDENCE_THRESHOLD,
     MAX_SCORE_PER_SIDE,
     SCORE_MARGIN_REQUIRED,
 } from '../constants';
+import type { TrendAndVolume } from '../types';
 
 // =============================================================================
 // FINAL SIGNAL DECISION: Apply filters and determine direction/confidence

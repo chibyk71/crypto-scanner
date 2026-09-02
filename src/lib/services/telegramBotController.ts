@@ -2,31 +2,32 @@
 // Thin orchestrator — all handler/menu logic lives under src/lib/services/telegram/
 
 import TelegramBot from 'node-telegram-bot-api';
+
+import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
+
 import { ExchangeService } from './exchange';
 import { MLService } from './mlService';
-import type { TradeSignal } from '../../types';
 import type { TelegramContext } from './telegram/context';
-import { UserStateManager } from './telegram/state/userStateManager';
-
 import { handleHelp, handleStatus, handleStopBot } from './telegram/handlers/helpStatus';
 import {
-    handleMLStatus, handleMLReload, handleExportTrainingData,
-    handleMLPause, handleMLResume, handleMLForceTrain,
-    handleMLSamples, handleMLPerformance,
+    handleExportTrainingData, handleMLForceTrain, handleMLPause,
+    handleMLPerformance, handleMLReload, handleMLResume,
+    handleMLSamples, handleMLStatus,
 } from './telegram/handlers/mlCommands';
-import {
-    handleTakenStats, handleTakenSymbols, handleTakenVsAll, handleExcursions,
-} from './telegram/handlers/tradeAnalytics';
 import { handlePositions, handleTrades } from './telegram/handlers/positionsTrades';
-import { sendSignalAlert as sendSignalAlertImpl } from './telegram/signalAlert';
 import {
-    handleWatchlistCommand,
-    handleWatchHelp,
-    handleWatchAlertPaste,
+    handleExcursions, handleTakenStats, handleTakenSymbols, handleTakenVsAll,
+} from './telegram/handlers/tradeAnalytics';
+import {
     handleWatchAlertCallback,
+    handleWatchAlertPaste,
+    handleWatchHelp,
+    handleWatchlistCommand,
 } from './telegram/handlers/watchAlerts';
+import { sendSignalAlert as sendSignalAlertImpl } from './telegram/signalAlert';
+import { UserStateManager } from './telegram/state/userStateManager';
 import { WatchAlertService } from './watchAlerts';
 
 

@@ -2,8 +2,9 @@
 // Encapsulates userStates Map, updateUserState, and stale-state cleanup timer
 
 import type TelegramBot from 'node-telegram-bot-api';
+
 import { createLogger } from '../../../logger';
-import { STATE_TIMEOUT_MS, type AlertState } from '../types';
+import { type AlertState, STATE_TIMEOUT_MS } from '../types';
 
 const logger = createLogger('TelegramBot:state');
 

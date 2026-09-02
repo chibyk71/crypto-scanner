@@ -3,8 +3,9 @@
 
 import { and, desc, eq, gte, isNotNull, isNull, not } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { simulatedTrades, type SimulatedTrade } from '../../schema';
+
 import { createLogger } from '../../../logger';
+import { type SimulatedTrade, simulatedTrades } from '../../schema';
 
 const logger = createLogger('db:simulations:read');
 

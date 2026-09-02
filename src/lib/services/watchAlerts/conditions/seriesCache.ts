@@ -2,14 +2,14 @@
 // Per-(symbol, timeframe) IndicatorMap cache for one evaluation pass.
 // Fetches OHLCV once per timeframe and runs computeIndicators() once.
 
-import { createLogger } from '../../../logger';
+import type { OhlcvData } from '../../../../types';
 import { config } from '../../../config/settings';
-import type { ExchangeService } from '../../exchange';
+import { createLogger } from '../../../logger';
 import {
     computeIndicators,
     type IndicatorMap,
 } from '../../../utils/indicatorUtils';
-import type { OhlcvData } from '../../../../types';
+import type { ExchangeService } from '../../exchange';
 
 const logger = createLogger('WatchAlerts.SeriesCache');
 

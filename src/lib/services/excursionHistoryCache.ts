@@ -19,12 +19,12 @@
 //   Live addCompletedSimulation receives boundedMfe directly (no division needed)
 // =============================================================================
 
-import { createLogger } from '../logger';
-import { config } from '../config/settings';
-import type { SimulationHistoryEntry } from '../../types/signalHistory';
 import type { SignalLabel, SimulationOutcome } from '../../types';
-import type { SimulatedTrade } from '../db/schema';
+import type { SimulationHistoryEntry } from '../../types/signalHistory';
+import { config } from '../config/settings';
 import { dbService } from '../db';
+import type { SimulatedTrade } from '../db/schema';
+import { createLogger } from '../logger';
 
 const logger = createLogger('ExcursionCache');
 

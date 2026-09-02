@@ -15,22 +15,22 @@
 //   • All periods are hard-coded for consistency but can be made configurable later
 // =============================================================================
 
+import type { OhlcvData } from '../../types';
 import {
-    calculateSMA,
-    calculateEMA,
-    calculateRSI,
-    calculateMACD,
-    calculateStochastic,
+    calculateADX,
     calculateATR,
     calculateBollingerBands,
-    calculateOBV,
-    calculateVWMA,
-    calculateVWAP,
+    calculateEMA,
+    calculateMACD,
     calculateMomentum,
-    calculateADX,
+    calculateOBV,
+    calculateRSI,
+    calculateSMA,
+    calculateStochastic,
+    calculateVWAP,
+    calculateVWMA,
     detectEngulfing,
 } from '../indicators';
-import type { OhlcvData } from '../../types';
 
 /**
  * Complete map of all indicators used throughout the bot

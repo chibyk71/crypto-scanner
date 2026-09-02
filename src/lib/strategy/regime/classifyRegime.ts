@@ -11,13 +11,14 @@
 // confidence, ML, risk, sizing, or trade eligibility.
 
 import type { IndicatorMap } from '../../utils/indicatorUtils';
-import { detectBbSqueezeBreakout } from '../patterns/bbSqueezeBreakout';
 import {
     MIN_ADX,
     MIN_DI_DIFF,
     RELATIVE_VOLUME_MULTIPLIER,
 } from '../constants';
+import { detectBbSqueezeBreakout } from '../patterns/bbSqueezeBreakout';
 import type { TrendAndVolume } from '../types';
+
 import type {
     BreakoutDirection,
     MarketRegime,

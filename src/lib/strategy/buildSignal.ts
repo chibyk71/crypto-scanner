@@ -5,6 +5,7 @@ import type {
     SignalLabel,
     TradeSignal,
 } from '../../types';
+
 import type { MarketRegime } from './regime/types';
 
 /**

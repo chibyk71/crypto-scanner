@@ -2,18 +2,21 @@
 // Phase 2 — Regime engine unit tests (shadow mode; no strategy scoring)
 
 import test from 'ava';
-import {
-    classifyRegime,
-    hasBreakoutVolumeConfirmation,
-} from './classifyRegime';
+
 import type { IndicatorMap } from '../../utils/indicatorUtils';
-import type { RegimeCandleContext } from './types';
 import {
     BB_SQUEEZE_LOOKBACK,
     MIN_ADX,
     MIN_BB_BANDWIDTH_PCT,
     RELATIVE_VOLUME_MULTIPLIER,
 } from '../constants';
+
+import {
+    classifyRegime,
+    hasBreakoutVolumeConfirmation,
+} from './classifyRegime';
+import type { RegimeCandleContext } from './types';
+
 
 type LastOverrides = Partial<IndicatorMap['last']>;
 

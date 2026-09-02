@@ -2,8 +2,9 @@
 // Live / paper trade logging
 
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { trades, type NewTrade } from '../schema';
+
 import { createLogger } from '../../logger';
+import { type NewTrade, trades } from '../schema';
 
 const logger = createLogger('db:trades');
 

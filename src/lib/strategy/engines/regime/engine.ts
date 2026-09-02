@@ -27,6 +27,7 @@ import type { RegimeClassification } from '../../regime/types';
 import { computeRiskParams } from '../../risk/riskParams';
 import type { StrategyInput } from '../../types';
 import type { RegimeEngineEvaluation, SetupResult } from '../types';
+
 import { applyQualityFilter } from './quality';
 import { detectSetupForRegime } from './setups';
 

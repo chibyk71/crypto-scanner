@@ -10,9 +10,10 @@
 //   4. Apply fees to that realized P&L.
 
 import type { TradeSignal } from '../../types';
-import type { EvaluationAssumptions, EvaluatedTrade, SimulationOutcome } from './types';
-import type { HistoricalCandle } from './types';
 import type { StrategyEngineId } from '../strategy/engines/types';
+
+import type { EvaluatedTrade, EvaluationAssumptions, SimulationOutcome } from './types';
+import type { HistoricalCandle } from './types';
 
 const FALLBACK_RISK_PCT = 0.015;
 const EPSILON = 1e-8;
