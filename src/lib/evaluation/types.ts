@@ -1,8 +1,8 @@
 // src/lib/evaluation/types.ts
 // Historical evaluation harness types only. No strategy logic.
 
-import type { BaselineTradeRow, PerformanceMetrics } from '../baseline/types';
 import type { TradeSignal } from '../../types';
+import type { BaselineTradeRow, PerformanceMetrics } from '../baseline/types';
 import type { StrategyEngineId } from '../strategy/engines/types';
 
 /**

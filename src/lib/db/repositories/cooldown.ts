@@ -3,8 +3,9 @@
 
 import { eq } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { coolDownTable } from '../schema';
+
 import { createLogger } from '../../logger';
+import { coolDownTable } from '../schema';
 
 const logger = createLogger('db:cooldown');
 

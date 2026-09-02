@@ -2,50 +2,40 @@ import type {
     PartialTPLevel,
     TradeSignal,
 } from '../../types';
-
-import type { MLService } from '../services/mlService';
-import type { ExchangeService } from '../services/exchange';
-
 import { config } from '../config/settings';
 import { createLogger } from '../logger';
-
+import type { ExchangeService } from '../services/exchange';
+import type { MLService } from '../services/mlService';
 import { computeIndicators } from '../utils/indicatorUtils';
 
-import type { StrategyInput } from './types';
-
-import {
-    MIN_BB_BANDWIDTH_PCT,
-} from './constants';
-
-import {
-    analyzeTrendAndVolume,
-} from './market/trendVolumeAnalysis';
-
-import {
-    classifyRegime,
-} from './regime/classifyRegime';
-import { runRegimeEngine } from './engines/regime/engine';
-import { resolveStrategyEngine } from './engines/selectEngine';
-
-import {
-    computeScores,
-} from './scoring/computeScores';
-
-import {
-    determineSignal,
-} from './signal/determineSignal';
-
-import {
-    isRiskEligible,
-} from './risk/riskEligibility';
-
-import {
-    computeRiskParams,
-} from './risk/riskParams';
 
 import {
     buildFinalSignal,
 } from './buildSignal';
+import {
+    MIN_BB_BANDWIDTH_PCT,
+} from './constants';
+import { runRegimeEngine } from './engines/regime/engine';
+import { resolveStrategyEngine } from './engines/selectEngine';
+import {
+    analyzeTrendAndVolume,
+} from './market/trendVolumeAnalysis';
+import {
+    classifyRegime,
+} from './regime/classifyRegime';
+import {
+    isRiskEligible,
+} from './risk/riskEligibility';
+import {
+    computeRiskParams,
+} from './risk/riskParams';
+import {
+    computeScores,
+} from './scoring/computeScores';
+import {
+    determineSignal,
+} from './signal/determineSignal';
+import type { StrategyInput } from './types';
 
 const logger = createLogger('Strategy');
 

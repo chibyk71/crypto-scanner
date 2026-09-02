@@ -1,9 +1,10 @@
 // src/lib/services/exchange.ts
 
-import { config } from '../config/settings';
-import ccxt, { type bybit, type Num, type OHLCV, Exchange, Order, Position, Trade } from 'ccxt';
-import { createLogger } from '../logger';
+import ccxt, { type bybit, Exchange, type Num, type OHLCV, Order, Position, Trade } from 'ccxt';
+
 import type { OhlcvData } from '../../types';
+import { config } from '../config/settings';
+import { createLogger } from '../logger';
 // import { dbService } from '../db';
 
 /**

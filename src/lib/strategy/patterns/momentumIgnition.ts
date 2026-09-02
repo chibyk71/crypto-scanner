@@ -14,7 +14,6 @@
 // =============================================================================
 
 import type { OhlcvData } from '../../../types';
-
 import {
     MOMENTUM_IGNITION_LOOKBACK,
     RELATIVE_VOLUME_MULTIPLIER,

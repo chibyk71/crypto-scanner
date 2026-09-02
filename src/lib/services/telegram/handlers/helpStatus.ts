@@ -2,10 +2,11 @@
 // handleHelp, handleStatus, handleStopBot
 
 import type TelegramBot from 'node-telegram-bot-api';
+
+import { closeAndCleanUp } from '../../../..';
 import { config } from '../../../config/settings';
 import { dbService } from '../../../db';
 import { createLogger } from '../../../logger';
-import { closeAndCleanUp } from '../../../..';
 import type { TelegramContext } from '../context';
 
 const logger = createLogger('TelegramBot');

@@ -3,10 +3,11 @@
 
 import { eq } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { simulatedTrades } from '../../schema';
-import { createLogger } from '../../../logger';
+
 import type { PartialTPLevel } from '../../../../types';
+import { createLogger } from '../../../logger';
 import type { MarketRegime } from '../../../strategy/regime/types';
+import { simulatedTrades } from '../../schema';
 
 const logger = createLogger('db:simulations:write');
 

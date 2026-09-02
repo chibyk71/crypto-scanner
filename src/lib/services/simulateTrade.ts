@@ -28,13 +28,14 @@
 //   excursionCache reads back with:    / 1e8  (correct)
 // =============================================================================
 
-import { ExchangeService } from './exchange';
-import { dbService } from '../db';
-import { createLogger } from '../logger';
 import type { TradeSignal } from '../../types';
 import { config } from '../config/settings';
-import { excursionCache } from './excursionHistoryCache';
+import { dbService } from '../db';
+import { createLogger } from '../logger';
 import { computeTrailingLevels } from '../utils/trailingStopUtils';
+
+import { ExchangeService } from './exchange';
+import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('simulateTrade');
 

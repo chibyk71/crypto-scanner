@@ -1,15 +1,16 @@
 // src/lib/worker.ts
 
-import { ExchangeService } from './services/exchange';
-import { Strategy } from './strategy/';
-import { MarketScanner } from './scanner';
-import { dbService, initializeClient, closeDb } from './db';
-import { createLogger } from './logger';
 import * as fs from 'fs/promises';
+
 import { config } from './config/settings';
-import { TelegramBotController } from './services/telegramBotController';
-import { MLService } from './services/mlService';
+import { closeDb, dbService, initializeClient } from './db';
+import { createLogger } from './logger';
+import { MarketScanner } from './scanner';
+import { ExchangeService } from './services/exchange';
 import { excursionCache } from './services/excursionHistoryCache';
+import { MLService } from './services/mlService';
+import { TelegramBotController } from './services/telegramBotController';
+import { Strategy } from './strategy/';
 
 /**
  * Logger instance for worker-related events and errors.
@@ -191,7 +192,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             }
         } catch (err: any) {
             logger.error('Failed to initialize TelegramBotController', { error: err });
-            throw new Error(`TelegramBotController initialization failed: ${err.message}`);
+            throw new Error(`TelegramBotController initialization failed: ${err.message}`, { cause: err });
         }
 
         // Initialize MarketScanner
@@ -243,7 +244,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
             logger.info('MarketScanner started', { mode: scannerMode });
         } catch (err: any) {
             logger.error('Failed to start MarketScanner', { error: err });
-            throw new Error(`MarketScanner failed to start: ${err.message}`);
+            throw new Error(`MarketScanner failed to start: ${err.message}`, { cause: err });
         }
 
         // For single mode, perform cleanup after scan
@@ -252,7 +253,7 @@ export async function startWorker(options: WorkerOptions = { lockType: 'file', s
         }
 
         return cleanup;
-    } catch (err) {
+    } catch (err: any) {
         logger.error('Worker failed, performing emergency cleanup', { error: err });
         try {
             if (scanner) scanner.stop();

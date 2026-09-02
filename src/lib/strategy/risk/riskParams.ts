@@ -4,16 +4,13 @@ import type {
     PartialTPLevel,
     TradeSignal,
 } from '../../../types';
-
-import { createLogger } from '../../logger';
 import { config } from '../../config/settings';
-
-import type { TrendAndVolume } from '../types';
-
+import { createLogger } from '../../logger';
 import {
     MAX_ATR_MULTIPLIER,
     MIN_ATR_MULTIPLIER,
 } from '../constants';
+import type { TrendAndVolume } from '../types';
 
 const logger = createLogger('Strategy');
 

@@ -1,18 +1,19 @@
 // src/lib/watchAlerts/index.ts
 // WatchAlertService — public API for create / evaluate / list.
 
-import { createLogger } from '../../logger';
 import { config } from '../../config/settings';
 import { dbService } from '../../db';
+import { createLogger } from '../../logger';
 import type { ExchangeService } from '../exchange';
+
+import { evaluateConditionTree, evaluateLeavesProgress } from './conditions/evaluateConditionTree';
+import { SeriesCache } from './conditions/seriesCache';
 import { MAX_CONCURRENT_ACTIVE_ALERTS } from './constants';
 import {
     asConditionNode,
     clampExpiryHours,
     parseWatchAlertJson,
 } from './schema';
-import { evaluateConditionTree, evaluateLeavesProgress } from './conditions/evaluateConditionTree';
-import { SeriesCache } from './conditions/seriesCache';
 import { resolveTradePlan } from './tradePlan/resolveTradePlan';
 import { validateTradePlan } from './tradePlan/validateTradePlan';
 import type {

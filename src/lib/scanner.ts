@@ -19,22 +19,23 @@
 //   • Heartbeat monitoring for operational visibility
 // =============================================================================
 
-import { ExchangeService } from './services/exchange';
-import { dbService } from './db';
-import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
-import { createLogger } from './logger';
-import { config } from './config/settings';
 import type { OhlcvData } from '../types';
-import type { TelegramBotController } from './services/telegramBotController';
-import { simulateTrade } from './services/simulateTrade';
+
+import { config } from './config/settings';
+import { dbService } from './db';
+import { createLogger } from './logger';
+import { AutoTradeService } from './services/autoTradeService';        // ← Handles safe live execution with excursion filtering
 import { cooldownService } from './services/cooldownService';
+import { ExchangeService } from './services/exchange';
 import type { MLService } from './services/mlService';
-import type { Strategy } from './strategy/';
+import { simulateTrade } from './services/simulateTrade';
+import { escape, formatR } from './services/telegram/utils/markdown';
+import type { TelegramBotController } from './services/telegramBotController';
 import { WatchAlertService } from './services/watchAlerts';
 import { checkAndNotify as checkTrendingNotify } from './services/watchAlerts/trending/trendingNotifier';
-import { computeIndicators } from './utils/indicatorUtils';
+import type { Strategy } from './strategy/';
 import { analyzeTrendAndVolume } from './strategy/market/trendVolumeAnalysis';
-import { escape, formatR } from './services/telegram/utils/markdown';
+import { computeIndicators } from './utils/indicatorUtils';
 
 
 const logger = createLogger('MarketScanner');

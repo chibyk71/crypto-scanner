@@ -24,15 +24,18 @@
 // =============================================================================
 
 import * as fs from 'fs/promises';
+import path from 'path';
+
 import * as ort from 'onnxruntime-node';
-import { createLogger } from '../logger';
+
+import type { SignalLabel, StrategyInput } from '../../types';
 import { config } from '../config/settings';
 import { dbService } from '../db';
-import type { StrategyInput, SignalLabel } from '../../types';
+import { createLogger } from '../logger';
 import { computeIndicators } from '../utils/indicatorUtils';
-import { excursionCache } from './excursionHistoryCache';
 import { symbolRegistry } from '../utils/symbolRegistry';
-import path from 'path';
+
+import { excursionCache } from './excursionHistoryCache';
 
 const logger = createLogger('MLService');
 

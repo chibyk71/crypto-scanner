@@ -14,7 +14,6 @@
 // =============================================================================
 
 import type { IndicatorMap } from '../../utils/indicatorUtils';
-
 import {
     BB_SQUEEZE_EXPANSION_RATIO,
     BB_SQUEEZE_LOOKBACK,

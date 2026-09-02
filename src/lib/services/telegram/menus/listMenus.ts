@@ -3,9 +3,10 @@
 // sendPositionsList, sendTradesList
 
 import type TelegramBot from 'node-telegram-bot-api';
+
+import { createLogger } from '../../../logger';
 import type { TelegramContext } from '../context';
 import { PAGE_SIZE } from '../types';
-import { createLogger } from '../../../logger';
 
 const logger = createLogger('TelegramBot');
 

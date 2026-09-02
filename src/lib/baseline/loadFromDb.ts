@@ -5,7 +5,9 @@
 
 import { desc, isNotNull } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
+
 import { simulatedTrades } from '../db/schema';
+
 import type { BaselineTradeRow } from './types';
 
 type Db = MySql2Database<any>;

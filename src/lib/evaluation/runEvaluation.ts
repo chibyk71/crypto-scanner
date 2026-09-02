@@ -3,31 +3,33 @@
 // Does NOT change strategy rules. Measurement infrastructure only.
 
 import { createHash } from 'crypto';
+
 import type { OhlcvData, TradeSignal } from '../../types';
 import { computePerformanceMetrics } from '../baseline/metrics';
 import type { BaselineTradeRow } from '../baseline/types';
+import type { ExchangeService } from '../services/exchange';
+import type { MLService } from '../services/mlService';
+import { Strategy } from '../strategy';
 import { runRegimeEngine } from '../strategy/engines/regime/engine';
 import type { StrategyEngineId } from '../strategy/engines/types';
 import type { StrategyInput } from '../strategy/types';
-import { Strategy } from '../strategy';
-import type { MLService } from '../services/mlService';
-import type { ExchangeService } from '../services/exchange';
+
+import { resolveTradeOffline } from './offlineSimulate';
+import {
+  DEFAULT_EVALUATION_ASSUMPTIONS,
+  type EngineEvaluationResult,
+  type EvaluatedTrade,
+  type EvaluationAssumptions,
+  type EvaluationManifest,
+  type HistoricalCandle,
+  type HistoricalComparisonResult,
+  LEGACY_CONTROL_DESCRIPTION,
+  LEGACY_CONTROL_VARIANT,
+} from './types';
 import {
   candlesToOhlcvData,
   validateHistoricalCandles,
 } from './validateCandles';
-import { resolveTradeOffline } from './offlineSimulate';
-import {
-  DEFAULT_EVALUATION_ASSUMPTIONS,
-  LEGACY_CONTROL_DESCRIPTION,
-  LEGACY_CONTROL_VARIANT,
-  type EngineEvaluationResult,
-  type EvaluationAssumptions,
-  type EvaluationManifest,
-  type EvaluatedTrade,
-  type HistoricalCandle,
-  type HistoricalComparisonResult,
-} from './types';
 
 /**
  * Stub ML: never ready → production ML-unavailable branch in computeScores:

@@ -1,5 +1,6 @@
 // src/lib/db/schema.ts
-import { mysqlTable, int, varchar, timestamp, boolean, bigint, json, index, float, decimal, uniqueIndex } from 'drizzle-orm/mysql-core';
+import { bigint, boolean, decimal, float, index, int, json, mysqlTable, timestamp, uniqueIndex, varchar } from 'drizzle-orm/mysql-core';
+
 import type { MarketRegime } from '../strategy/regime/types';
 
 /**

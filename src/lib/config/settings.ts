@@ -29,11 +29,12 @@ const ConfigSchema = z.object({
     // ──────────────────────────────────────────────────────────────
     ENV: z.enum(['dev', 'test', 'prod']).default('dev'),
     LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+    STRATEGY_ENGINE: z.enum(['legacy', 'regime']).default('regime'),
 
     // ──────────────────────────────────────────────────────────────
     // Database
     // ──────────────────────────────────────────────────────────────
-    DATABASE_URL: z.string().url(),
+    DATABASE_URL: z.url(),
 
     // ──────────────────────────────────────────────────────────────
     // Exchange & Trading Mode

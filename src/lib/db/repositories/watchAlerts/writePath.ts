@@ -3,15 +3,16 @@
 
 import { eq } from 'drizzle-orm';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
-import {
-    watchAlerts,
-    trendingNotifications,
-    type NewWatchAlertRow,
-} from '../../schema';
+
 import type {
     ResolvedReason,
     WatchAlertStatus,
 } from '../../../services/watchAlerts/types';
+import {
+    type NewWatchAlertRow,
+    trendingNotifications,
+    watchAlerts,
+} from '../../schema';
 
 type Db = MySql2Database<any>;
 
