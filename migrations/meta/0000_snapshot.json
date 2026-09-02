@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "1ffa79e5-d36a-41b8-a462-23e118ff74ef",
+  "id": "2fc55d62-f26d-4e62-be83-6c28faba83d6",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "cool_down": {
@@ -306,6 +306,20 @@
         "regime": {
           "name": "regime",
           "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "engine": {
+          "name": "engine",
+          "type": "varchar(10)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "setup_id": {
+          "name": "setup_id",
+          "type": "varchar(64)",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

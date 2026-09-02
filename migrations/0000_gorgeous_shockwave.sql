@@ -46,6 +46,8 @@ CREATE TABLE `simulated_trades` (
 	`symbol` varchar(50) NOT NULL,
 	`side` varchar(10) NOT NULL,
 	`regime` varchar(32),
+	`engine` varchar(10),
+	`setup_id` varchar(64),
 	`entry_price` float NOT NULL,
 	`stop_loss` float,
 	`trailing_dist` float,
